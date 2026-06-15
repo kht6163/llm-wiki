@@ -17,3 +17,7 @@ __pycache__/
 
 # HuggingFace model cache (if redirected into the project)
 .cache/
+
+# Local agent / editor config (kept locally, not committed)
+/CLAUDE.md
+/.claude/
