@@ -7,6 +7,7 @@ __pycache__/
 
 # Project data / secrets
 .env
+!.env.example
 *.db
 *.db-wal
 *.db-shm
