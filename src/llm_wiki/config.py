@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     # Web session signing secret (empty -> generated and persisted in DB meta)
     session_secret: str = ""
 
+    # Mark the session cookie Secure (HTTPS-only). Keep False for local http;
+    # set COOKIE_SECURE=true when serving behind TLS / a reverse proxy.
+    cookie_secure: bool = False
+
     def ensure_dirs(self) -> None:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,20 +5,22 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
+import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from argon2 import PasswordHasher
-from argon2.exceptions import Argon2Error
 
 from ..db import Database, get_meta, set_meta
 from ..util import now_iso
-from .errors import UnauthorizedError, ValidationError
+from .errors import ValidationError
 
 ROLES = ("admin", "editor", "viewer")
 ROLE_RANK = {"viewer": 0, "editor": 1, "admin": 2}
 SESSION_TTL_DAYS = 14
 API_KEY_PREFIX_LEN = 12
+MIN_PASSWORD_LEN = 8
 
 _ph = PasswordHasher()
 
@@ -46,7 +48,7 @@ def hash_password(password: str) -> str:
 def verify_password(stored_hash: str, password: str) -> bool:
     try:
         return _ph.verify(stored_hash, password)
-    except (Argon2Error, Exception):
+    except Exception:
         return False
 
 
@@ -55,8 +57,8 @@ def _validate_new_user(username: str, password: str, role: str) -> None:
         raise ValidationError("username is required")
     if role not in ROLES:
         raise ValidationError(f"role must be one of {ROLES}")
-    if not password or len(password) < 4:
-        raise ValidationError("password must be at least 4 characters")
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        raise ValidationError(f"password must be at least {MIN_PASSWORD_LEN} characters")
 
 
 def create_user(db: Database, username: str, password: str, role: str = "editor") -> int:
@@ -71,6 +73,7 @@ def create_user(db: Database, username: str, password: str, role: str = "editor"
             "VALUES(?,?,?,1,?,?)",
             (username, hash_password(password), role, now, now),
         )
+        assert cur.lastrowid is not None
         return cur.lastrowid
 
 
@@ -88,7 +91,7 @@ def authenticate(db: Database, username: str, password: str) -> Principal | None
 # -- web sessions ----------------------------------------------------------
 def create_session(db: Database, user_id: int) -> str:
     sid = secrets.token_urlsafe(32)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     expires = (now + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with db.writer() as conn:
         conn.execute(
@@ -119,6 +122,23 @@ def delete_session(db: Database, sid: str | None) -> None:
 
 
 # -- API keys (MCP) --------------------------------------------------------
+# Throttle last_used_at writes: without this, every authenticated (read-only)
+# MCP tool call would take the writer lock just to stamp a timestamp, contending
+# with real writes. One write per key per window is plenty for an activity hint.
+_LAST_USED_THROTTLE_S = 60.0
+_last_used_marks: dict[int, float] = {}
+_last_used_lock = threading.Lock()
+
+
+def _should_stamp_last_used(key_id: int) -> bool:
+    now = time.monotonic()
+    with _last_used_lock:
+        if now - _last_used_marks.get(key_id, 0.0) >= _LAST_USED_THROTTLE_S:
+            _last_used_marks[key_id] = now
+            return True
+    return False
+
+
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -149,8 +169,9 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
         ).fetchone()
     if not row or not hmac.compare_digest(row["key_hash"], _hash_token(raw)):
         return None
-    with db.writer() as conn:
-        conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now_iso(), row["id"]))
+    if _should_stamp_last_used(row["id"]):
+        with db.writer() as conn:
+            conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now_iso(), row["id"]))
     return Principal(row["uid"], row["username"], row["role"])
 
 

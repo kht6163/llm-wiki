@@ -5,7 +5,8 @@ blocked by SQLite / embedding work.
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import anyio
 from mcp.server.fastmcp import Context, FastMCP
@@ -50,7 +51,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     # ---- read tools (any authenticated role) ----------------------------
     @mcp.tool(description="Hybrid search (BM25 + embedding vector, RRF-fused). "
-                          "mode: hybrid|bm25|vector. Returns ranked path/title/score/snippet.")
+                          "mode: hybrid|bm25|vector. top_k is clamped to 1..50. Returns "
+                          "ranked path/title/score/snippet. 'count' is the number of hits "
+                          "returned; 'truncated' true means more matches likely exist beyond top_k.")
     async def search_documents(
         ctx: Context, query: str, mode: str = "hybrid", top_k: int = 10,
         folder: str | None = None, tags: list[str] | None = None,
@@ -60,7 +63,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         def fn(_p: Principal) -> dict:
             results = run_search(db, embedder, query, mode=mode, top_k=top_k,
                                  folder=folder, tags=tags)
-            return {"ok": True, "mode": mode, "total": len(results),
+            return {"ok": True, "mode": mode, "count": len(results),
+                    "truncated": len(results) >= max(1, min(int(top_k), 50)),
                     "results": [r.to_dict() for r in results]}
         return await _call(token, fn)
 
@@ -70,7 +74,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         token = _bearer_token(ctx)
         return await _call(token, lambda _p: {"ok": True, **docs.get(path)})
 
-    @mcp.tool(description="List documents, optionally filtered by folder/tag.")
+    @mcp.tool(description="List documents, optionally filtered by folder/tag. limit is "
+                          "clamped to 1..1000; sort: updated_at|title|path. Returns 'count' "
+                          "(this page), 'total' (all matches), and 'has_more' for paging.")
     async def list_documents(
         ctx: Context, folder: str | None = None, tag: str | None = None,
         limit: int = 100, offset: int = 0, sort: str = "updated_at",
@@ -78,9 +84,17 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         token = _bearer_token(ctx)
 
         def fn(_p: Principal) -> dict:
-            items = docs.list(folder=folder, tag=tag, limit=limit, offset=offset, sort=sort)
-            return {"ok": True, "total": len(items), "documents": items}
+            items = docs.list_docs(folder=folder, tag=tag, limit=limit, offset=offset, sort=sort)
+            total = docs.count(folder=folder, tag=tag)
+            return {"ok": True, "count": len(items), "total": total, "offset": offset,
+                    "has_more": offset + len(items) < total, "documents": items}
         return await _call(token, fn)
+
+    @mcp.tool(description="List the tag vocabulary with usage counts (most-used first). "
+                          "Use this to discover exact tag strings for the 'tag'/'tags' filters.")
+    async def get_tags(ctx: Context) -> dict:
+        token = _bearer_token(ctx)
+        return await _call(token, lambda _p: {"ok": True, "tags": docs.tags()})
 
     @mcp.tool(description="Outgoing links of a document (resolved + broken).")
     async def get_links(ctx: Context, path: str) -> dict:

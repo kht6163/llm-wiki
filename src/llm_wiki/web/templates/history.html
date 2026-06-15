@@ -12,7 +12,16 @@
       <td>{{ r.op }}</td>
       <td>{{ r.author or '—' }}</td>
       <td>{{ r.created_at }}</td>
-      <td><a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a></td>
+      <td>
+        <a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a>
+        {% if user.can_write and r.version != current_version %}
+          · <form method="post" action="/doc/{{ path|urlpath }}/rev/{{ r.version }}/restore" class="inline"
+                  onsubmit="return confirm('v{{ r.version }} 내용으로 되돌릴까요? (새 버전으로 기록됩니다)')">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <button>되돌리기</button>
+            </form>
+        {% endif %}
+      </td>
     </tr>
   {% endfor %}
   </tbody>

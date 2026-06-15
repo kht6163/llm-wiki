@@ -34,7 +34,7 @@ def test_search_folder_filter(ctx, principals):
 
 def test_password_and_api_key_auth(ctx, principals):
     # password auth
-    assert authenticate(ctx.db, "alice", "secret") is not None
+    assert authenticate(ctx.db, "alice", "secret12") is not None
     assert authenticate(ctx.db, "alice", "wrong") is None
 
     # api key auth round-trip

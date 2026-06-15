@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 # Media / non-document extensions that markdown links may point at; excluded
@@ -19,7 +19,7 @@ class PathError(ValueError):
 
 def now_iso() -> str:
     """Current UTC time as an ISO-8601 string (second precision, 'Z' suffix)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def sha256_hex(text: str) -> str:

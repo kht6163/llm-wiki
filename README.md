@@ -9,6 +9,8 @@
 - 🔒 **다중 사용자 동시 편집** — 문서별 정수 버전 낙관적 잠금. 앞선 변경이 있으면 **거부**하고 현재 내용을 돌려줘서 재확인 후 재시도. 모든 변경은 작성자·시각과 함께 **전체 본문 스냅샷**으로 기록
 - 🕸 **링크 그래프** — 위키링크/마크다운 링크를 파싱해 SQLite에 저장, 백링크·미해석(broken) 링크 추적
 - 👤 **역할 기반 권한** — `admin`/`editor`/`viewer`. 웹은 ID/비밀번호 로그인, MCP는 사용자별 API 키(Bearer)
+- 🛡 **보안 기본기** — 세션 CSRF 토큰 + 동일 출처 검사, 로그인 레이트리밋, 보안 응답 헤더(CSP·X-Frame-Options 등), 비밀번호 최소 8자
+- 🎨 **편의 기능** — 다크모드(OS 설정 자동), 리비전 1‑클릭 롤백, 태그 색인 페이지, 원문(.md) 다운로드, 목록 정렬
 
 ## 요구사항
 
@@ -36,6 +38,7 @@ uv sync          # 의존성 설치 (torch는 CPU 전용 휠로 설치됨)
 | `DB_PATH` | SQLite DB 경로(메타·리비전·검색인덱스·그래프·사용자) | `./data/llm_wiki.db` |
 | `EMBEDDING_MODEL` | 로컬 임베딩 모델 | `intfloat/multilingual-e5-base` |
 | `SESSION_SECRET` | 세션 쿠키 서명 키(비우면 자동 생성·DB 저장) | (자동) |
+| `COOKIE_SECURE` | 세션 쿠키 Secure(HTTPS 전용) 플래그. TLS 뒤에서는 `true` | `false` |
 
 > 임베딩 모델을 바꾸면 벡터 차원이 달라져 기동 시 거부됩니다. `uv run llm-wiki reindex --reembed`로 재임베딩하세요.
 
@@ -71,9 +74,10 @@ uv run llm-wiki create-api-key --username admin --name my-agent
 
 | 툴 | 권한 | 설명 |
 |---|---|---|
-| `search_documents(query, mode, top_k, folder?, tags?)` | 읽기 | 하이브리드/BM25/벡터 검색 |
+| `search_documents(query, mode, top_k, folder?, tags?)` | 읽기 | 하이브리드/BM25/벡터 검색. `count`+`truncated`(top_k 초과 가능성) 반환 |
 | `read_document(path)` | 읽기 | 본문 + 현재 `version`(=업데이트용 base_version) |
-| `list_documents(folder?, tag?, …)` | 읽기 | 문서 목록 |
+| `list_documents(folder?, tag?, …)` | 읽기 | 문서 목록. `count`/`total`/`has_more`로 페이징 |
+| `get_tags()` | 읽기 | 태그 목록 + 사용 횟수(필터용 어휘 탐색) |
 | `get_links(path)` / `get_backlinks(path)` | 읽기 | 나가는/들어오는 링크 |
 | `get_revisions(path)` / `get_revision(path, version)` | 읽기 | 이력/특정 버전 |
 | `get_graph(root?, depth, limit, …)` | 읽기 | `{nodes, edges}` 그래프 |
@@ -103,11 +107,38 @@ uv run llm-wiki reindex            # mtime/해시 비교로 변경 화해(extern
 uv run llm-wiki reindex --reembed  # 임베딩 전체 재생성(모델 교체 시)
 ```
 
-## 테스트
+## 백업 / 복원
+
+WAL이 켜진 상태에서 `.db` 파일을 단순 복사하면 손상된(torn) 스냅샷이 나올 수 있습니다.
+`backup` 명령은 `VACUUM INTO`로 트랜잭션 일관성이 보장된 온라인 스냅샷을 만듭니다.
 
 ```bash
-uv run pytest
+uv run llm-wiki backup --out backups/wiki-$(date +%F).db   # DB 일관 스냅샷
 ```
+
+완전한 백업은 **DB 스냅샷 + vault 디렉터리**를 함께 보관해야 합니다(본문은 vault의 `.md`에도 투영됨).
+복원은 스냅샷을 `DB_PATH`로, vault 백업을 `VAULT_PATH`로 되돌린 뒤 필요 시 `reindex`를 실행합니다.
+
+## 도커로 실행
+
+```bash
+docker compose run --rm llm-wiki create-admin --username admin   # 최초 1회 관리자 생성
+docker compose up -d                                             # 웹(8080) + MCP(8081) 기동
+```
+
+- torch는 pyproject의 `pytorch-cpu` 인덱스를 따라 **CPU 휠**로 설치되어 이미지가 가볍습니다.
+- 임베딩 모델 캐시는 `hf-models` 볼륨에 보존되어 재시작 시 재다운로드하지 않습니다.
+- `./data`(DB)·`./vault`(문서)는 호스트에 바인드 마운트됩니다. TLS 뒤라면 `COOKIE_SECURE=true`를 설정하세요.
+
+## 테스트 & 품질
+
+```bash
+uv run pytest                 # 단위 + 라우트/MCP/보안 테스트
+uv run ruff check .           # 린트
+uv run mypy src/llm_wiki      # 타입 체크
+```
+
+`.github/workflows/ci.yml`이 push/PR마다 위 셋을 실행합니다(HuggingFace 모델 캐시 포함).
 
 ## 아키텍처 요약
 

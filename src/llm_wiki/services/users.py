@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..db import Database
 from ..util import now_iso
-from .auth import ROLES, hash_password
+from .auth import MIN_PASSWORD_LEN, ROLES, hash_password
 from .errors import NotFoundError, ValidationError
 
 
@@ -65,8 +65,8 @@ def set_active(db: Database, user_id: int, active: bool) -> None:
 
 
 def set_password(db: Database, user_id: int, password: str) -> None:
-    if not password or len(password) < 4:
-        raise ValidationError("password must be at least 4 characters")
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        raise ValidationError(f"password must be at least {MIN_PASSWORD_LEN} characters")
     with db.writer() as conn:
         if not conn.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone():
             raise NotFoundError("user not found")

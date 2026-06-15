@@ -5,6 +5,7 @@
   <h1>로그인</h1>
   {% if error %}<div class="error">{{ error }}</div>{% endif %}
   <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <label>아이디 <input name="username" autofocus required></label>
     <label>비밀번호 <input name="password" type="password" required></label>
     <button type="submit">로그인</button>

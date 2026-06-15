@@ -183,28 +183,28 @@ def build_graph(
     eid = 0
     for did in doc_ids:
         src = path_by_id[did]
-        for l in conn.execute(
+        for lk in conn.execute(
             "SELECT dst_doc_id, dst_name, is_resolved, link_type, alias, anchor "
             "FROM links WHERE src_doc_id=?", (did,)
         ):
-            if l["dst_doc_id"] is not None:
-                if l["dst_doc_id"] not in id_set:
+            if lk["dst_doc_id"] is not None:
+                if lk["dst_doc_id"] not in id_set:
                     continue
-                target_id = path_by_id[l["dst_doc_id"]]
+                target_id = path_by_id[lk["dst_doc_id"]]
             else:
                 if not include_unresolved:
                     continue
-                target_id = "unresolved:" + (l["dst_name"] or "?")
+                target_id = "unresolved:" + (lk["dst_name"] or "?")
                 if target_id not in nodes:
                     nodes[target_id] = {
-                        "id": target_id, "label": l["dst_name"] or "?", "exists": False,
+                        "id": target_id, "label": lk["dst_name"] or "?", "exists": False,
                         "folder": None, "tags": [], "degree": 0, "is_root": False,
                     }
             eid += 1
             edges.append({
                 "id": f"e{eid}", "source": src, "target": target_id,
-                "type": l["link_type"], "resolved": bool(l["is_resolved"]),
-                "alias": l["alias"], "anchor": l["anchor"],
+                "type": lk["link_type"], "resolved": bool(lk["is_resolved"]),
+                "alias": lk["alias"], "anchor": lk["anchor"],
             })
             nodes[src]["degree"] += 1
             if target_id in nodes:

@@ -15,6 +15,7 @@
   <nav>
     {% if user %}
       <a href="/">문서</a>
+      <a href="/tags">태그</a>
       <a href="/graph">그래프</a>
       {% if user.can_write %}<a href="/new">새 문서</a>{% endif %}
       <a href="/settings">API 키</a>

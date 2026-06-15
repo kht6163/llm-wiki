@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}태그{% endblock %}
+{% block content %}
+<h1>태그</h1>
+{% if not tags %}
+  <p class="muted">아직 태그가 없습니다.</p>
+{% endif %}
+<ul class="taglist">
+  {% for t in tags %}
+    <li><a class="tag" href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }}</a> <span class="muted">{{ t.count }}</span></li>
+  {% endfor %}
+</ul>
+{% endblock %}

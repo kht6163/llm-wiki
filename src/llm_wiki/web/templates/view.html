@@ -10,11 +10,13 @@
           <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
           <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
                 onsubmit="return confirm('이 문서를 삭제할까요?')">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="hidden" name="base_version" value="{{ doc.version }}">
             <button type="submit" class="danger">삭제</button>
           </form>
         {% endif %}
         <a href="/doc/{{ doc.path|urlpath }}/history">이력</a>
+        <a href="/doc/{{ doc.path|urlpath }}/raw">원문</a>
         <a href="/graph?root={{ doc.path|urlpath }}">그래프</a>
       </div>
     </div>

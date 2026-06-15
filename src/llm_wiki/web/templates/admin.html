@@ -3,6 +3,7 @@
 {% block content %}
 <h1>사용자 관리</h1>
 <form method="post" action="/admin/users" class="inline">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="username" placeholder="아이디" required>
   <input name="password" type="password" placeholder="비밀번호" required>
   <select name="role">
@@ -20,6 +21,7 @@
       <td>{{ u.username }}</td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/role" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <select name="role" onchange="this.form.submit()">
             {% for r in ['admin','editor','viewer'] %}<option value="{{ r }}" {{ 'selected' if u.role==r }}>{{ r }}</option>{% endfor %}
           </select>
@@ -27,6 +29,7 @@
       </td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/active" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="active" value="{{ 0 if u.is_active else 1 }}">
           <button>{{ '활성' if u.is_active else '비활성' }}</button>
         </form>
@@ -34,12 +37,14 @@
       <td>{{ u.created_at }}</td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/password" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input name="password" type="password" placeholder="새 비밀번호" size="12" required>
           <button>변경</button>
         </form>
       </td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/delete" class="inline" onsubmit="return confirm('삭제할까요?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="danger">삭제</button>
         </form>
       </td>

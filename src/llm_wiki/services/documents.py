@@ -119,7 +119,7 @@ class DocumentService:
             ).fetchone()
         return r is not None
 
-    def list(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at") -> list[dict]:
+    def list_docs(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at") -> list[dict]:
         sort_col = {"updated_at": "updated_at", "title": "title", "path": "path"}.get(sort, "updated_at")
         order = "DESC" if sort_col == "updated_at" else "ASC"
         q = "SELECT id, path, title, version, folder, updated_at FROM documents WHERE is_deleted=0"
@@ -142,6 +142,30 @@ class DocumentService:
                     "folder": r["folder"], "tags": tags, "updated_at": r["updated_at"],
                 })
         return out
+
+    def count(self, folder=None, tag=None) -> int:
+        """Total non-deleted documents matching the same folder/tag filters as list()."""
+        q = "SELECT COUNT(*) FROM documents WHERE is_deleted=0"
+        params: list = []
+        if folder:
+            f = folder.strip("/")
+            q += " AND (folder=? OR folder LIKE ?)"
+            params += [f, f + "/%"]
+        if tag:
+            q += " AND id IN (SELECT doc_id FROM tags WHERE tag=?)"
+            params.append(tag)
+        with self.db.reader() as conn:
+            return conn.execute(q, params).fetchone()[0]
+
+    def tags(self) -> list[dict]:
+        """Tag vocabulary across non-deleted documents, most-used first."""
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT t.tag AS tag, COUNT(*) AS count FROM tags t "
+                "JOIN documents d ON d.id=t.doc_id WHERE d.is_deleted=0 "
+                "GROUP BY t.tag ORDER BY count DESC, t.tag ASC"
+            ).fetchall()
+        return [{"tag": r["tag"], "count": r["count"]} for r in rows]
 
     def revisions(self, path: str, limit: int = 100) -> dict:
         rel = normalize_rel_path(path)

@@ -1,0 +1,20 @@
+services:
+  llm-wiki:
+    build: .
+    image: llm-wiki:latest
+    ports:
+      - "8080:8080"   # web UI
+      - "8081:8081"   # MCP (streamable-http)
+    environment:
+      - HOST=0.0.0.0
+      # - COOKIE_SECURE=true              # enable when serving behind TLS
+      # - EMBEDDING_MODEL=intfloat/multilingual-e5-base
+      # - SESSION_SECRET=change-me        # else auto-generated + persisted in the DB
+    volumes:
+      - ./data:/data        # SQLite DB (metadata, revisions, index, graph, users)
+      - ./vault:/vault      # markdown documents
+      - hf-models:/models   # embedding-model cache (avoids re-downloading)
+    restart: unless-stopped
+
+volumes:
+  hf-models:

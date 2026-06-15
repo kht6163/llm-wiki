@@ -15,6 +15,7 @@
 </div>
 {% endif %}
 <form method="post" action="{% if is_new %}/new{% else %}/doc/{{ path|urlpath }}/edit{% endif %}" class="editform">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   {% if is_new %}
     <label>경로 <input type="text" name="path" value="{{ path }}" placeholder="folder/note.md" required></label>
   {% else %}

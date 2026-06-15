@@ -22,9 +22,9 @@ def ctx(tmp_path):
 
 @pytest.fixture
 def principals(ctx):
-    admin_id = create_user(ctx.db, "admin", "secret", "admin")
-    editor_id = create_user(ctx.db, "alice", "secret", "editor")
-    viewer_id = create_user(ctx.db, "bob", "secret", "viewer")
+    admin_id = create_user(ctx.db, "admin", "secret12", "admin")
+    editor_id = create_user(ctx.db, "alice", "secret12", "editor")
+    viewer_id = create_user(ctx.db, "bob", "secret12", "viewer")
     return {
         "admin": Principal(admin_id, "admin", "admin"),
         "editor": Principal(editor_id, "alice", "editor"),

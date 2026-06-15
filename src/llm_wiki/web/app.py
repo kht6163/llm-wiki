@@ -9,8 +9,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 import bleach
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
@@ -32,6 +32,12 @@ from ..services.auth import (
     revoke_api_key,
 )
 from ..services.errors import ConflictError, WikiError
+from .security import (
+    RateLimiter,
+    SecurityHeadersMiddleware,
+    enforce_csrf,
+    get_csrf_token,
+)
 
 _HERE = Path(__file__).parent
 
@@ -44,10 +50,18 @@ def create_web_app(app: AppContext) -> FastAPI:
     # <mark> through so stored content can't inject HTML into the results page.
     templates.env.filters["snippet"] = lambda s: bleach.clean(s or "", tags=["mark"], strip=True)
 
-    web = FastAPI(title="llm-wiki")
+    # A global dependency enforces CSRF (same-origin + per-session token) on every
+    # unsafe method; safe methods pass through. Forms carry the token via a hidden
+    # field rendered from render()'s context.
+    web = FastAPI(title="llm-wiki", dependencies=[Depends(enforce_csrf)])
     secret = get_or_create_session_secret(db, app.settings.session_secret)
-    web.add_middleware(SessionMiddleware, secret_key=secret, same_site="lax", max_age=14 * 86400)
+    web.add_middleware(SecurityHeadersMiddleware)
+    web.add_middleware(
+        SessionMiddleware, secret_key=secret, same_site="lax",
+        https_only=app.settings.cookie_secure, max_age=14 * 86400,
+    )
     web.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
+    login_limiter = RateLimiter()
 
     def user(request: Request) -> Principal | None:
         return principal_from_session(db, request.session.get("sid"))
@@ -55,7 +69,9 @@ def create_web_app(app: AppContext) -> FastAPI:
     def render(name: str, request: Request, status: int = 200, **kw) -> HTMLResponse:
         flash = request.session.pop("flash", None)
         return templates.TemplateResponse(
-            request, name, {"user": user(request), "flash": flash, **kw}, status_code=status
+            request, name,
+            {"user": user(request), "flash": flash, "csrf_token": get_csrf_token(request), **kw},
+            status_code=status,
         )
 
     def login_redirect() -> RedirectResponse:
@@ -70,9 +86,22 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.post("/login", response_class=HTMLResponse)
     def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+        ip = request.client.host if request.client else "?"
+        uname = (username or "").strip().lower()
+        ip_key, user_key = f"ip:{ip}", f"user:{uname}"
+        if not (login_limiter.allowed(ip_key) and login_limiter.allowed(user_key)):
+            return render("login.html", request, status=429,
+                          error="Too many attempts. Please wait a few minutes and try again.")
         p = authenticate(db, username, password)
         if not p:
+            login_limiter.record_failure(ip_key)
+            login_limiter.record_failure(user_key)
             return render("login.html", request, status=401, error="Invalid username or password.")
+        login_limiter.reset(ip_key)
+        login_limiter.reset(user_key)
+        # Drop any pre-login session state (fixation hardening), then bind the new
+        # session. A fresh CSRF token is minted on the next rendered page.
+        request.session.clear()
         request.session["sid"] = create_session(db, p.user_id)
         return RedirectResponse("/", status_code=303)
 
@@ -88,11 +117,18 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
-    def home(request: Request, folder: str | None = None, tag: str | None = None):
+    def home(request: Request, folder: str | None = None, tag: str | None = None,
+             sort: str = "updated_at"):
         if not user(request):
             return login_redirect()
-        items = docs.list(folder=folder, tag=tag, limit=1000)
-        return render("list.html", request, items=items, folder=folder, tag=tag)
+        items = docs.list_docs(folder=folder, tag=tag, limit=1000, sort=sort)
+        return render("list.html", request, items=items, folder=folder, tag=tag, sort=sort)
+
+    @web.get("/tags", response_class=HTMLResponse)
+    def tags_page(request: Request):
+        if not user(request):
+            return login_redirect()
+        return render("tags.html", request, tags=docs.tags())
 
     @web.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20):
@@ -200,6 +236,20 @@ def create_web_app(app: AppContext) -> FastAPI:
         return render("history.html", request, path=data["path"],
                       current_version=data["current_version"], revisions=data["revisions"])
 
+    @web.get("/doc/{path:path}/raw")
+    def raw(path: str, request: Request):
+        if not user(request):
+            return login_redirect()
+        try:
+            doc = docs.get(path)
+        except WikiError as e:
+            return render("error.html", request, status=e.http_status, message=e.message)
+        filename = doc["path"].rsplit("/", 1)[-1].replace('"', "")
+        return PlainTextResponse(
+            doc["content"], media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     @web.get("/doc/{path:path}/rev/{version}", response_class=HTMLResponse)
     def revision_view(path: str, version: int, request: Request):
         if not user(request):
@@ -210,6 +260,24 @@ def create_web_app(app: AppContext) -> FastAPI:
             return render("error.html", request, status=e.http_status, message=e.message)
         html = render_markdown(rev["content"], rev["path"])
         return render("revision.html", request, rev=rev, html=html)
+
+    @web.post("/doc/{path:path}/rev/{version}/restore")
+    def restore_revision(path: str, version: int, request: Request):
+        p = user(request)
+        if not p:
+            return login_redirect()
+        try:
+            rev = docs.revision(path, version)
+            current = docs.get(path)
+            doc = docs.update(p, path, current["version"], rev["content"], title=rev["title"])
+        except ConflictError:
+            request.session["flash"] = "복원 실패: 그 사이 다른 변경이 있었습니다. 다시 시도하세요."
+            return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
+        except WikiError as e:
+            request.session["flash"] = f"복원 실패: {e.message}"
+            return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
+        request.session["flash"] = f"v{version} 내용으로 복원했습니다 (현재 v{doc['version']})."
+        return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}", response_class=HTMLResponse)
     def view(path: str, request: Request):
@@ -230,16 +298,17 @@ def create_web_app(app: AppContext) -> FastAPI:
         p = user(request)
         if not p:
             return login_redirect()
-        new_key = request.session.pop("new_key", None)
-        return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=new_key)
+        return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=None)
 
-    @web.post("/settings/keys")
+    @web.post("/settings/keys", response_class=HTMLResponse)
     def settings_create_key(request: Request, name: str = Form("key")):
         p = user(request)
         if not p:
             return login_redirect()
-        request.session["new_key"] = create_api_key(db, p.user_id, name)
-        return RedirectResponse("/settings", status_code=303)
+        # Render the freshly-minted key directly in the response instead of
+        # round-tripping it through the (signed-but-not-encrypted) session cookie.
+        token = create_api_key(db, p.user_id, name)
+        return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=token)
 
     @web.post("/settings/keys/{key_id}/revoke")
     def settings_revoke_key(key_id: int, request: Request):

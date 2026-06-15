@@ -39,6 +39,7 @@ def rechunk(conn: sqlite3.Connection, doc_id: int, body: str) -> list[tuple[int,
             "VALUES(?,?,?,?,?,?)",
             (doc_id, ch.ordinal, ch.heading, ch.text, ch.char_start, ch.char_end),
         )
+        assert cur.lastrowid is not None
         out.append((cur.lastrowid, ch.text))
     return out
 
@@ -68,7 +69,7 @@ def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
     embs = embedder.embed_passages([r["text"] for r in rows])
     with db.writer() as conn:
         existing = {r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))}
-        for r, emb in zip(rows, embs):
+        for r, emb in zip(rows, embs, strict=False):
             if r["id"] in existing:
                 conn.execute(
                     "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",

@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 import sqlite_vec
 
@@ -158,24 +158,36 @@ class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self._write_lock = threading.RLock()
+        # One reusable connection per thread. Opening a connection reloads the
+        # sqlite-vec C extension and re-applies the PRAGMAs, so doing it per
+        # operation is the single most pervasive overhead on read paths; caching
+        # it per thread removes that fixed cost. Connections are autocommit, so a
+        # cached reader holds no open transaction (no WAL checkpoint stall), and
+        # writes are serialized in-process by ``_write_lock``.
+        self._local = threading.local()
 
     def connect(self) -> sqlite3.Connection:
         return connect(self.path)
 
+    def _conn(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self.connect()
+            self._local.conn = conn
+        return conn
+
     @contextmanager
     def reader(self) -> Iterator[sqlite3.Connection]:
-        conn = self.connect()
-        try:
-            yield conn
-        finally:
-            conn.close()
+        # Reuses the thread-local connection; each SELECT is its own implicit
+        # transaction in autocommit mode, so nothing is left open between calls.
+        yield self._conn()
 
     @contextmanager
     def writer(self) -> Iterator[sqlite3.Connection]:
         with self._write_lock:
-            conn = self.connect()
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute("BEGIN IMMEDIATE")
                 yield conn
                 conn.execute("COMMIT")
             except Exception:
@@ -184,8 +196,13 @@ class Database:
                 except Exception:
                     pass
                 raise
-            finally:
-                conn.close()
+
+    def close(self) -> None:
+        """Close this thread's cached connection (mainly for tests/teardown)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
 
     # -- schema / meta -----------------------------------------------------
     def ensure_schema(self) -> None:

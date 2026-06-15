@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import signal
+from pathlib import Path
 
 import uvicorn
 
@@ -46,6 +47,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("reindex", help="Reconcile the DB with the on-disk vault (external edits).")
     r.add_argument("--reembed", action="store_true", help="Recompute all embeddings.")
+
+    b = sub.add_parser("backup", help="Write a consistent (WAL-safe) copy of the database.")
+    b.add_argument("--out", required=True, help="Destination .db path for the snapshot.")
     return p
 
 
@@ -73,6 +77,8 @@ def _dispatch(args) -> int:
         return _create_api_key(args)
     if args.cmd == "reindex":
         return _reindex(args)
+    if args.cmd == "backup":
+        return _backup(args)
     return 2
 
 
@@ -131,6 +137,22 @@ def _reindex(args) -> int:
     return 0
 
 
+def _backup(args) -> int:
+    ctx = build_context(full=False)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        print(f"refusing to overwrite existing file: {out}")
+        return 1
+    # VACUUM INTO produces a transactionally-consistent snapshot even while WAL is
+    # active — unlike a naive file copy, which can capture a torn .db + .db-wal.
+    with ctx.db.reader() as conn:
+        conn.execute("VACUUM INTO ?", (str(out),))
+    print(f"Database backed up to {out}")
+    print(f"NOTE: also back up the vault directory for a complete snapshot: {ctx.settings.vault_path}")
+    return 0
+
+
 def _serve(args) -> int:
     settings = get_settings()
     if args.host:
@@ -161,7 +183,7 @@ async def _serve_both(settings, web_app, mcp_app) -> None:
     mcp_cfg = uvicorn.Config(mcp_app, host=settings.host, port=settings.mcp_port, log_level="info")
     servers = [uvicorn.Server(web_cfg), uvicorn.Server(mcp_cfg)]
     for s in servers:
-        s.install_signal_handlers = lambda: None  # we manage signals for both at once
+        s.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # we manage signals for both at once
 
     loop = asyncio.get_running_loop()
 
