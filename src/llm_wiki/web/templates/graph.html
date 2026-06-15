@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}그래프{% endblock %}
+{% block content %}
+<h1>링크 그래프</h1>
+<div class="graph-controls">
+  <label>중심 문서 <input id="root" value="{{ root }}" placeholder="(비우면 전체)" size="36"></label>
+  <label>깊이 <input id="depth" type="number" value="1" min="1" max="3"></label>
+  <button onclick="reloadGraph()">적용</button>
+  <span id="ginfo" class="muted"></span>
+</div>
+<div id="cy"></div>
+<script src="/static/vendor/cytoscape.min.js"></script>
+<script>
+async function reloadGraph() {
+  const root = document.getElementById('root').value.trim();
+  const depth = document.getElementById('depth').value;
+  let url = '/api/graph?depth=' + encodeURIComponent(depth) + '&limit=500';
+  if (root) url += '&root=' + encodeURIComponent(root);
+  const data = await (await fetch(url)).json();
+  document.getElementById('ginfo').textContent =
+    data.nodes.length + ' 노드 / ' + data.edges.length + ' 엣지' + (data.truncated ? ' (일부 생략됨)' : '');
+  const els = [];
+  for (const n of data.nodes) els.push({ data: { id: n.id, label: n.label, exists: n.exists, root: n.is_root } });
+  for (const e of data.edges) els.push({ data: { id: e.id, source: e.source, target: e.target, resolved: e.resolved } });
+  const cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements: els,
+    style: [
+      { selector: 'node', style: { 'label': 'data(label)', 'font-size': '9px', 'background-color': '#6aa9ff', 'width': 12, 'height': 12, 'color': '#444' } },
+      { selector: 'node[?root]', style: { 'background-color': '#ff7043', 'width': 18, 'height': 18, 'font-size': '11px' } },
+      { selector: 'node[!exists]', style: { 'background-color': '#ddd', 'border-width': 1, 'border-style': 'dashed', 'border-color': '#aaa' } },
+      { selector: 'edge', style: { 'width': 1, 'line-color': '#ccc', 'target-arrow-color': '#ccc', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.6 } },
+      { selector: 'edge[!resolved]', style: { 'line-style': 'dashed', 'line-color': '#e3e3e3' } }
+    ],
+    layout: { name: 'cose', animate: false }
+  });
+  cy.on('tap', 'node', evt => { if (evt.target.data('exists')) location.href = '/doc/' + encodeURIComponent(evt.target.data('id')); });
+}
+reloadGraph();
+</script>
+{% endblock %}

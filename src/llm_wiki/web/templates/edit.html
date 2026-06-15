@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}{% if is_new %}새 문서{% else %}편집{% endif %}{% endblock %}
+{% block content %}
+<h1>{% if is_new %}새 문서{% else %}편집 · {{ path }}{% endif %}</h1>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% if conflict %}
+<div class="conflict">
+  <strong>⚠ 충돌로 거부됨.</strong>
+  다른 변경(현재 <b>v{{ conflict.current_version }}</b>{% if conflict.updated_by %}, {{ conflict.updated_by }}{% endif %})이 먼저 적용되었습니다.
+  아래 서버의 현재 내용을 확인해 병합한 뒤 다시 저장하세요. (base_version은 v{{ conflict.current_version }}로 갱신됨)
+  <details>
+    <summary>서버의 현재 내용 보기</summary>
+    <pre>{{ conflict.current_content }}</pre>
+  </details>
+</div>
+{% endif %}
+<form method="post" action="{% if is_new %}/new{% else %}/doc/{{ path|urlpath }}/edit{% endif %}" class="editform">
+  {% if is_new %}
+    <label>경로 <input type="text" name="path" value="{{ path }}" placeholder="folder/note.md" required></label>
+  {% else %}
+    <input type="hidden" name="base_version" value="{{ base_version }}">
+  {% endif %}
+  <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="(비우면 자동 추출)"></label>
+  <textarea name="content" rows="26" spellcheck="false">{{ content }}</textarea>
+  <div class="form-actions">
+    <button type="submit" {% if not can_write %}disabled{% endif %}>저장</button>
+    {% if not is_new %}<a href="/doc/{{ path|urlpath }}">취소</a>{% endif %}
+  </div>
+  {% if not can_write %}<p class="muted">현재 역할은 읽기 전용이라 저장할 수 없습니다.</p>{% endif %}
+</form>
+{% endblock %}

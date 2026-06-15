@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}검색{% endblock %}
+{% block content %}
+<h1>검색</h1>
+<form action="/search" method="get" class="searchform">
+  <input type="search" name="q" value="{{ q }}" placeholder="검색어" autofocus>
+  <select name="mode">
+    <option value="hybrid" {{ 'selected' if mode=='hybrid' }}>하이브리드</option>
+    <option value="bm25" {{ 'selected' if mode=='bm25' }}>BM25(어휘)</option>
+    <option value="vector" {{ 'selected' if mode=='vector' }}>의미(벡터)</option>
+  </select>
+  <button>검색</button>
+</form>
+{% if q %}<p class="muted">{{ results|length }}건</p>{% endif %}
+<ul class="results">
+  {% for r in results %}
+    <li>
+      <a class="title" href="/doc/{{ r.path|urlpath }}">{{ r.title }}</a>
+      <span class="score">{{ '%.4f'|format(r.score) }}</span>
+      <span class="path">{{ r.path }}</span>
+      <div class="snippet">{{ r.snippet|snippet|safe }}</div>
+      {% if r.heading %}<div class="muted">↳ {{ r.heading }}</div>{% endif %}
+    </li>
+  {% else %}
+    {% if q %}<li class="muted">결과 없음</li>{% endif %}
+  {% endfor %}
+</ul>
+{% endblock %}

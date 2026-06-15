@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}문서 없음{% endblock %}
+{% block content %}
+<h1>문서 없음</h1>
+<p><code>{{ path }}</code> 경로에 문서가 없습니다.</p>
+{% if user.can_write %}<p><a class="btn" href="/new?path={{ path|urlpath }}">이 경로로 새로 만들기</a></p>{% endif %}
+{% endblock %}

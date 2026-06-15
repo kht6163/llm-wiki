@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Project data / secrets
+.env
+*.db
+*.db-wal
+*.db-shm
+
+# Default local vault & data dirs (override via .env)
+/vault/
+/data/
+
+# HuggingFace model cache (if redirected into the project)
+.cache/

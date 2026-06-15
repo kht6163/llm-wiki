@@ -1,0 +1,91 @@
+"""Reindexing primitives: FTS rows, chunks, link edges, and vector embeddings.
+
+FTS + chunk text + link edges are cheap and run inside the write transaction.
+Embedding is slow on CPU, so it runs *after* the commit (off the write lock) via
+``embed_doc`` / ``embed_pending``, keeping write-then-search consistent without
+holding the SQLite writer.
+"""
+from __future__ import annotations
+
+import sqlite3
+
+from . import graph
+from .embedding import Embedder
+from .markdown_utils import chunk_markdown, extract_links
+
+
+def reindex_fts(conn: sqlite3.Connection, doc_id: int, title: str, body: str) -> None:
+    conn.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
+    conn.execute(
+        "INSERT INTO documents_fts(rowid, title, body) VALUES(?,?,?)",
+        (doc_id, title or "", body or ""),
+    )
+
+
+def remove_fts(conn: sqlite3.Connection, doc_id: int) -> None:
+    conn.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
+
+
+def rechunk(conn: sqlite3.Connection, doc_id: int, body: str) -> list[tuple[int, str]]:
+    """Replace a document's chunks (and drop their vectors). Returns (chunk_id, text)."""
+    old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    if old:
+        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    out: list[tuple[int, str]] = []
+    for ch in chunk_markdown(body):
+        cur = conn.execute(
+            "INSERT INTO chunks(doc_id, ordinal, heading, text, char_start, char_end) "
+            "VALUES(?,?,?,?,?,?)",
+            (doc_id, ch.ordinal, ch.heading, ch.text, ch.char_start, ch.char_end),
+        )
+        out.append((cur.lastrowid, ch.text))
+    return out
+
+
+def clear_chunks(conn: sqlite3.Connection, doc_id: int) -> None:
+    old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    if old:
+        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+
+
+def reindex_links(conn: sqlite3.Connection, doc_id: int, body: str, folder: str) -> None:
+    graph.store_links(conn, doc_id, extract_links(body), folder)
+
+
+def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
+    """Compute + upsert vectors for one document's chunks, then clear vector_dirty.
+    Runs outside the write transaction that produced the chunks."""
+    with db.reader() as conn:
+        rows = conn.execute(
+            "SELECT id, text FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
+        ).fetchall()
+    if not rows:
+        with db.writer() as conn:
+            conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
+        return
+    embs = embedder.embed_passages([r["text"] for r in rows])
+    with db.writer() as conn:
+        existing = {r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))}
+        for r, emb in zip(rows, embs):
+            if r["id"] in existing:
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
+                    (r["id"], Embedder.serialize(emb)),
+                )
+        conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
+
+
+def embed_pending(db, embedder: Embedder, doc_id: int | None = None) -> int:
+    """Embed a single doc, or sweep all docs with vector_dirty=1. Returns count."""
+    with db.reader() as conn:
+        if doc_id is None:
+            ids = [r[0] for r in conn.execute(
+                "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0"
+            )]
+        else:
+            ids = [doc_id]
+    for did in ids:
+        embed_doc(db, embedder, did)
+    return len(ids)

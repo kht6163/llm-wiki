@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ doc.title }}{% endblock %}
+{% block content %}
+<div class="layout">
+  <article class="doc">
+    <div class="doc-head">
+      <h1>{{ doc.title }}</h1>
+      <div class="doc-actions">
+        {% if user.can_write %}
+          <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
+          <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
+                onsubmit="return confirm('이 문서를 삭제할까요?')">
+            <input type="hidden" name="base_version" value="{{ doc.version }}">
+            <button type="submit" class="danger">삭제</button>
+          </form>
+        {% endif %}
+        <a href="/doc/{{ doc.path|urlpath }}/history">이력</a>
+        <a href="/graph?root={{ doc.path|urlpath }}">그래프</a>
+      </div>
+    </div>
+    <div class="doc-meta">
+      <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at }}
+      {% if doc.updated_by %} · {{ doc.updated_by }}{% endif %}
+      {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
+    </div>
+    <div class="rendered">{{ html|safe }}</div>
+  </article>
+  <aside class="sidebar">
+    <h3>백링크 ({{ backlinks|length }})</h3>
+    <ul>
+      {% for b in backlinks %}<li><a href="/doc/{{ b.src_path|urlpath }}">{{ b.src_title or b.src_path }}</a></li>
+      {% else %}<li class="muted">없음</li>{% endfor %}
+    </ul>
+    <h3>나가는 링크</h3>
+    <ul>
+      {% for l in outgoing %}<li>
+        {% if l.dst_path %}<a href="/doc/{{ l.dst_path|urlpath }}">{{ l.dst_title or l.dst_path }}</a>
+        {% else %}<span class="broken">{{ l.dst_name }} (없음)</span>{% endif %}
+      </li>{% else %}<li class="muted">없음</li>{% endfor %}
+    </ul>
+  </aside>
+</div>
+{% endblock %}

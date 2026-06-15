@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}API 키{% endblock %}
+{% block content %}
+<h1>API 키 (MCP 접속용)</h1>
+{% if new_key %}
+<div class="newkey">
+  <strong>새 키 (이번 한 번만 표시됩니다):</strong>
+  <code class="bigkey">{{ new_key }}</code>
+  <p class="muted">MCP 클라이언트에서 <code>Authorization: Bearer {{ new_key }}</code> 헤더로 사용하세요.</p>
+</div>
+{% endif %}
+<form method="post" action="/settings/keys" class="inline">
+  <input name="name" placeholder="키 이름 (예: my-agent)" required>
+  <button>새 키 발급</button>
+</form>
+<table class="revtable">
+  <thead><tr><th>이름</th><th>prefix</th><th>생성</th><th>마지막 사용</th><th>상태</th><th></th></tr></thead>
+  <tbody>
+  {% for k in keys %}
+    <tr>
+      <td>{{ k.name }}</td>
+      <td><code>{{ k.key_prefix }}…</code></td>
+      <td>{{ k.created_at }}</td>
+      <td>{{ k.last_used_at or '—' }}</td>
+      <td>{% if k.revoked_at %}<span class="muted">폐기됨</span>{% else %}활성{% endif %}</td>
+      <td>{% if not k.revoked_at %}
+        <form method="post" action="/settings/keys/{{ k.id }}/revoke" class="inline"><button class="danger">폐기</button></form>
+      {% endif %}</td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">발급된 키가 없습니다.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted">MCP 엔드포인트(streamable-http): <code>http://{{ request.url.hostname }}:&lt;MCP_PORT&gt;/mcp</code></p>
+{% endblock %}

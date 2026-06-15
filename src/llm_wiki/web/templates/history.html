@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}이력 · {{ path }}{% endblock %}
+{% block content %}
+<h1>이력 · <a href="/doc/{{ path|urlpath }}">{{ path }}</a></h1>
+<p class="muted">현재 버전 v{{ current_version }}</p>
+<table class="revtable">
+  <thead><tr><th>버전</th><th>작업</th><th>작성자</th><th>시각</th><th></th></tr></thead>
+  <tbody>
+  {% for r in revisions %}
+    <tr>
+      <td>v{{ r.version }}</td>
+      <td>{{ r.op }}</td>
+      <td>{{ r.author or '—' }}</td>
+      <td>{{ r.created_at }}</td>
+      <td><a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

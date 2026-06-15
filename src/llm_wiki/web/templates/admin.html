@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}사용자 관리{% endblock %}
+{% block content %}
+<h1>사용자 관리</h1>
+<form method="post" action="/admin/users" class="inline">
+  <input name="username" placeholder="아이디" required>
+  <input name="password" type="password" placeholder="비밀번호" required>
+  <select name="role">
+    <option value="admin">admin</option>
+    <option value="editor" selected>editor</option>
+    <option value="viewer">viewer</option>
+  </select>
+  <button>추가</button>
+</form>
+<table class="revtable">
+  <thead><tr><th>아이디</th><th>역할</th><th>상태</th><th>가입</th><th>비밀번호</th><th></th></tr></thead>
+  <tbody>
+  {% for u in users %}
+    <tr>
+      <td>{{ u.username }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/role" class="inline">
+          <select name="role" onchange="this.form.submit()">
+            {% for r in ['admin','editor','viewer'] %}<option value="{{ r }}" {{ 'selected' if u.role==r }}>{{ r }}</option>{% endfor %}
+          </select>
+        </form>
+      </td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/active" class="inline">
+          <input type="hidden" name="active" value="{{ 0 if u.is_active else 1 }}">
+          <button>{{ '활성' if u.is_active else '비활성' }}</button>
+        </form>
+      </td>
+      <td>{{ u.created_at }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/password" class="inline">
+          <input name="password" type="password" placeholder="새 비밀번호" size="12" required>
+          <button>변경</button>
+        </form>
+      </td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/delete" class="inline" onsubmit="return confirm('삭제할까요?')">
+          <button class="danger">삭제</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
