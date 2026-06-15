@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..db import Database
 from ..util import now_iso
-from .auth import MIN_PASSWORD_LEN, ROLES, hash_password
+from .auth import MIN_PASSWORD_LEN, ROLES, hash_password, invalidate_credentials
 from .errors import NotFoundError, ValidationError
 
 
@@ -62,6 +62,10 @@ def set_active(db: Database, user_id: int, active: bool) -> None:
             "UPDATE users SET is_active=?, updated_at=? WHERE id=?",
             (1 if active else 0, now_iso(), user_id),
         )
+        # Deactivating revokes every access path (sessions + API keys); the user
+        # cannot have either while disabled.
+        if not active:
+            invalidate_credentials(conn, user_id)
 
 
 def set_password(db: Database, user_id: int, password: str) -> None:
@@ -74,6 +78,9 @@ def set_password(db: Database, user_id: int, password: str) -> None:
             "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
             (hash_password(password), now_iso(), user_id),
         )
+        # A password change invalidates anything minted under the old credential:
+        # existing sessions are dropped and all API keys revoked (see CLAUDE.md).
+        invalidate_credentials(conn, user_id)
 
 
 def delete_user(db: Database, user_id: int) -> None:

@@ -9,23 +9,28 @@
 <body>
 <header class="topbar">
   <a class="brand" href="/">📚 llm-wiki</a>
-  <form class="searchbox" action="/search" method="get">
-    <input type="search" name="q" placeholder="검색…" value="{{ q|default('') }}">
+  <form class="searchbox" action="/search" method="get" role="search">
+    <input type="search" name="q" placeholder="검색…" aria-label="검색" value="{{ q|default('') }}">
   </form>
-  <nav>
-    {% if user %}
-      <a href="/">문서</a>
-      <a href="/tags">태그</a>
-      <a href="/graph">그래프</a>
-      {% if user.can_write %}<a href="/new">새 문서</a>{% endif %}
-      <a href="/settings">API 키</a>
-      {% if user.can_admin %}<a href="/admin/users">사용자</a>{% endif %}
-      <span class="who">{{ user.username }} · {{ user.role }}</span>
-      <a href="/logout">로그아웃</a>
-    {% endif %}
+  {% if user %}
+  <nav class="nav" aria-label="주 메뉴">
+    <details class="navmenu">
+      <summary aria-label="메뉴 열기">☰ 메뉴</summary>
+      <div class="navlinks">
+        <a href="/">문서</a>
+        <a href="/tags">태그</a>
+        <a href="/graph">그래프</a>
+        {% if user.can_write %}<a href="/new">새 문서</a>{% endif %}
+        <a href="/settings">API 키</a>
+        {% if user.can_admin %}<a href="/admin/users">사용자</a>{% endif %}
+        <span class="who">{{ user.username }} · {{ user.role }}</span>
+        <a href="/logout">로그아웃</a>
+      </div>
+    </details>
   </nav>
+  {% endif %}
 </header>
-{% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+{% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
 <main>{% block content %}{% endblock %}</main>
 </body>
 </html>

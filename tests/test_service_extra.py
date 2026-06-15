@@ -156,3 +156,63 @@ def test_audit_log_records_writes(ctx, principals):
     from llm_wiki.services import audit
     actions = {row["action"] for row in audit.recent(ctx.db)}
     assert {"doc_create", "doc_delete"} <= actions
+
+
+# -- batch C: agent-editing surface ----------------------------------------
+def test_outline_lists_headings(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "o.md", "# Top\n\n## Sub A\n\n### Deep\n\n## Sub B\n")
+    levels = [(h["level"], h["text"]) for h in docs.outline("o.md")["headings"]]
+    assert (1, "Top") in levels and (2, "Sub A") in levels and (3, "Deep") in levels
+
+
+def test_broken_links_reports_only_unresolved(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "src.md", "[[NopeTarget]] and [[real]]")
+    docs.create(p, "real.md", "x")  # backfills/resolves src's [[real]]
+    targets = {lk["target"] for lk in docs.broken_links()["links"]}
+    assert "nopetarget" in targets and "real" not in targets
+
+
+def test_section_edit_base_version_conflict(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "sv.md", "# T\n\n## A\nold\n")
+    stale = docs.get("sv.md")["version"]  # 1
+    docs.append_section(p, "sv.md", "A", "more")  # bumps to v2
+    with pytest.raises(ConflictError):
+        docs.replace_section(p, "sv.md", "A", "rewrite", base_version=stale)
+    # Without base_version it applies on top of the current version.
+    out = docs.replace_section(p, "sv.md", "A", "fresh")
+    assert "fresh" in out["content"]
+
+
+def test_patch_tags_add_and_remove(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "t.md", "---\ntags: [keep, drop]\n---\nbody")
+    out = docs.patch_tags(p, "t.md", add=["new"], remove=["drop"])
+    assert "new" in out["tags"] and "keep" in out["tags"] and "drop" not in out["tags"]
+    before = docs.get("t.md")["version"]
+    out2 = docs.patch_tags(p, "t.md", add=["new"])  # no net change -> idempotent
+    assert sorted(out2["tags"]) == sorted(out["tags"])
+    assert docs.get("t.md")["version"] == before  # no needless version bump
+
+
+def test_folders_lists_distinct(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "x/a.md", "a")
+    docs.create(p, "y/b.md", "b")
+    docs.create(p, "top.md", "c")
+    assert docs.folders() == ["x", "y"]
+
+
+def test_save_attachment_validates_type_and_size(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    res = docs.save_attachment(p, "pic.png", b"\x89PNG\r\n\x1a\n123")
+    assert res["url"].startswith("/attachments/") and res["markdown"].startswith("![")
+    # identical content is content-addressed to the same path
+    assert docs.save_attachment(p, "pic.png", b"\x89PNG\r\n\x1a\n123")["path"] == res["path"]
+    with pytest.raises(ValidationError):
+        docs.save_attachment(p, "evil.exe", b"MZ")
+    from llm_wiki.services.errors import ForbiddenError
+    with pytest.raises(ForbiddenError):
+        docs.save_attachment(principals["viewer"], "pic.png", b"\x89PNG")

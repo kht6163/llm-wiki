@@ -2,16 +2,23 @@
 {% block title %}검색{% endblock %}
 {% block content %}
 <h1>검색</h1>
-<form action="/search" method="get" class="searchform">
-  <input type="search" name="q" value="{{ q }}" placeholder="검색어" autofocus>
-  <select name="mode">
+<form action="/search" method="get" class="searchform" role="search">
+  <input type="search" name="q" value="{{ q }}" placeholder="검색어" aria-label="검색어" autofocus>
+  <select name="mode" aria-label="검색 방식">
     <option value="hybrid" {{ 'selected' if mode=='hybrid' }}>하이브리드</option>
     <option value="bm25" {{ 'selected' if mode=='bm25' }}>BM25(어휘)</option>
     <option value="vector" {{ 'selected' if mode=='vector' }}>의미(벡터)</option>
   </select>
+  <input type="text" name="folder" value="{{ folder }}" placeholder="폴더(선택)" aria-label="폴더 필터"
+         list="folders" autocomplete="off" size="14">
+  <datalist id="folders">{% for f in folders %}<option value="{{ f }}"></option>{% endfor %}</datalist>
+  <input type="text" name="tag" value="{{ tag }}" placeholder="태그(선택)" aria-label="태그 필터" size="10">
+  <select name="top_k" aria-label="결과 수">
+    {% for n in [10, 20, 50] %}<option value="{{ n }}" {{ 'selected' if top_k==n }}>{{ n }}개</option>{% endfor %}
+  </select>
   <button>검색</button>
 </form>
-{% if q %}<p class="muted">{{ results|length }}건</p>{% endif %}
+{% if q %}<p class="muted" role="status">{{ results|length }}건{% if truncated %} · 상위 {{ top_k }}개까지 표시(더 보려면 결과 수를 늘리세요){% endif %}</p>{% endif %}
 <ul class="results">
   {% for r in results %}
     <li>

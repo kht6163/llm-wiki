@@ -187,3 +187,81 @@ def test_api_key_minted_in_response_not_session(client):
     # The full raw key must not survive into a later GET (it was rendered directly,
     # never round-tripped through the session cookie). The prefix may still show.
     assert full not in client.get("/settings").text
+
+
+# -- batch A: metrics ------------------------------------------------------
+def test_metrics_endpoint_exposes_prometheus(client):
+    login(client, "admin")
+    client.get("/")  # generate a request to count
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "llmwiki_http_requests_total" in r.text
+
+
+# -- batch D: attachments / upload -----------------------------------------
+_PNG = b"\x89PNG\r\n\x1a\n" + bytes(40)
+
+
+def test_upload_and_serve_attachment(client):
+    login(client, "admin")
+    tok = _token(client, "/new")
+    r = client.post("/api/upload", files={"file": ("pic.png", _PNG, "image/png")},
+                    headers={"X-CSRF-Token": tok})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["url"].startswith("/attachments/")
+    got = client.get(body["url"])
+    assert got.status_code == 200 and got.content == _PNG
+
+
+def test_svg_attachment_served_without_script_execution(client):
+    login(client, "admin")
+    tok = _token(client, "/new")
+    svg = b"<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>"
+    r = client.post("/api/upload", files={"file": ("d.svg", svg, "image/svg+xml")},
+                    headers={"X-CSRF-Token": tok})
+    assert r.status_code == 200
+    got = client.get(r.json()["url"])
+    assert got.status_code == 200
+    csp = got.headers.get("content-security-policy", "")
+    # A directly-opened SVG must not run scripts (overrides the site's inline-allowing CSP).
+    assert "script-src 'none'" in csp
+
+
+def test_upload_rejects_unsupported_type(client):
+    login(client, "admin")
+    tok = _token(client, "/new")
+    r = client.post("/api/upload", files={"file": ("evil.exe", b"MZ", "application/octet-stream")},
+                    headers={"X-CSRF-Token": tok})
+    assert r.status_code == 400 and r.json()["error"]["code"] == "validation"
+
+
+def test_upload_forbidden_for_viewer(client):
+    login(client, "bob")  # viewer
+    tok = _token(client, "/settings")
+    r = client.post("/api/upload", files={"file": ("p.png", _PNG, "image/png")},
+                    headers={"X-CSRF-Token": tok})
+    assert r.status_code == 403 and r.json()["error"]["code"] == "forbidden"
+
+
+# -- batch D: search filters + bad-path handling + responsive nav ----------
+def test_search_folder_filter(client):
+    login(client, "admin")
+    create_doc(client, "notes/a.md", "alpha keyword here")
+    create_doc(client, "other/b.md", "alpha keyword here too")
+    r = client.get("/search?q=alpha&folder=notes&top_k=10")
+    assert r.status_code == 200
+    assert "notes/a.md" in r.text and "other/b.md" not in r.text
+
+
+def test_traversal_path_is_400_not_500(client):
+    login(client, "admin")
+    tok = _token(client, "/new")
+    r = client.post("/new", data={"path": "../escape.md", "content": "x", "csrf_token": tok})
+    assert r.status_code == 400
+
+
+def test_nav_renders_responsive_menu(client):
+    login(client, "admin")
+    html = client.get("/").text
+    assert 'class="navmenu"' in html and "navlinks" in html

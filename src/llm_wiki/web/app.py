@@ -10,13 +10,21 @@ from pathlib import Path
 from urllib.parse import quote
 
 import bleach
-from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from ..markdown_render import render_markdown
+from ..metrics import PrometheusMiddleware, render_latest
 from ..runtime import AppContext
 from ..search import search as run_search
 from ..services import audit
@@ -34,6 +42,7 @@ from ..services.auth import (
     revoke_api_key,
 )
 from ..services.errors import ConflictError, WikiError
+from ..util import PathError
 from .security import (
     RateLimiter,
     SecurityHeadersMiddleware,
@@ -76,6 +85,7 @@ def create_web_app(app: AppContext) -> FastAPI:
     web = FastAPI(title="llm-wiki", dependencies=[Depends(enforce_csrf)])
     secret = get_or_create_session_secret(db, app.settings.session_secret)
     web.add_middleware(SecurityHeadersMiddleware)
+    web.add_middleware(PrometheusMiddleware)
     web.add_middleware(
         SessionMiddleware, secret_key=secret, same_site="lax",
         https_only=app.settings.cookie_secure, max_age=14 * 86400,
@@ -96,6 +106,14 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     def login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=303)
+
+    @web.exception_handler(PathError)
+    async def _on_path_error(request: Request, exc: PathError):
+        # An unsafe/malformed path is a client error, not a 500. API routes get JSON;
+        # pages get the HTML error template.
+        if request.url.path.startswith(("/api/", "/attachments/")):
+            return JSONResponse({"ok": False, "error": "bad_path", "message": str(exc)}, status_code=400)
+        return render("error.html", request, status=400, message=f"잘못된 경로입니다: {exc}")
 
     # ---- auth -----------------------------------------------------------
     @web.get("/login", response_class=HTMLResponse)
@@ -152,6 +170,14 @@ def create_web_app(app: AppContext) -> FastAPI:
         code = 200 if ready else 503
         return JSONResponse({"ok": ready, "ready": ready, "model_loaded": embedder.is_loaded}, status_code=code)
 
+    @web.get("/metrics")
+    def metrics():
+        # Prometheus exposition over the shared process registry (web + MCP). Like
+        # /healthz this is unauthenticated; restrict it at the network layer if the
+        # port is exposed beyond the scrape target.
+        body, ctype = render_latest()
+        return Response(content=body, media_type=ctype)
+
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
     def home(request: Request, folder: str | None = None, tag: str | None = None,
@@ -174,13 +200,21 @@ def create_web_app(app: AppContext) -> FastAPI:
         return render("tags.html", request, tags=docs.tags())
 
     @web.get("/search", response_class=HTMLResponse)
-    def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20):
+    def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20,
+                    folder: str | None = None, tag: str | None = None):
         if not user(request):
             return login_redirect()
+        top_k = max(1, min(int(top_k), 50))
+        tags = [tag] if tag and tag.strip() else None
         results = []
         if q.strip():
-            results = [r.to_dict() for r in run_search(db, embedder, q, mode=mode, top_k=top_k)]
-        return render("search.html", request, q=q, mode=mode, results=results)
+            results = [r.to_dict() for r in run_search(
+                db, embedder, q, mode=mode, top_k=top_k,
+                folder=folder or None, tags=tags)]
+        truncated = len(results) >= top_k
+        return render("search.html", request, q=q, mode=mode, top_k=top_k,
+                      folder=folder or "", tag=tag or "", results=results,
+                      truncated=truncated, folders=docs.folders())
 
     @web.get("/graph", response_class=HTMLResponse)
     def graph_page(request: Request, root: str | None = None):
@@ -206,6 +240,38 @@ def create_web_app(app: AppContext) -> FastAPI:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse({"ok": True, "html": render_markdown(content, path or "preview.md")})
 
+    @web.post("/api/upload")
+    async def api_upload(request: Request, file: UploadFile = File(...)):
+        p = user(request)
+        if not p:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        data = await file.read()
+        try:
+            res = docs.save_attachment(p, file.filename or "file", data)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        audit.record_tx(db, actor=p.username, via="web", action="attachment_upload", target=res["path"])
+        return JSONResponse({"ok": True, **res})
+
+    @web.get("/attachments/{subpath:path}")
+    def attachment(subpath: str, request: Request):
+        if not user(request):
+            return login_redirect()
+        try:
+            target = docs.attachment_file(subpath)
+        except WikiError as e:
+            return render("error.html", request, status=e.http_status, message=e.message)
+        # Hardened CSP overrides the site default (which permits inline scripts):
+        # an SVG opened directly as a document must not execute scripts. The explicit
+        # script-src 'none' is unambiguous, sandbox strips same-origin/JS as defense
+        # in depth, and Content-Disposition: inline keeps it from being treated as a
+        # download. <img> embedding is governed by the embedding page's CSP (the
+        # resource's own CSP is ignored for subresource loads), so images still render.
+        return FileResponse(target, headers={
+            "Content-Security-Policy": "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+        })
+
     @web.get("/go")
     def go(request: Request, target: str, **_):
         if not user(request):
@@ -222,7 +288,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not p:
             return login_redirect()
         return render("edit.html", request, is_new=True, path=path, title="", content="",
-                      base_version=0, conflict=None, error=None, can_write=p.can_write)
+                      base_version=0, conflict=None, error=None, can_write=p.can_write,
+                      folders=docs.folders())
 
     @web.post("/new")
     def new_post(request: Request, path: str = Form(...), content: str = Form(""), title: str = Form("")):
@@ -234,7 +301,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         except WikiError as e:
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
-                          error=e.message, can_write=p.can_write)
+                          error=e.message, can_write=p.can_write, folders=docs.folders())
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}/edit", response_class=HTMLResponse)

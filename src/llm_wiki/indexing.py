@@ -57,64 +57,90 @@ def reindex_links(conn: sqlite3.Connection, doc_id: int, body: str, folder: str)
 
 def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
     """Compute + upsert vectors for one document's chunks, then clear vector_dirty.
-    Runs outside the write transaction that produced the chunks."""
+    Runs outside the write transaction that produced the chunks.
+
+    Concurrency: another edit may rechunk this doc between the read below and the
+    write. We match by (chunk_id, text) — not id alone, since SQLite reuses rowids
+    after a delete — and only write a vector when the chunk's text still matches what
+    we embedded. vector_dirty is cleared only when every current chunk was matched;
+    otherwise the changed chunks stay dirty for a later embed."""
     with db.reader() as conn:
         rows = conn.execute(
             "SELECT id, text FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
         ).fetchall()
-    if not rows:
-        with db.writer() as conn:
-            conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
-        return
-    embs = embedder.embed_passages([r["text"] for r in rows])
+    embs = embedder.embed_passages([r["text"] for r in rows]) if rows else []
+    embedded = {r["id"]: (r["text"], emb) for r, emb in zip(rows, embs, strict=False)}
     with db.writer() as conn:
-        existing = {r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))}
-        for r, emb in zip(rows, embs, strict=False):
-            if r["id"] in existing:
+        current = {
+            r["id"]: r["text"]
+            for r in conn.execute("SELECT id, text FROM chunks WHERE doc_id=?", (doc_id,))
+        }
+        all_matched = True
+        for cid, ctext in current.items():
+            hit = embedded.get(cid)
+            if hit is not None and hit[0] == ctext:
+                # vec0 doesn't honor INSERT OR REPLACE; delete any prior vector first.
+                conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (cid,))
                 conn.execute(
-                    "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
-                    (r["id"], Embedder.serialize(emb)),
+                    "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
+                    (cid, Embedder.serialize(hit[1])),
                 )
-        conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
+            else:
+                all_matched = False
+        if all_matched:  # current set fully (re)embedded — true also when there are no chunks
+            conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
 
 
 def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64) -> int:
     """Embed a single doc, or sweep all docs with vector_dirty=1. Returns the number
-    of documents embedded.
+    of documents whose vectors were brought up to date.
 
-    The sweep path (doc_id is None, used by reindex) batches encode calls across
-    *all* dirty chunks and writes every vector in one transaction, instead of one
-    encode + one writer transaction per document. This turns a large-vault reembed
-    from O(docs) torch/commit round-trips into O(chunks/batch)."""
+    The sweep path (doc_id is None, used by reindex) batches the expensive encode
+    across *all* dirty chunks, then writes in one transaction. The write is verified
+    per document — exactly like embed_doc — so vector_dirty is cleared ONLY for docs
+    whose current chunk set was fully embedded with matching (chunk_id, text). This
+    prevents a doc created or rechunked mid-sweep (possibly from another process) from
+    being marked clean without its vectors and then never retried."""
     if doc_id is not None:
         embed_doc(db, embedder, doc_id)
         return 1
 
     with db.reader() as conn:
+        dirty = [r[0] for r in conn.execute(
+            "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0")]
         rows = conn.execute(
             "SELECT c.id AS chunk_id, c.text AS text "
             "FROM chunks c JOIN documents d ON d.id=c.doc_id "
             "WHERE d.vector_dirty=1 AND d.is_deleted=0 ORDER BY c.doc_id, c.ordinal"
         ).fetchall()
-        dirty = [r[0] for r in conn.execute(
-            "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0")]
     if not dirty:
         return 0
-    if rows:
-        texts = [r["text"] for r in rows]
-        vectors: list = []
-        for i in range(0, len(texts), batch_size):
-            vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
-        with db.writer() as conn:
-            for r, emb in zip(rows, vectors, strict=False):
-                conn.execute(
-                    "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
-                    (r["chunk_id"], Embedder.serialize(emb)),
-                )
-            conn.executemany(
-                "UPDATE documents SET vector_dirty=0 WHERE id=?", [(d,) for d in dirty])
-    else:
-        with db.writer() as conn:
-            conn.executemany(
-                "UPDATE documents SET vector_dirty=0 WHERE id=?", [(d,) for d in dirty])
-    return len(dirty)
+    texts = [r["text"] for r in rows]
+    vectors: list = []
+    for i in range(0, len(texts), batch_size):
+        vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
+    embedded = {r["chunk_id"]: (r["text"], emb) for r, emb in zip(rows, vectors, strict=False)}
+
+    cleared = 0
+    with db.writer() as conn:
+        for did in dirty:
+            current = {
+                r["id"]: r["text"]
+                for r in conn.execute("SELECT id, text FROM chunks WHERE doc_id=?", (did,))
+            }
+            all_matched = True
+            for cid, ctext in current.items():
+                hit = embedded.get(cid)
+                if hit is not None and hit[0] == ctext:
+                    # vec0 doesn't honor INSERT OR REPLACE; delete any prior vector first.
+                    conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (cid,))
+                    conn.execute(
+                        "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
+                        (cid, Embedder.serialize(hit[1])),
+                    )
+                else:
+                    all_matched = False
+            if all_matched:  # fully (re)embedded — also true for a chunk-less doc
+                conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (did,))
+                cleared += 1
+    return cleared

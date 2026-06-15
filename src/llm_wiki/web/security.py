@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import hmac
 import secrets
-import threading
-import time
-from collections import defaultdict, deque
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from ..ratelimit import RateLimiter
+
+# Re-exported for callers that still import RateLimiter from this module.
+__all__ = ["RateLimiter", "SecurityHeadersMiddleware", "enforce_csrf", "get_csrf_token"]
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
@@ -65,41 +67,6 @@ async def enforce_csrf(request: Request) -> None:
         sent = value if isinstance(value, str) else None
     if not expected or not sent or not hmac.compare_digest(sent, str(expected)):
         raise HTTPException(status_code=403, detail="Missing or invalid CSRF token.")
-
-
-# -- login rate limiting ---------------------------------------------------
-class RateLimiter:
-    """In-memory sliding-window limiter (single process). Tracks failures per key
-    (IP and username) and blocks once a key exceeds ``max_attempts`` in the
-    window. Successful logins reset the key."""
-
-    def __init__(self, max_attempts: int = 8, window_s: float = 300.0):
-        self.max_attempts = max_attempts
-        self.window_s = window_s
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
-        self._lock = threading.Lock()
-
-    def _prune(self, dq: deque[float], now: float) -> None:
-        while dq and now - dq[0] > self.window_s:
-            dq.popleft()
-
-    def allowed(self, key: str) -> bool:
-        now = time.monotonic()
-        with self._lock:
-            dq = self._hits[key]
-            self._prune(dq, now)
-            return len(dq) < self.max_attempts
-
-    def record_failure(self, key: str) -> None:
-        now = time.monotonic()
-        with self._lock:
-            dq = self._hits[key]
-            self._prune(dq, now)
-            dq.append(now)
-
-    def reset(self, key: str) -> None:
-        with self._lock:
-            self._hits.pop(key, None)
 
 
 # -- response headers ------------------------------------------------------

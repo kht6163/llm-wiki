@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass
 
 from .embedding import Embedder
+from .metrics import SEARCH_QUERIES
 
 RRF_K = 60
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
@@ -80,6 +81,7 @@ def search(
 ) -> list[SearchResult]:
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
+    SEARCH_QUERIES.labels(mode).inc()
     top_k = max(1, min(int(top_k), 50))
     k = max(top_k * 4, 40)
 

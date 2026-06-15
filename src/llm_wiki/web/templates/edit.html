@@ -25,15 +25,21 @@
       data-path="{{ path }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   {% if is_new %}
-    <label>경로 <input type="text" name="path" value="{{ path }}" placeholder="folder/note.md" required></label>
+    <label>경로 <input type="text" name="path" value="{{ path }}" placeholder="folder/note.md"
+                       list="folders" autocomplete="off" required></label>
+    <datalist id="folders">
+      {% for f in folders|default([]) %}<option value="{{ f }}/"></option>{% endfor %}
+    </datalist>
   {% else %}
     <input type="hidden" name="base_version" value="{{ base_version }}">
   {% endif %}
   <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="(비우면 자동 추출)"></label>
   <div class="editor-pane">
-    <textarea id="editor" name="content" rows="26" spellcheck="false">{{ content }}</textarea>
-    <div id="preview" class="rendered preview" aria-label="미리보기"></div>
+    <textarea id="editor" name="content" rows="26" spellcheck="false"
+              aria-label="마크다운 본문">{{ content }}</textarea>
+    <div id="preview" class="rendered preview" aria-label="미리보기" aria-live="polite"></div>
   </div>
+  <p class="muted edit-hint">서식: <kbd>Ctrl/⌘+B</kbd> 굵게 · <kbd>Ctrl/⌘+I</kbd> 기울임 · <kbd>Ctrl/⌘+K</kbd> 링크 · <kbd>Tab</kbd> 들여쓰기 · <kbd>Ctrl/⌘+S</kbd> 저장. 이미지는 끌어다 놓거나 붙여넣기로 업로드됩니다.</p>
   <div class="form-actions">
     <button type="submit" {% if not can_write %}disabled{% endif %}>저장</button>
     <label class="muted"><input type="checkbox" id="preview-toggle" checked> 미리보기</label>

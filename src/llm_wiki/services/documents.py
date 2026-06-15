@@ -8,15 +8,23 @@ from the latest revision (see ``recover_pending``).
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from .. import graph, indexing
 from ..db import Database
 from ..embedding import Embedder
-from ..markdown_utils import derive_title, extract_tags, parse_frontmatter
+from ..markdown_utils import (
+    derive_title,
+    extract_tags,
+    parse_frontmatter,
+    set_frontmatter_tags,
+)
+from ..metrics import DOC_WRITES
 from ..util import (
     basename_stem,
     folder_of,
@@ -31,6 +39,11 @@ from .auth import Principal
 from .errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+# Uploaded images/files live under this vault subdir (excluded from the .md scan).
+ATTACH_DIR = "_attachments"
+ATTACH_MAX_BYTES = 10 * 1024 * 1024
+ALLOWED_ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".pdf"}
 
 
 def _locate_section(body: str, heading: str):
@@ -218,6 +231,23 @@ class DocumentService:
             ).fetchall()
         return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
+    def folders(self) -> list[str]:
+        """Distinct non-empty folder paths across non-deleted documents (sorted)."""
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT folder FROM documents WHERE is_deleted=0 AND folder<>'' "
+                "ORDER BY folder"
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def attachment_file(self, subpath: str) -> Path:
+        """Resolve an uploaded attachment to a real file under the vault, safely.
+        Raises PathError for traversal, NotFoundError if missing."""
+        target = safe_join(self.vault / ATTACH_DIR, subpath)
+        if not target.is_file():
+            raise NotFoundError("No such attachment.", path=subpath)
+        return target
+
     def tags(self) -> list[dict]:
         """Tag vocabulary across non-deleted documents, most-used first."""
         with self.db.reader() as conn:
@@ -348,6 +378,7 @@ class DocumentService:
         with self.db.writer() as conn:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         indexing.embed_doc(self.db, self.embedder, doc_id)
+        DOC_WRITES.labels("create").inc()
         return self.get(rel)
 
     def update(self, principal: Principal, path: str, base_version: int, content: str,
@@ -400,6 +431,7 @@ class DocumentService:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         if content_changed:
             indexing.embed_doc(self.db, self.embedder, doc_id)
+        DOC_WRITES.labels("update").inc()
         return self.get(rel)
 
     # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
@@ -410,9 +442,21 @@ class DocumentService:
             raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
         lines, start, end, _ = loc
         return {"path": doc["path"], "heading": heading, "version": doc["version"],
-                "content": "".join(lines[start:end])}
+                "tags": doc["tags"], "content": "".join(lines[start:end])}
 
-    def replace_section(self, principal: Principal, path: str, heading: str, text: str) -> dict:
+    def outline(self, path: str) -> dict:
+        """Flat heading outline of a document: [{level, text, line}] (1-based lines).
+        Lets an agent discover exact heading strings before a section read/edit."""
+        doc = self.get(path)
+        headings: list[dict] = []
+        for i, line in enumerate(doc["content"].splitlines()):
+            m = _HEADING_RE.match(line)
+            if m:
+                headings.append({"level": len(m.group(1)), "text": m.group(2).strip(), "line": i + 1})
+        return {"path": doc["path"], "version": doc["version"], "headings": headings}
+
+    def replace_section(self, principal: Principal, path: str, heading: str, text: str,
+                        base_version: int | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         doc = self.get(path)
@@ -422,9 +466,11 @@ class DocumentService:
         lines, start, end, _ = loc
         # Keep the heading line; replace its body up to the next same/higher heading.
         body = "".join(lines[:start + 1]) + _as_block(text) + "".join(lines[end:])
-        return self.update(principal, doc["path"], doc["version"], body)
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, body)
 
-    def append_section(self, principal: Principal, path: str, heading: str, text: str) -> dict:
+    def append_section(self, principal: Principal, path: str, heading: str, text: str,
+                       base_version: int | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         doc = self.get(path)
@@ -433,7 +479,8 @@ class DocumentService:
             raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
         lines, start, end, _ = loc
         body = "".join(lines[:end]) + _as_block(text) + "".join(lines[end:])
-        return self.update(principal, doc["path"], doc["version"], body)
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, body)
 
     def patch(self, principal: Principal, path: str, find: str, replace: str,
               base_version: int | None = None, count: int = 1) -> dict:
@@ -452,6 +499,31 @@ class DocumentService:
         new_body = doc["content"].replace(find, replace, count if count else -1)
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, new_body)
+
+    def patch_tags(self, principal: Principal, path: str, add: list[str] | None = None,
+                   remove: list[str] | None = None) -> dict:
+        """Add/remove tags by rewriting the frontmatter ``tags`` list (body untouched).
+        Returns the document's resulting tags. Tags written inline as ``#hashtags``
+        in the body are re-derived on save, so they cannot be removed this way."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        doc = self.get(path)
+        current = set(doc["tags"])
+        add_set = {str(t).strip().lstrip("#") for t in (add or []) if str(t).strip()}
+        remove_set = {str(t).strip().lstrip("#") for t in (remove or []) if str(t).strip()}
+        target = sorted((current | add_set) - remove_set)
+        if target == sorted(current):  # no net change — stay idempotent, skip the version bump
+            return {"path": doc["path"], "version": doc["version"], "tags": sorted(current)}
+        new_content = set_frontmatter_tags(doc["content"], target)
+        updated = self.update(principal, doc["path"], doc["version"], new_content)
+        return {"path": updated["path"], "version": updated["version"], "tags": updated["tags"]}
+
+    def broken_links(self, limit: int = 200) -> dict:
+        """Vault-wide unresolved links (dangling references) for cleanup tooling."""
+        limit = max(1, min(int(limit), 2000))
+        with self.db.reader() as conn:
+            items = graph.list_broken_links(conn, limit)
+        return {"count": len(items), "links": items}
 
     def move(self, principal: Principal, path: str, new_path: str) -> dict:
         if not principal.can_write:
@@ -493,6 +565,7 @@ class DocumentService:
         mtime = self._write_file(new_rel, body)
         with self.db.writer() as conn:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+        DOC_WRITES.labels("move").inc()
         return self.get(new_rel)
 
     def recent_changes(self, limit: int = 20, since: str | None = None,
@@ -551,7 +624,37 @@ class DocumentService:
             audit.record(conn, actor=principal.username, via=principal.via,
                          action="doc_delete", target=rel, detail=f"v{new_version}")
         self._trash_file(rel)
+        DOC_WRITES.labels("delete").inc()
         return {"ok": True, "path": rel, "deleted": True}
+
+    def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
+        """Store an uploaded image/file under the vault's _attachments dir and return
+        a markdown snippet to embed it. Content-addressed name (sha8) dedups
+        identical uploads and avoids collisions. Type/size are validated."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot upload attachments.")
+        name = (filename or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+        if ext not in ALLOWED_ATTACH_EXTS:
+            raise ValidationError(
+                f"Unsupported attachment type {ext or '(none)'!r}; allowed: "
+                f"{', '.join(sorted(ALLOWED_ATTACH_EXTS))}.")
+        if not data:
+            raise ValidationError("Empty upload.")
+        if len(data) > ATTACH_MAX_BYTES:
+            raise ValidationError(
+                f"Attachment too large ({len(data)} bytes; limit {ATTACH_MAX_BYTES}).")
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", name[: len(name) - len(ext)]).strip("-_.") or "file"
+        digest = hashlib.sha256(data).hexdigest()[:8]
+        sub = f"{stem}-{digest}{ext}"
+        target = safe_join(self.vault / ATTACH_DIR, sub)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():  # content-addressed: skip rewrite of an identical file
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, target)
+        url = "/attachments/" + quote(sub)
+        return {"path": f"{ATTACH_DIR}/{sub}", "url": url, "markdown": f"![{stem}]({url})"}
 
     # ---- maintenance ----------------------------------------------------
     def recover_pending(self) -> int:
@@ -574,6 +677,7 @@ class DocumentService:
         vault = self.vault.resolve()
         seen: set[str] = set()
         created = updated = unchanged = 0
+        skipped_deleted: list[str] = []
         now = now_iso()
         for p in sorted(vault.rglob("*.md")):
             try:
@@ -594,7 +698,13 @@ class DocumentService:
             with self.db.writer() as conn:
                 row = conn.execute(
                     "SELECT id, version, content_hash, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
-                if row and not row["is_deleted"] and row["content_hash"] == chash and not reembed:
+                if row and row["is_deleted"]:
+                    # A soft delete is an explicit, recorded intent and the DB is the
+                    # canonical owner of deletion. An external .md reappearing must NOT
+                    # silently undo it — report it and leave the tombstone in place.
+                    skipped_deleted.append(rel)
+                    continue
+                if row and row["content_hash"] == chash and not reembed:
                     conn.execute("UPDATE documents SET file_mtime=? WHERE id=?", (mtime, row["id"]))
                     unchanged += 1
                     continue
@@ -603,7 +713,7 @@ class DocumentService:
                     new_version = row["version"] + 1
                     conn.execute(
                         "UPDATE documents SET path=?, title=?, version=?, content_hash=?, folder=?, "
-                        "file_state='clean', vector_dirty=1, is_deleted=0, file_mtime=?, updated_at=?, "
+                        "file_state='clean', vector_dirty=1, file_mtime=?, updated_at=?, "
                         "updated_by=NULL WHERE id=?",
                         (rel, title, new_version, chash, folder, mtime, now, doc_id),
                     )
@@ -635,4 +745,5 @@ class DocumentService:
                 if r["path_norm"] not in seen]
         embedded = indexing.embed_pending(self.db, self.embedder)
         return {"created": created, "updated": updated, "unchanged": unchanged,
-                "missing_files": missing, "embedded": embedded}
+                "missing_files": missing, "skipped_deleted": skipped_deleted,
+                "embedded": embedded}

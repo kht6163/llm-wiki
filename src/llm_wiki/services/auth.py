@@ -194,6 +194,33 @@ def revoke_api_key(db: Database, user_id: int, key_id: int) -> None:
         )
 
 
+# -- credential-change invalidation (conn-scoped; run inside the caller's txn) ---
+# Policy (see CLAUDE.md): API keys are NOT time-expired — sustaining long-lived
+# agent keys is intentional. The ONLY automatic revocation triggers are a password
+# change or account deactivation, and the same triggers also drop the user's web
+# sessions. Both run inside the caller's writer transaction so the credential
+# change and its invalidation commit atomically.
+def revoke_user_sessions(conn, user_id: int) -> int:
+    return conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,)).rowcount
+
+
+def revoke_user_api_keys(conn, user_id: int, *, now: str | None = None) -> int:
+    return conn.execute(
+        "UPDATE api_keys SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL",
+        (now or now_iso(), user_id),
+    ).rowcount
+
+
+def invalidate_credentials(conn, user_id: int) -> dict[str, int]:
+    """Revoke all active web sessions AND MCP API keys for a user. Returns the
+    counts touched. Call on password change / deactivation only."""
+    now = now_iso()
+    return {
+        "sessions": revoke_user_sessions(conn, user_id),
+        "api_keys": revoke_user_api_keys(conn, user_id, now=now),
+    }
+
+
 # -- session signing secret ------------------------------------------------
 def get_or_create_session_secret(db: Database, configured: str) -> str:
     if configured:

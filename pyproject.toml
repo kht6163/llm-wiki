@@ -22,6 +22,7 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "python-dotenv>=1.0",
+    "prometheus-client>=0.20",
 ]
 
 [project.scripts]
@@ -69,6 +70,11 @@ src = ["src", "tests"]
 select = ["E", "F", "W", "I", "B", "UP"]
 # E501 (line length) is noisy on long SQL/strings; the formatter handles wrapping.
 ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency markers are designed to be used as argument defaults; this
+# is the idiomatic pattern, not the B008 mutable-default bug.
+extend-immutable-calls = ["fastapi.Depends", "fastapi.File", "fastapi.Form", "fastapi.Query"]
 
 [tool.mypy]
 python_version = "3.12"

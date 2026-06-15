@@ -10,7 +10,7 @@ from pathlib import Path
 
 import uvicorn
 
-from .config import get_settings
+from .config import ConfigError, get_settings
 from .mcp_server import create_mcp_server
 from .runtime import build_context
 from .services import users as users_svc
@@ -57,6 +57,9 @@ def run(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         return _dispatch(args)
+    except ConfigError as e:
+        print(f"configuration error: {e}")
+        return 2
     except WikiError as e:
         print(f"error: {e.message}")
         return 1
@@ -163,7 +166,7 @@ def _serve(args) -> int:
         settings.mcp_port = args.mcp_port
 
     from .logconf import configure_logging
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_file)
 
     print("Loading embedding model… (first run downloads it from HuggingFace)")
     ctx = build_context(settings, full=True)
@@ -176,14 +179,23 @@ def _serve(args) -> int:
     web_app = create_web_app(ctx)
     mcp_app = create_mcp_server(ctx).streamable_http_app()
 
-    # Unauthenticated health route on the MCP app (for orchestrators / probes).
-    from starlette.responses import JSONResponse
+    # Unauthenticated health + metrics routes on the MCP app (for orchestrators /
+    # probes / Prometheus scraping the MCP port). The metrics registry is shared
+    # across both servers, so this exposes the same data as the web /metrics.
+    from starlette.responses import JSONResponse, Response
     from starlette.routing import Route
+
+    from .metrics import render_latest
 
     async def _mcp_health(_req):
         return JSONResponse({"ok": True, "model_loaded": ctx.embedder.is_loaded})
 
+    async def _mcp_metrics(_req):
+        body, ctype = render_latest()
+        return Response(content=body, media_type=ctype)
+
     mcp_app.router.routes.append(Route("/healthz", _mcp_health, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/metrics", _mcp_metrics, methods=["GET"]))
 
     print(f"Web UI : http://{settings.host}:{settings.gui_port}")
     print(f"MCP    : http://{settings.host}:{settings.mcp_port}/mcp  (Authorization: Bearer <api_key>)")

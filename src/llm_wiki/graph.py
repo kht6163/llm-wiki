@@ -111,6 +111,25 @@ def get_backlinks(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def list_broken_links(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:
+    """Every unresolved (dangling) link across non-deleted documents, ordered by
+    source path. ``target`` is the path or bare note name the link points at."""
+    rows = conn.execute(
+        "SELECT d.path AS src_path, l.dst_path_norm, l.dst_name, l.dst_is_path, "
+        "l.link_type, l.alias, l.anchor, l.raw "
+        "FROM links l JOIN documents d ON d.id=l.src_doc_id "
+        "WHERE l.is_resolved=0 AND d.is_deleted=0 "
+        "ORDER BY d.path, l.char_start LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [{
+        "src_path": r["src_path"],
+        "target": r["dst_path_norm"] if r["dst_is_path"] else r["dst_name"],
+        "link_type": r["link_type"], "alias": r["alias"],
+        "anchor": r["anchor"], "raw": r["raw"],
+    } for r in rows]
+
+
 def get_outgoing(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
     rows = conn.execute(
         "SELECT l.dst_path_norm, l.dst_name, l.dst_doc_id, l.is_resolved, l.link_type, "

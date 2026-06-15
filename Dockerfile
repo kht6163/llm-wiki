@@ -28,6 +28,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 VOLUME ["/data", "/vault", "/models"]
 EXPOSE 8080 8081
 
+# Liveness check against the web port (HOST=0.0.0.0 above). start-period covers the
+# embedding-model load on first boot. Uses the venv's python (already on PATH).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3).status==200 else 1)"
+
 # `serve` auto-creates the schema; create the first admin once with:
 #   docker compose run --rm llm-wiki create-admin --username admin
 ENTRYPOINT ["llm-wiki"]

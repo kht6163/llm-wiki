@@ -129,6 +129,45 @@ def extract_tags(meta: dict, text: str) -> list[str]:
     return sorted(t for t in tags if t)
 
 
+def _format_tag_list(tags: list[str]) -> str:
+    parts = []
+    for t in tags:
+        parts.append('"' + t.replace('"', '\\"') + '"' if any(c in t for c in ", []\"'#") else t)
+    return "[" + ", ".join(parts) + "]"
+
+
+def set_frontmatter_tags(content: str, tags: list[str]) -> str:
+    """Rewrite a document's frontmatter ``tags`` to ``tags`` (an inline list),
+    preserving every other frontmatter key and the body. Inserts a frontmatter
+    block if absent and ``tags`` is non-empty; drops the key (and an otherwise-empty
+    block) when ``tags`` is empty. Inline ``#hashtags`` in the body are untouched."""
+    m = FRONTMATTER_RE.match(content or "")
+    if m:
+        rest = content[m.end():]
+        lines = m.group(1).split("\n")
+        kept: list[str] = []
+        i = 0
+        while i < len(lines):
+            km = re.match(r"^([A-Za-z0-9_\-]+):[ \t]*(.*)$", lines[i])
+            if km and km.group(1).strip().lower() == "tags":
+                if km.group(2).strip() == "":  # block list: skip following '- ' items
+                    i += 1
+                    while i < len(lines) and re.match(r"^[ \t]*-[ \t]+", lines[i]):
+                        i += 1
+                else:
+                    i += 1
+                continue
+            kept.append(lines[i])
+            i += 1
+        if tags:
+            kept.append(f"tags: {_format_tag_list(tags)}")
+        body = "\n".join(kept).strip("\n")
+        return f"---\n{body}\n---\n{rest}" if body else rest.lstrip("\n")
+    if not tags:
+        return content
+    return f"---\ntags: {_format_tag_list(tags)}\n---\n\n{content}"
+
+
 def _is_internal_md(url: str) -> bool:
     if not url or url.startswith("#"):
         return False

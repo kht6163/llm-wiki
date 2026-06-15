@@ -42,6 +42,74 @@
     }
   });
 
+  // ---- formatting shortcuts (Ctrl/Cmd-B/I/K) + Tab indent ----
+  function wrap(prefix, suffix) {
+    var s = editor.selectionStart, e = editor.selectionEnd;
+    var sel = editor.value.slice(s, e);
+    editor.setRangeText(prefix + sel + suffix, s, e, "end");
+    if (s === e) editor.setSelectionRange(s + prefix.length, s + prefix.length);
+    else editor.setSelectionRange(s, s + prefix.length + sel.length + suffix.length);
+    schedulePreview();
+  }
+  function makeLink() {
+    var s = editor.selectionStart, e = editor.selectionEnd;
+    var sel = editor.value.slice(s, e) || "텍스트";
+    editor.setRangeText("[" + sel + "](url)", s, e, "end");
+    var urlStart = s + 1 + sel.length + 2;  // after "[sel]("
+    editor.setSelectionRange(urlStart, urlStart + 3);
+    schedulePreview();
+  }
+  function indent(out) {
+    var s = editor.selectionStart, e = editor.selectionEnd, val = editor.value;
+    if (s === e && !out) { editor.setRangeText("  ", s, e, "end"); schedulePreview(); return; }
+    var lineStart = val.lastIndexOf("\n", s - 1) + 1;
+    var seg = val.slice(lineStart, e);
+    var newSeg = out ? seg.replace(/^( {1,2}|\t)/gm, "") : seg.replace(/^/gm, "  ");
+    editor.setRangeText(newSeg, lineStart, e, "end");
+    editor.setSelectionRange(lineStart, lineStart + newSeg.length);
+    schedulePreview();
+  }
+  editor.addEventListener("keydown", function (e) {
+    if (e.key === "Tab" && ac.hidden) { e.preventDefault(); indent(e.shiftKey); return; }
+    if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+    var k = e.key.toLowerCase();
+    if (k === "b") { e.preventDefault(); wrap("**", "**"); }
+    else if (k === "i") { e.preventDefault(); wrap("*", "*"); }
+    else if (k === "k") { e.preventDefault(); makeLink(); }
+  });
+
+  // ---- image / file upload (drag & drop, paste) ----
+  function insertAtCaret(text) {
+    var s = editor.selectionStart, e = editor.selectionEnd;
+    editor.setRangeText(text, s, e, "end");
+    editor.focus();
+    schedulePreview();
+  }
+  function uploadFiles(files) {
+    Array.prototype.forEach.call(files || [], function (f) {
+      var fd = new FormData();
+      fd.append("file", f);
+      fetch("/api/upload", { method: "POST", headers: { "X-CSRF-Token": csrf }, body: fd })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.ok && d.markdown) insertAtCaret(d.markdown + "\n");
+          else alert("업로드 실패: " + ((d && d.error && (d.error.message || d.error)) || "오류"));
+        })
+        .catch(function () { alert("업로드 실패"); });
+    });
+  }
+  editor.addEventListener("dragover", function (e) { e.preventDefault(); editor.classList.add("dropping"); });
+  editor.addEventListener("dragleave", function () { editor.classList.remove("dropping"); });
+  editor.addEventListener("drop", function (e) {
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      e.preventDefault(); editor.classList.remove("dropping"); uploadFiles(e.dataTransfer.files);
+    }
+  });
+  editor.addEventListener("paste", function (e) {
+    var files = e.clipboardData && e.clipboardData.files;
+    if (files && files.length) { e.preventDefault(); uploadFiles(files); }
+  });
+
   // ---- [[wikilink]] autocomplete ----
   if (!ac) return;
   var acItems = [];
