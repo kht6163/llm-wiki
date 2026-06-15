@@ -134,6 +134,34 @@ def test_tags_page(client):
     assert r.status_code == 200 and "alpha" in r.text
 
 
+def test_broken_links_page_lists_dangling_links(client):
+    login(client, "admin")
+    create_doc(client, "src.md", "see [[ghosttarget]] for details")
+    r = client.get("/broken-links")
+    assert r.status_code == 200
+    assert "ghosttarget" in r.text and "src.md" in r.text
+
+
+def test_broken_links_requires_auth(client):
+    r = client.get("/broken-links", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+
+
+def test_api_doc_preview_returns_title_and_excerpt(client):
+    login(client, "admin")
+    create_doc(client, "prev.md", "# Preview Title\n\nThe quick brown fox jumps over.", title="Preview Title")
+    r = client.get("/api/doc/prev.md/preview")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["ok"] and d["title"] == "Preview Title"
+    assert "quick brown fox" in d["excerpt"]
+
+
+def test_list_page_includes_preview_hook(client):
+    login(client, "admin")
+    assert "/static/preview.js" in client.get("/").text
+
+
 def test_security_headers_present(client):
     login(client, "admin")
     h = client.get("/").headers
@@ -236,6 +264,19 @@ def test_upload_rejects_unsupported_type(client):
     assert r.status_code == 400 and r.json()["error"]["code"] == "validation"
 
 
+def test_upload_rejects_oversized_without_buffering(client, monkeypatch):
+    # The size cap must be enforced during the streamed read, not after buffering the
+    # whole body. Shrink the cap so a tiny body trips it.
+    import llm_wiki.web.app as app_mod
+    monkeypatch.setattr(app_mod, "ATTACH_MAX_BYTES", 16)
+    login(client, "admin")
+    tok = _token(client, "/new")
+    big = b"\x89PNG\r\n\x1a\n" + bytes(64)  # > 16 bytes
+    r = client.post("/api/upload", files={"file": ("big.png", big, "image/png")},
+                    headers={"X-CSRF-Token": tok})
+    assert r.status_code == 400 and r.json()["error"]["code"] == "validation"
+
+
 def test_upload_forbidden_for_viewer(client):
     login(client, "bob")  # viewer
     tok = _token(client, "/settings")
@@ -261,7 +302,98 @@ def test_traversal_path_is_400_not_500(client):
     assert r.status_code == 400
 
 
+def test_home_pagination(client):
+    login(client, "admin")
+    # Create more than one page worth (per_page=50) to exercise paging.
+    for i in range(55):
+        create_doc(client, f"p{i:03}.md", f"doc number {i}")
+    first = client.get("/?sort=path").text
+    assert "p000.md" in first and "/ 55" in first  # pager total shown
+    # Page 2 holds the tail; page 1 doesn't.
+    second = client.get("/?sort=path&page=2").text
+    assert "p054.md" in second and "p054.md" not in first
+    assert "p000.md" not in second
+
+
 def test_nav_renders_responsive_menu(client):
     login(client, "admin")
     html = client.get("/").text
     assert 'class="navmenu"' in html and "navlinks" in html
+
+
+# -- realtime: WebSocket live change reflection -----------------------------
+def test_ws_reflects_document_change(client, ctx, principals):
+    login(client, "admin")
+    create_doc(client, "live.md", "# Live\n\noriginal")
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["type"] == "ready"  # subscribed; no event can be missed now
+        # An out-of-band edit (another user / MCP) must be pushed to the viewer.
+        ctx.docs.update(principals["editor"], "live.md", 1, "# Live\n\nchanged")
+        ev = ws.receive_json()
+    assert ev["type"] == "doc_changed" and ev["path"] == "live.md"
+    assert ev["op"] == "update" and ev["version"] == 2
+
+
+def test_ws_receives_create_event(client, ctx, principals):
+    login(client, "admin")
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        ctx.docs.create(principals["editor"], "fresh.md", "# Fresh\n\nbody")
+        ev = ws.receive_json()
+    assert ev["type"] == "doc_changed" and ev["op"] == "create" and ev["path"] == "fresh.md"
+
+
+def test_list_page_has_realtime_hook(client):
+    login(client, "admin")
+    html = client.get("/").text
+    assert 'data-mode="list"' in html and "/static/realtime.js" in html
+
+
+def test_ws_rejects_unauthenticated(client):
+    # No session cookie -> the handshake is refused (closed before accept).
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws"):
+            pass
+
+
+def test_api_doc_rendered_returns_html_and_version(client):
+    login(client, "admin")
+    create_doc(client, "rd.md", "# RD\n\n**bold** body")
+    r = client.get("/api/doc/rd.md/rendered")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["version"] == 1
+    assert "<strong>bold</strong>" in body["html"]
+
+
+def test_login_lockout_is_ip_scoped_not_per_username(ctx, principals):
+    # An attacker spamming bad passwords for 'admin' from their own IP must NOT lock
+    # the real admin out from a different, clean IP — the 429 is keyed by client IP,
+    # so a per-username lockout DoS is not possible.
+    app = create_web_app(ctx)
+    attacker = TestClient(app, client=("9.9.9.9", 1))
+    victim = TestClient(app, client=("1.1.1.1", 2))
+    for _ in range(12):  # well past the limiter threshold
+        attacker.post("/login", data={"username": "admin", "password": "wrong",
+                                       "csrf_token": _token(attacker, "/login")})
+    r = login(victim, "admin")  # correct password from a clean IP
+    assert r.status_code == 200 and "llm-wiki" in r.text
+
+
+def test_login_lockout_collapses_ipv4_mapped_ipv6(ctx, principals):
+    # The same caller arriving as plain IPv4 and as IPv4-mapped IPv6 must share one
+    # limiter bucket, so it can't reset the counter by switching address family.
+    app = create_web_app(ctx)
+    mapped = TestClient(app, client=("::ffff:9.9.9.9", 1))
+    plain = TestClient(app, client=("9.9.9.9", 2))
+    for _ in range(9):  # exhaust the limiter via the IPv6-mapped form
+        mapped.post("/login", data={"username": "admin", "password": "wrong",
+                                    "csrf_token": _token(mapped, "/login")})
+    # Arriving as plain IPv4 now lands in the SAME bucket -> blocked.
+    r = plain.post(
+        "/login",
+        data={"username": "admin", "password": "wrong", "csrf_token": _token(plain, "/login")},
+        follow_redirects=False,
+    )
+    assert r.status_code == 429

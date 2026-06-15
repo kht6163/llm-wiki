@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}깨진 링크{% endblock %}
+{% block content %}
+<h1>깨진 링크 <span class="muted">{{ count }}건</span></h1>
+<p class="muted">존재하지 않는 문서를 가리키는 위키링크/마크다운 링크입니다. 이름 변경·삭제 후 정리에 사용하세요.</p>
+{% if not links %}
+  <p class="muted">깨진 링크가 없습니다. 🎉</p>
+{% else %}
+<table class="broken">
+  <thead><tr><th>출처 문서</th><th>가리키는 대상</th><th>형식</th><th>원본</th></tr></thead>
+  <tbody>
+  {% for l in links %}
+    <tr>
+      <td><a href="/doc/{{ l.src_path|urlpath }}">{{ l.src_path }}</a></td>
+      <td>{{ l.target }}{% if l.anchor %}<span class="muted">#{{ l.anchor }}</span>{% endif %}</td>
+      <td class="muted">{{ l.link_type }}</td>
+      <td><code>{{ l.raw }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

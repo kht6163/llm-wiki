@@ -48,5 +48,9 @@
   {% if not can_write %}<p class="muted">현재 역할은 읽기 전용이라 저장할 수 없습니다.</p>{% endif %}
 </form>
 <div id="ac" class="autocomplete" hidden></div>
+{% if not is_new %}
+<div id="rt-meta" data-path="{{ path }}" data-version="{{ base_version }}" data-mode="edit" hidden></div>
+{% endif %}
 <script src="/static/editor.js"></script>
+{% if not is_new %}<script src="/static/realtime.js"></script>{% endif %}
 {% endblock %}

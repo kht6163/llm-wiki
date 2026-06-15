@@ -17,6 +17,16 @@ def test_bfs_depth_bounds(ctx, principals):
     assert "D.md" in d3
 
 
+def test_bfs_follows_incoming_links(ctx, principals):
+    # BFS expands BOTH directions: a doc that links TO the root must be reachable at
+    # depth 1 (guards the batched backward-edge query).
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "hub.md", "just a hub")
+    docs.create(p, "ref.md", "[[hub]]")  # ref -> hub, i.e. an incoming edge to hub
+    d1 = {n["id"] for n in docs.graph(root="hub.md", depth=1)["nodes"]}
+    assert "ref.md" in d1
+
+
 def test_cycle_terminates(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "x.md", "[[y]]")

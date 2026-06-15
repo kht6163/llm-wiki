@@ -66,6 +66,13 @@ async def test_unauthorized_envelope(ctx, monkeypatch):
     assert d["ok"] is False and d["error"]["code"] == "unauthorized"
 
 
+async def test_search_rejects_empty_query(editor_mcp):
+    # An empty/whitespace query is a client error, not a successful 0-result search,
+    # so an agent can tell "no matches" from "bad query".
+    d = _payload(await editor_mcp.call_tool("search_documents", {"query": "   "}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
 async def test_create_then_read_roundtrip(editor_mcp):
     created = _payload(await editor_mcp.call_tool("create_document", {"path": "m.md", "content": "# M\n\nbody"}))
     assert created["ok"] and created["version"] == 1
@@ -97,6 +104,61 @@ async def test_section_base_version_conflict_via_tool(editor_mcp):
     d = _payload(await editor_mcp.call_tool(
         "replace_section", {"path": "s.md", "heading": "A", "text": "new", "base_version": 0}))
     assert d["ok"] is False and d["error"]["code"] == "conflict"
+
+
+async def test_write_tools_e2e(editor_mcp):
+    # The write tools an agent uses most — none had behavioral coverage before.
+    mcp = editor_mcp
+    _payload(await mcp.call_tool("create_document", {"path": "w.md", "content": "# W\n\n## A\nalpha\n"}))
+    pd = _payload(await mcp.call_tool("patch_document", {"path": "w.md", "find": "alpha", "replace": "beta"}))
+    assert pd["ok"] and "beta" in pd["content"]
+    ap = _payload(await mcp.call_tool("append_section", {"path": "w.md", "heading": "A", "text": "gamma"}))
+    assert ap["ok"] and "gamma" in ap["content"]
+    pt = _payload(await mcp.call_tool("patch_tags", {"path": "w.md", "add": ["t1", "t2"]}))
+    assert pt["ok"] and {"t1", "t2"} <= set(pt["tags"])
+    mv = _payload(await mcp.call_tool("move_document", {"path": "w.md", "new_path": "moved/w.md"}))
+    assert mv["ok"] and mv["path"] == "moved/w.md"
+    dl = _payload(await mcp.call_tool("delete_document", {"path": "moved/w.md"}))
+    assert dl["ok"] and dl["deleted"] is True
+
+
+async def test_read_tools_e2e(editor_mcp):
+    mcp = editor_mcp
+    _payload(await mcp.call_tool(
+        "create_document", {"path": "notes/a.md", "content": "# A\n\nhello [[b]]", "tags": ["x"]}))
+    _payload(await mcp.call_tool("create_document", {"path": "notes/b.md", "content": "# B\n\nworld"}))
+    ld = _payload(await mcp.call_tool("list_documents", {"folder": "notes"}))
+    assert ld["ok"] and ld["total"] >= 2 and ld["count"] >= 2 and ld["has_more"] is False
+    sd = _payload(await mcp.call_tool("search_documents", {"query": "hello", "mode": "bm25"}))
+    assert sd["ok"] and any(r["path"] == "notes/a.md" for r in sd["results"])
+    bl = _payload(await mcp.call_tool("get_backlinks", {"path": "notes/b.md"}))
+    assert bl["ok"] and any(x["src_path"] == "notes/a.md" for x in bl["backlinks"])
+    assert _payload(await mcp.call_tool("get_links", {"path": "notes/a.md"}))["ok"]
+    gg = _payload(await mcp.call_tool("get_graph", {}))
+    assert gg["ok"] and gg["nodes"]
+    rc = _payload(await mcp.call_tool("list_recent_changes", {"limit": 5}))
+    assert rc["ok"] and "count" in rc and "has_more" in rc
+    rv = _payload(await mcp.call_tool("get_revisions", {"path": "notes/a.md"}))
+    assert rv["ok"] and rv["revisions"]
+    one = _payload(await mcp.call_tool("get_revision", {"path": "notes/a.md", "version": 1}))
+    assert one["ok"] and "content" in one
+
+
+async def test_internal_error_returns_structured_envelope(ctx, principals, monkeypatch):
+    # A non-WikiError raised inside a tool body must still reach the agent as the
+    # structured {ok:false, error:{code:"internal"}} envelope, not a raw protocol
+    # error, and must not leak internals.
+    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
+
+    def boom():
+        raise RuntimeError("kaboom-internal-detail")
+
+    monkeypatch.setattr(ctx.docs, "tags", boom)
+    mcp = create_mcp_server(ctx)
+    d = _payload(await mcp.call_tool("get_tags", {}))
+    assert d["ok"] is False and d["error"]["code"] == "internal"
+    assert "kaboom" not in json.dumps(d)
 
 
 async def test_bad_key_is_rate_limited(ctx, monkeypatch):

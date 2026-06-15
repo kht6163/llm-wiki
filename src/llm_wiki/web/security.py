@@ -26,6 +26,7 @@ CSP = (
     "img-src 'self' data: https: http:; "
     "script-src 'self' 'unsafe-inline'; "
     "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; "  # same-origin fetch + WebSocket (live change stream)
     "base-uri 'self'; "
     "frame-ancestors 'none'; "
     "object-src 'none'"

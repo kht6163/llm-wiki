@@ -49,6 +49,18 @@ class Settings(BaseSettings):
     # Optional path to a rotating log file (in addition to stderr). Empty = stderr only.
     log_file: str = ""
 
+    # Seconds to let in-flight requests finish on shutdown before uvicorn force-closes
+    # them. Kept under a typical orchestrator kill grace (e.g. Kubernetes' 30s SIGTERM
+    # -> SIGKILL) so the process exits cleanly instead of being hard-killed mid-write.
+    shutdown_grace_s: int = 25
+
+    @field_validator("shutdown_grace_s")
+    @classmethod
+    def _grace_in_range(cls, v: int) -> int:
+        if not (1 <= int(v) <= 300):
+            raise ValueError(f"shutdown_grace_s must be between 1 and 300 (got {v})")
+        return int(v)
+
     @field_validator("gui_port", "mcp_port")
     @classmethod
     def _port_in_range(cls, v: int, info) -> int:

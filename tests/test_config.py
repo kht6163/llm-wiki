@@ -32,6 +32,15 @@ def test_log_level_is_normalized():
     assert Settings(log_level="debug").log_level == "DEBUG"
 
 
+def test_shutdown_grace_defaults_and_bounds():
+    assert Settings().shutdown_grace_s == 25
+    assert Settings(shutdown_grace_s=10).shutdown_grace_s == 10
+    with pytest.raises(ValidationError):
+        Settings(shutdown_grace_s=0)
+    with pytest.raises(ValidationError):
+        Settings(shutdown_grace_s=301)
+
+
 def test_get_settings_wraps_validation_as_config_error(monkeypatch):
     monkeypatch.setenv("GUI_PORT", "8080")
     monkeypatch.setenv("MCP_PORT", "8080")  # collides with GUI_PORT

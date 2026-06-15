@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ doc.title }}{% endblock %}
 {% block content %}
+<div id="rt-meta" data-path="{{ doc.path }}" data-version="{{ doc.version }}" data-mode="view" hidden></div>
 <div class="layout">
   <article class="doc">
     <div class="doc-head">
@@ -42,4 +43,5 @@
     </ul>
   </aside>
 </div>
+<script src="/static/realtime.js"></script>
 {% endblock %}

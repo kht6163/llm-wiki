@@ -7,11 +7,14 @@ holding the SQLite writer.
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from . import graph
 from .embedding import Embedder
 from .markdown_utils import chunk_markdown, extract_links
+
+log = logging.getLogger("llm_wiki.indexing")
 
 
 def reindex_fts(conn: sqlite3.Connection, doc_id: int, title: str, body: str) -> None:
@@ -116,6 +119,7 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
     if not dirty:
         return 0
     texts = [r["text"] for r in rows]
+    log.info("embed_pending: embedding %d chunk(s) across %d document(s)", len(texts), len(dirty))
     vectors: list = []
     for i in range(0, len(texts), batch_size):
         vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
@@ -143,4 +147,5 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
             if all_matched:  # fully (re)embedded — also true for a chunk-less doc
                 conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (did,))
                 cleared += 1
+    log.info("embed_pending: cleared vector_dirty on %d/%d document(s)", cleared, len(dirty))
     return cleared

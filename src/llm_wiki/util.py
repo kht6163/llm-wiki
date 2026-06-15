@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,6 +25,23 @@ def now_iso() -> str:
 
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def normalize_client_ip(host: str | None) -> str:
+    """Canonicalize a client address for use as a rate-limit / audit key. An
+    IPv4-mapped IPv6 address (``::ffff:1.2.3.4``) collapses to its IPv4 form so the
+    same caller can't dodge the limiter by switching address families. Non-IP hosts
+    (a proxy name, missing client) pass through unchanged ('?' when absent)."""
+    if not host:
+        return "?"
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return str(ip)
 
 
 def normalize_rel_path(raw: str) -> str:

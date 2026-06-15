@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from .config import Settings, get_settings
 from .db import Database
 from .embedding import Embedder, get_embedder
+from .events import EventHub
 from .services.documents import DocumentService
 
 
@@ -20,6 +21,7 @@ class AppContext:
     db: Database
     embedder: Embedder
     docs: DocumentService
+    events: EventHub
 
 
 def build_context(settings: Settings | None = None, *, full: bool = True) -> AppContext:
@@ -31,5 +33,6 @@ def build_context(settings: Settings | None = None, *, full: bool = True) -> App
         db.initialize(settings.embedding_model, embedder.dim)
     else:
         db.ensure_schema()
-    docs = DocumentService(db, embedder, settings.vault_path)
-    return AppContext(settings=settings, db=db, embedder=embedder, docs=docs)
+    events = EventHub()
+    docs = DocumentService(db, embedder, settings.vault_path, events=events)
+    return AppContext(settings=settings, db=db, embedder=embedder, docs=docs, events=events)

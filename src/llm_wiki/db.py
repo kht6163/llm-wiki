@@ -147,11 +147,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 """
 
-# Numbered forward migrations for EXISTING databases, applied in order inside the
-# schema transaction. New *tables* belong in SCHEMA_SQL (IF NOT EXISTS covers fresh
-# and existing DBs); use a migration only for changes IF NOT EXISTS can't express —
-# ALTER TABLE ADD COLUMN, index/constraint changes, data backfills. Each entry is
-# (target_version, ddl). Example:
+# Numbered forward migrations for EXISTING databases, applied in ascending order.
+# New *tables* belong in SCHEMA_SQL (IF NOT EXISTS covers fresh and existing DBs);
+# use a migration only for changes IF NOT EXISTS can't express — ALTER TABLE ADD
+# COLUMN, index/constraint changes, data backfills.
+#
+# Each entry is (target_version, ddl) and MUST be a SINGLE SQL statement: the
+# applier runs the statement and bumps schema_version in one transaction, so a
+# failure rolls the step back atomically (no half-migrated DB) and leaves the
+# version at the last fully-applied step (resumable). For a multi-step change, use
+# several entries so each step is independently atomic. Example:
 #   (3, "ALTER TABLE documents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
 MIGRATIONS: list[tuple[int, str]] = []
 
@@ -251,10 +256,27 @@ class Database:
                 f"({SCHEMA_VERSION}). Upgrade llm-wiki to match the database."
             )
         for target, ddl in MIGRATIONS:
-            if current < target <= SCHEMA_VERSION:
-                conn.executescript(ddl)
-                current = target
-        if int(stored) < SCHEMA_VERSION:
+            if not (current < target <= SCHEMA_VERSION):
+                continue
+            # Apply the DDL and stamp the version together so a crash/failure can't
+            # leave the schema changed with schema_version unbumped (a half-migrated
+            # DB). On failure the step rolls back and the version stays at the last
+            # fully-applied migration, so a re-run resumes from there.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(ddl)
+                set_meta(conn, "schema_version", str(target))
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            current = target
+        if current < SCHEMA_VERSION:
+            # Code is ahead of the DB but no DDL was needed up to SCHEMA_VERSION (e.g.
+            # only new IF-NOT-EXISTS tables in SCHEMA_SQL); advance the stamp to match.
             set_meta(conn, "schema_version", str(SCHEMA_VERSION))
 
     def ensure_vector_table(self, dim: int) -> None:

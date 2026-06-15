@@ -17,9 +17,10 @@ from pydantic import Field
 from .metrics import MCP_CALLS, MCP_LATENCY
 from .ratelimit import RateLimiter
 from .runtime import AppContext
-from .search import search as run_search
+from .search import search_page as run_search_page
 from .services.auth import Principal, principal_from_api_key
-from .services.errors import UnauthorizedError, WikiError
+from .services.errors import UnauthorizedError, ValidationError, WikiError
+from .util import normalize_client_ip
 
 log = logging.getLogger("llm_wiki.mcp")
 
@@ -48,7 +49,7 @@ def _bearer_token(ctx: Context) -> str | None:
 def _client_ip(ctx: Context) -> str:
     req = _request(ctx)
     client = getattr(req, "client", None) if req is not None else None
-    return getattr(client, "host", None) or "?"
+    return normalize_client_ip(getattr(client, "host", None))
 
 
 def create_mcp_server(app: AppContext) -> FastMCP:
@@ -94,6 +95,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             except WikiError as e:
                 outcome = e.code
                 return e.to_dict()
+            except Exception:
+                # An unexpected error must still reach the agent as the structured
+                # envelope (not a raw protocol error), and the metric must reflect it.
+                # Log the traceback server-side; never leak internals to the client.
+                outcome = "internal"
+                log.exception("tool=%s actor=%s crashed", tool, actor)
+                return {"ok": False,
+                        "error": {"code": "internal", "message": "Internal server error."}}
             finally:
                 dt = time.monotonic() - t0
                 MCP_CALLS.labels(tool, outcome).inc()
@@ -105,7 +114,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     # ---- read tools (any authenticated role) ----------------------------
     @mcp.tool(description="Hybrid search (BM25 + embedding vector, RRF-fused). 'count' is the "
                           "number of hits returned. 'truncated' true means the result set hit "
-                          "the top_k cap — raise top_k to see more. Echoes 'mode' and 'top_k'.")
+                          "the top_k cap — raise top_k to see more. Echoes 'mode' and 'top_k'. "
+                          "Rejects an empty query with code 'validation' (so 0 results means "
+                          "'no matches', never 'bad query').")
     async def search_documents(
         ctx: Context,
         query: str,
@@ -116,11 +127,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
     ) -> dict:
         def fn(_p: Principal) -> dict:
-            results = run_search(db, embedder, query, mode=mode, top_k=top_k,
-                                 folder=folder, tags=tags)
+            if not query or not query.strip():
+                raise ValidationError("query must not be empty.")
+            results, truncated = run_search_page(db, embedder, query, mode=mode, top_k=top_k,
+                                                 folder=folder, tags=tags)
             capped = max(1, min(int(top_k), 50))
             return {"ok": True, "mode": mode, "top_k": capped, "count": len(results),
-                    "truncated": len(results) >= capped,
+                    "truncated": truncated,
                     "results": [r.to_dict() for r in results]}
         return await _call(ctx, fn, "search_documents")
 
@@ -175,11 +188,11 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         since: Annotated[str | None, Field(description="ISO-8601 lower bound on updated_at.")] = None,
         until: Annotated[str | None, Field(description="ISO-8601 upper bound on updated_at.")] = None,
     ) -> dict:
-        return await _call(
-            ctx,
-            lambda _p: {"ok": True, "documents": docs.recent_changes(limit=limit, since=since, until=until)},
-            "list_recent_changes",
-        )
+        def fn(_p: Principal) -> dict:
+            items = docs.recent_changes(limit=limit, since=since, until=until)
+            return {"ok": True, "count": len(items), "limit": limit, "since": since,
+                    "until": until, "has_more": len(items) >= limit, "documents": items}
+        return await _call(ctx, fn, "list_recent_changes")
 
     @mcp.tool(description="Vault-wide broken (unresolved) links: each wikilink/markdown link "
                           "that points at a non-existent document. Use after renames/cleanup to "
@@ -204,8 +217,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def get_backlinks(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.backlinks(path)}, "get_backlinks")
 
-    @mcp.tool(description="Revision history (versions, authors, timestamps) for a document.")
-    async def get_revisions(ctx: Context, path: str, limit: int = 100) -> dict:
+    @mcp.tool(description="Revision history (versions, authors, timestamps) for a document, "
+                          "newest first.")
+    async def get_revisions(
+        ctx: Context, path: str,
+        limit: Annotated[int, Field(ge=1, le=500, description="Max revisions (1..500).")] = 100,
+    ) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.revisions(path, limit=limit)},
                            "get_revisions")
 
@@ -235,10 +252,11 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.create(p, path, content, title, tags)},
                            "create_document")
 
-    @mcp.tool(description="Replace a document's full body. base_version is REQUIRED; if it does "
-                          "not match the current version the update is rejected with code "
-                          "'conflict' + current content, so you can re-read, reapply, and retry. "
-                          "For small edits prefer patch_document / replace_section (cheaper).")
+    @mcp.tool(description="Replace a document's full body (editor/admin only; viewer gets "
+                          "'forbidden'). base_version is REQUIRED; if it does not match the "
+                          "current version the update is rejected with code 'conflict' + current "
+                          "content, so you can re-read, reapply, and retry. For small edits prefer "
+                          "patch_document / replace_section (cheaper).")
     async def update_document(
         ctx: Context, path: str, base_version: int, content: str,
         title: str | None = None, tags: list[str] | None = None,
@@ -246,10 +264,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.update(
             p, path, base_version, content, title, tags)}, "update_document")
 
-    @mcp.tool(description="Find-and-replace a unique substring in a document (token-cheap edit). "
-                          "Fails 'not_found' if absent, 'validation' if it appears more than "
-                          "'count' times. base_version optional (defaults to current); the edit "
-                          "runs through the same optimistic-locking update.")
+    @mcp.tool(description="Find-and-replace a unique substring in a document (token-cheap edit; "
+                          "editor/admin only). Fails 'not_found' if absent, 'validation' if it "
+                          "appears more than 'count' times. base_version optional (defaults to "
+                          "current); the edit runs through the same optimistic-locking update.")
     async def patch_document(
         ctx: Context, path: str, find: str, replace: str,
         base_version: int | None = None,
@@ -258,10 +276,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.patch(
             p, path, find, replace, base_version=base_version, count=count)}, "patch_document")
 
-    @mcp.tool(description="Replace the body under a heading (the heading line is kept). "
-                          "Token-cheap; reads latest server-side. Pass base_version to reject the "
-                          "edit with 'conflict' if the document changed since you read it; omit "
-                          "to apply on top of the current version.")
+    @mcp.tool(description="Replace the body under a heading (the heading line is kept; "
+                          "editor/admin only). Token-cheap; reads latest server-side. Pass "
+                          "base_version to reject the edit with 'conflict' if the document changed "
+                          "since you read it; omit to apply on top of the current version.")
     async def replace_section(
         ctx: Context, path: str, heading: str, text: str,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
@@ -270,8 +288,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             p, path, heading, text, base_version=base_version)}, "replace_section")
 
     @mcp.tool(description="Append text to the end of a heading's section (before the next "
-                          "same/higher heading). Token-cheap. Pass base_version to reject with "
-                          "'conflict' if the document changed since you read it.")
+                          "same/higher heading; editor/admin only). Token-cheap. Pass base_version "
+                          "to reject with 'conflict' if the document changed since you read it.")
     async def append_section(
         ctx: Context, path: str, heading: str, text: str,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
@@ -279,10 +297,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.append_section(
             p, path, heading, text, base_version=base_version)}, "append_section")
 
-    @mcp.tool(description="Add and/or remove tags on a document without rewriting its body. "
-                          "Adjusts the frontmatter 'tags' list; returns the document's resulting "
-                          "tags. (Tags written inline as #hashtags in the body are managed by "
-                          "editing the body.)")
+    @mcp.tool(description="Add and/or remove tags on a document without rewriting its body "
+                          "(editor/admin only). Adjusts the frontmatter 'tags' list; returns the "
+                          "document's resulting tags. (Tags written inline as #hashtags in the "
+                          "body are managed by editing the body.)")
     async def patch_tags(
         ctx: Context, path: str,
         add: Annotated[list[str] | None, Field(description="Tags to add.")] = None,
@@ -292,13 +310,15 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                            "patch_tags")
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
-                          "re-resolving links. Fails 'conflict' if the destination exists.")
+                          "re-resolving links (editor/admin only). Fails 'conflict' if the "
+                          "destination exists.")
     async def move_document(ctx: Context, path: str, new_path: str) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **docs.move(p, path, new_path)},
                            "move_document")
 
-    @mcp.tool(description="Delete (soft) a document. Pass base_version to guard against "
-                          "deleting a version you haven't seen.")
+    @mcp.tool(description="Delete (soft) a document (editor/admin only). Pass base_version to "
+                          "guard against deleting a version you haven't seen. Returns "
+                          "{ok, path, deleted: true} on success.")
     async def delete_document(ctx: Context, path: str, base_version: int | None = None) -> dict:
         return await _call(ctx, lambda p: docs.delete(p, path, base_version), "delete_document")
 

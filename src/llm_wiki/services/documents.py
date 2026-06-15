@@ -9,6 +9,7 @@ from the latest revision (see ``recover_pending``).
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import uuid
@@ -37,6 +38,8 @@ from ..util import (
 from . import audit
 from .auth import Principal
 from .errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
+
+log = logging.getLogger("llm_wiki.documents")
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 
@@ -76,12 +79,26 @@ def _as_block(text: str) -> str:
 
 
 class DocumentService:
-    def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str):
+    def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str, events=None):
         self.db = db
         self.embedder = embedder
         self.vault = Path(vault_path)
+        # Optional EventHub for live change notifications (web WebSocket). None in
+        # contexts that don't serve (tests/CLI) -> _emit is a silent no-op.
+        self.events = events
 
     # ---- helpers --------------------------------------------------------
+    def _emit(self, op: str, path: str, version: int, **extra) -> None:
+        """Best-effort live-change notification, fired after the commit + file write.
+        Never raises — a notification failure must not break a write."""
+        if self.events is None:
+            return
+        try:
+            self.events.publish({"type": "doc_changed", "op": op, "path": path,
+                                 "version": version, **extra})
+        except Exception:
+            pass
+
     def _merge_tags(self, meta: dict, content: str, extra: list[str] | None) -> list[str]:
         tags = set(extract_tags(meta, content))
         for x in extra or []:
@@ -231,6 +248,24 @@ class DocumentService:
             ).fetchall()
         return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
+    def preview(self, path: str, max_chars: int = 240) -> dict:
+        """Short plain-text preview for hover popovers: the title plus a leading
+        excerpt of the body (frontmatter stripped, heading markers removed). Plain
+        text only — the caller renders it as text, never HTML."""
+        doc = self.get(path)
+        body = doc["content"][parse_frontmatter(doc["content"])[1]:]
+        parts: list[str] = []
+        total = 0
+        for line in body.splitlines():
+            s = line.strip().lstrip("#").strip()
+            if not s:
+                continue
+            parts.append(s)
+            total += len(s)
+            if total >= max_chars:
+                break
+        return {"path": doc["path"], "title": doc["title"], "excerpt": " ".join(parts)[:max_chars]}
+
     def folders(self) -> list[str]:
         """Distinct non-empty folder paths across non-deleted documents (sorted)."""
         with self.db.reader() as conn:
@@ -239,6 +274,16 @@ class DocumentService:
                 "ORDER BY folder"
             ).fetchall()
         return [r[0] for r in rows]
+
+    def folder_counts(self) -> list[tuple[str, int]]:
+        """(folder, document count) across ALL non-deleted docs — independent of any
+        list page, so the sidebar stays accurate under pagination."""
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT folder, COUNT(*) AS n FROM documents WHERE is_deleted=0 AND folder<>'' "
+                "GROUP BY folder ORDER BY folder"
+            ).fetchall()
+        return [(r["folder"], r["n"]) for r in rows]
 
     def attachment_file(self, subpath: str) -> Path:
         """Resolve an uploaded attachment to a real file under the vault, safely.
@@ -379,6 +424,7 @@ class DocumentService:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         indexing.embed_doc(self.db, self.embedder, doc_id)
         DOC_WRITES.labels("create").inc()
+        self._emit("create", rel, new_version, title=final_title)
         return self.get(rel)
 
     def update(self, principal: Principal, path: str, base_version: int, content: str,
@@ -403,10 +449,14 @@ class DocumentService:
                 raise NotFoundError("No document at this path.", path=rel)
             doc_id = row["id"]
             content_changed = row["content_hash"] != chash
+            # vector_dirty moves monotonically toward dirty: a content change forces
+            # 1, but an unchanged-content edit must NOT clear a pending flag — doing so
+            # would cancel an embedding that reindex queued (vector_dirty=1, no vectors
+            # yet) and the doc would silently vanish from vector search forever.
             cur = conn.execute(
                 "UPDATE documents SET version=version+1, title=?, content_hash=?, folder=?, "
-                "file_state='pending', vector_dirty=?, updated_at=?, updated_by=? "
-                "WHERE id=? AND version=?",
+                "file_state='pending', vector_dirty=CASE WHEN ? THEN 1 ELSE vector_dirty END, "
+                "updated_at=?, updated_by=? WHERE id=? AND version=?",
                 (final_title, chash, folder, 1 if content_changed else 0, now,
                  principal.user_id, doc_id, int(base_version)),
             )
@@ -432,6 +482,8 @@ class DocumentService:
         if content_changed:
             indexing.embed_doc(self.db, self.embedder, doc_id)
         DOC_WRITES.labels("update").inc()
+        self._emit("update", rel, new_version, title=final_title,
+                   updated_by=principal.username, content_changed=content_changed)
         return self.get(rel)
 
     # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
@@ -478,7 +530,12 @@ class DocumentService:
         if not loc:
             raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
         lines, start, end, _ = loc
-        body = "".join(lines[:end]) + _as_block(text) + "".join(lines[end:])
+        head = "".join(lines[:end])
+        # Guarantee a line boundary: a final section whose last line has no trailing
+        # newline would otherwise glue the appended block onto that line.
+        if head and not head.endswith("\n"):
+            head += "\n"
+        body = head + _as_block(text) + "".join(lines[end:])
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, body)
 
@@ -566,6 +623,8 @@ class DocumentService:
         with self.db.writer() as conn:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         DOC_WRITES.labels("move").inc()
+        # Keyed on the OLD path so a viewer of the moved doc can follow it to `to`.
+        self._emit("move", rel, new_version, to=new_rel)
         return self.get(new_rel)
 
     def recent_changes(self, limit: int = 20, since: str | None = None,
@@ -625,6 +684,7 @@ class DocumentService:
                          action="doc_delete", target=rel, detail=f"v{new_version}")
         self._trash_file(rel)
         DOC_WRITES.labels("delete").inc()
+        self._emit("delete", rel, new_version)
         return {"ok": True, "path": rel, "deleted": True}
 
     def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
@@ -668,13 +728,25 @@ class DocumentService:
             mtime = self._write_file(rel, body)
             with self.db.writer() as conn:
                 conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+        if bodies:
+            log.info("recover_pending: re-projected %d file(s) from the latest revision", len(bodies))
         return len(bodies)
+
+    def embed_pending(self) -> int:
+        """Embed any documents still flagged ``vector_dirty`` (no-op when none are).
+        A crash can commit a write — version bumped, ``vector_dirty=1`` — but die before
+        the post-commit embed (it runs off the write lock), leaving the doc absent from
+        vector search until the next ``reindex --reembed``. Sweeping on startup closes
+        that gap. Also catches docs left ``file_state='clean'`` but unembedded, which
+        ``recover_pending`` (file-state only) does not see."""
+        return indexing.embed_pending(self.db, self.embedder)
 
     def reindex_all(self, reembed: bool = False) -> dict:
         """Reconcile the DB with the on-disk vault (handles external edits / new
         files). New files are created; changed files get an 'external-reconcile'
         revision; vanished files are reported (not auto-deleted)."""
         vault = self.vault.resolve()
+        log.info("reindex: scanning vault %s (reembed=%s)", vault, reembed)
         seen: set[str] = set()
         created = updated = unchanged = 0
         skipped_deleted: list[str] = []
@@ -703,6 +775,9 @@ class DocumentService:
                     # canonical owner of deletion. An external .md reappearing must NOT
                     # silently undo it — report it and leave the tombstone in place.
                     skipped_deleted.append(rel)
+                    audit.record(conn, actor=None, via="cli", action="doc_reconcile_skip",
+                                 target=rel, outcome="skipped",
+                                 detail="deleted document still present on disk")
                     continue
                 if row and row["content_hash"] == chash and not reembed:
                     conn.execute("UPDATE documents SET file_mtime=? WHERE id=?", (mtime, row["id"]))
@@ -736,6 +811,11 @@ class DocumentService:
                 indexing.rechunk(conn, doc_id, content)
                 indexing.reindex_links(conn, doc_id, content, folder)
                 graph.backfill_links_for(conn, doc_id, norm, stem)
+                # External reconciliation is otherwise a silent batch operation; record
+                # who/when so "this file changed outside the app" stays auditable, like
+                # every other write path.
+                audit.record(conn, actor=None, via="cli", action="doc_reconcile", target=rel,
+                             detail=f"v{new_version} {'create' if is_new else 'update'}")
             created += int(is_new)
             updated += int(not is_new)
 
@@ -744,6 +824,9 @@ class DocumentService:
                 "SELECT path, path_norm FROM documents WHERE is_deleted=0").fetchall()
                 if r["path_norm"] not in seen]
         embedded = indexing.embed_pending(self.db, self.embedder)
+        log.info("reindex: created=%d updated=%d unchanged=%d skipped_deleted=%d "
+                 "missing_files=%d embedded=%d", created, updated, unchanged,
+                 len(skipped_deleted), len(missing), embedded)
         return {"created": created, "updated": updated, "unchanged": unchanged,
                 "missing_files": missing, "skipped_deleted": skipped_deleted,
                 "embedded": embedded}

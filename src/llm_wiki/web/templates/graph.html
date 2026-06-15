@@ -47,6 +47,12 @@ async function reloadGraph() {
   });
   cy.on('tap', 'node', evt => { if (evt.target.data('exists')) location.href = '/doc/' + encodeURIComponent(evt.target.data('id')); });
 }
+// Enter in the root/depth fields applies the graph (keyboard parity with the button).
+['root', 'depth'].forEach(function (id) {
+  document.getElementById(id).addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); reloadGraph(); }
+  });
+});
 reloadGraph();
 </script>
 {% endblock %}

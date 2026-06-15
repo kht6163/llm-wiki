@@ -24,6 +24,12 @@ MIN_PASSWORD_LEN = 8
 
 _ph = PasswordHasher()
 
+# A precomputed hash to verify against when the username doesn't exist, so a failed
+# login spends the same Argon2 work whether or not the account is real. Without this,
+# an unknown user returns instantly (no hash) while a real user pays the hashing
+# cost — a timing oracle for username enumeration.
+_DUMMY_PASSWORD_HASH = _ph.hash("enumeration-guard-not-a-real-secret")
+
 
 @dataclass
 class Principal:
@@ -84,7 +90,12 @@ def authenticate(db: Database, username: str, password: str) -> Principal | None
             "SELECT id, username, role, password_hash FROM users WHERE username=? AND is_active=1",
             (username.strip(),),
         ).fetchone()
-    if not row or not verify_password(row["password_hash"], password):
+    if row is None:
+        # Spend equivalent Argon2 work so response time doesn't reveal whether the
+        # username exists (the result is discarded).
+        verify_password(_DUMMY_PASSWORD_HASH, password)
+        return None
+    if not verify_password(row["password_hash"], password):
         return None
     return Principal(row["id"], row["username"], row["role"])
 
@@ -93,11 +104,16 @@ def authenticate(db: Database, username: str, password: str) -> Principal | None
 def create_session(db: Database, user_id: int) -> str:
     sid = secrets.token_urlsafe(32)
     now = datetime.now(UTC)
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     expires = (now + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with db.writer() as conn:
+        # Opportunistic GC: expired rows are otherwise only filtered at read time and
+        # would accumulate forever. Login is infrequent and the table is small, so a
+        # sweep here keeps it bounded without a separate scheduled job.
+        conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_str,))
         conn.execute(
             "INSERT INTO sessions(id, user_id, created_at, expires_at) VALUES(?,?,?,?)",
-            (sid, user_id, now.strftime("%Y-%m-%dT%H:%M:%SZ"), expires),
+            (sid, user_id, now_str, expires),
         )
     return sid
 

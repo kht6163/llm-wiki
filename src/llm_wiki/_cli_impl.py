@@ -175,6 +175,12 @@ def _serve(args) -> int:
         n = ctx.docs.recover_pending()
         if n:
             print(f"Recovered {n} pending file(s) from the last run.")
+        # A crash can also leave committed docs flagged vector_dirty=1 whose embedding
+        # never ran (it happens post-commit, off the write lock). Sweep them now so they
+        # don't silently stay out of vector search until the next reindex.
+        embedded = ctx.docs.embed_pending()
+        if embedded:
+            print(f"Re-embedded {embedded} document(s) left pending by the last run.")
 
     web_app = create_web_app(ctx)
     mcp_app = create_mcp_server(ctx).streamable_http_app()
@@ -204,17 +210,29 @@ def _serve(args) -> int:
 
 
 async def _serve_both(settings, web_app, mcp_app) -> None:
-    web_cfg = uvicorn.Config(web_app, host=settings.host, port=settings.gui_port, log_level="info")
-    mcp_cfg = uvicorn.Config(mcp_app, host=settings.host, port=settings.mcp_port, log_level="info")
+    # Bound the graceful-shutdown wait so an in-flight request (e.g. a multi-second
+    # embed) can't keep the process alive past an orchestrator's kill grace, which
+    # would escalate to SIGKILL and risk a torn WAL. A second signal forces an
+    # immediate exit.
+    grace = settings.shutdown_grace_s
+    web_cfg = uvicorn.Config(web_app, host=settings.host, port=settings.gui_port,
+                             log_level="info", timeout_graceful_shutdown=grace)
+    mcp_cfg = uvicorn.Config(mcp_app, host=settings.host, port=settings.mcp_port,
+                             log_level="info", timeout_graceful_shutdown=grace)
     servers = [uvicorn.Server(web_cfg), uvicorn.Server(mcp_cfg)]
     for s in servers:
         s.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # we manage signals for both at once
 
     loop = asyncio.get_running_loop()
+    signalled = False
 
     def _shutdown() -> None:
+        nonlocal signalled
         for s in servers:
+            if signalled:
+                s.force_exit = True  # second signal -> drop in-flight requests now
             s.should_exit = True
+        signalled = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:

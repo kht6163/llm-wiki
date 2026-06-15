@@ -141,6 +141,26 @@ def get_outgoing(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _neighbors(conn: sqlite3.Connection, ids: list[int]) -> set[int]:
+    """All document ids directly linked to/from any of ``ids`` (both directions),
+    in batched IN(...) queries instead of two per node. Chunked to stay under
+    SQLite's bound-parameter limit for large frontiers."""
+    out: set[int] = set()
+    for i in range(0, len(ids), 900):
+        chunk = ids[i:i + 900]
+        ph = ",".join("?" * len(chunk))
+        for r in conn.execute(
+            f"SELECT dst_doc_id FROM links WHERE src_doc_id IN ({ph}) AND dst_doc_id IS NOT NULL",
+            chunk,
+        ):
+            out.add(r[0])
+        for r in conn.execute(
+            f"SELECT src_doc_id FROM links WHERE dst_doc_id IN ({ph})", chunk
+        ):
+            out.add(r[0])
+    return out
+
+
 def build_graph(
     conn: sqlite3.Connection,
     root_path: str | None = None,
@@ -166,15 +186,11 @@ def build_graph(
         frontier = {root["id"]}
         for _ in range(depth):
             visited |= frontier
-            nxt: set[int] = set()
-            for did in frontier:
-                for r in conn.execute(
-                    "SELECT dst_doc_id FROM links WHERE src_doc_id=? AND dst_doc_id IS NOT NULL", (did,)
-                ):
-                    nxt.add(r[0])
-                for r in conn.execute("SELECT src_doc_id FROM links WHERE dst_doc_id=?", (did,)):
-                    nxt.add(r[0])
-            frontier = nxt - visited
+            if not frontier:
+                break
+            # One pair of batched queries per BFS level (was two per frontier node:
+            # an N+1 that dominated query count on wide graphs up to the 2000 cap).
+            frontier = _neighbors(conn, list(frontier)) - visited
         visited |= frontier
         doc_ids = list(visited)[:limit]
         truncated = len(visited) > limit

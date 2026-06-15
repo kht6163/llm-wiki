@@ -5,12 +5,22 @@ embedding work. Authorization is delegated to the shared service layer.
 """
 from __future__ import annotations
 
+import asyncio
 import difflib
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import bleach
-from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -26,7 +36,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from ..markdown_render import render_markdown
 from ..metrics import PrometheusMiddleware, render_latest
 from ..runtime import AppContext
-from ..search import search as run_search
+from ..search import search_page as run_search_page
 from ..services import audit
 from ..services import users as users_svc
 from ..services.auth import (
@@ -41,8 +51,9 @@ from ..services.auth import (
     principal_from_session,
     revoke_api_key,
 )
-from ..services.errors import ConflictError, WikiError
-from ..util import PathError
+from ..services.documents import ATTACH_MAX_BYTES
+from ..services.errors import ConflictError, ValidationError, WikiError
+from ..util import PathError, normalize_client_ip
 from .security import (
     RateLimiter,
     SecurityHeadersMiddleware,
@@ -51,6 +62,24 @@ from .security import (
 )
 
 _HERE = Path(__file__).parent
+_UPLOAD_CHUNK = 64 * 1024
+
+
+async def _read_capped(file: UploadFile, limit: int) -> bytes | None:
+    """Read an upload in chunks, aborting as soon as it exceeds ``limit`` so a
+    multi-GB body can't be buffered into memory before the size check. Returns None
+    on overflow; peak memory stays at ~limit + one chunk."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(_UPLOAD_CHUNK)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _diff_lines(a_text: str, b_text: str) -> list[dict]:
@@ -124,21 +153,23 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.post("/login", response_class=HTMLResponse)
     def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
-        ip = request.client.host if request.client else "?"
+        ip = normalize_client_ip(request.client.host if request.client else None)
         uname = (username or "").strip().lower()
-        ip_key, user_key = f"ip:{ip}", f"user:{uname}"
-        if not (login_limiter.allowed(ip_key) and login_limiter.allowed(user_key)):
+        # Throttle by client IP only. A per-username counter would let anyone lock a
+        # known account (e.g. admin) out from its own clean IP just by spamming bad
+        # passwords — the lockout itself becomes the DoS. Failed attempts are still
+        # audit-logged with the username so a spray is detectable.
+        ip_key = f"ip:{ip}"
+        if not login_limiter.allowed(ip_key):
             return render("login.html", request, status=429,
                           error="Too many attempts. Please wait a few minutes and try again.")
         p = authenticate(db, username, password)
         if not p:
             login_limiter.record_failure(ip_key)
-            login_limiter.record_failure(user_key)
             audit.record_tx(db, actor=uname or "-", via="web", action="login_failed",
                             target=None, outcome="error", detail=f"ip={ip}")
             return render("login.html", request, status=401, error="Invalid username or password.")
         login_limiter.reset(ip_key)
-        login_limiter.reset(user_key)
         audit.record_tx(db, actor=p.username, via="web", action="login", detail=f"ip={ip}")
         # Drop any pre-login session state (fixation hardening), then bind the new
         # session. A fresh CSRF token is minted on the next rendered page.
@@ -181,17 +212,20 @@ def create_web_app(app: AppContext) -> FastAPI:
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
     def home(request: Request, folder: str | None = None, tag: str | None = None,
-             sort: str = "updated_at"):
+             sort: str = "updated_at", page: int = 1):
         if not user(request):
             return login_redirect()
-        items = docs.list_docs(folder=folder, tag=tag, limit=1000, sort=sort)
-        folder_counts: dict[str, int] = {}
-        for d in items:
-            if d["folder"]:
-                folder_counts[d["folder"]] = folder_counts.get(d["folder"], 0) + 1
-        folders = sorted(folder_counts.items())
+        per_page = 50
+        page = max(1, int(page))
+        offset = (page - 1) * per_page
+        items = docs.list_docs(folder=folder, tag=tag, limit=per_page, offset=offset, sort=sort)
+        total = docs.count(folder=folder, tag=tag)
+        # Folder counts come from a dedicated query (not the current page) so the
+        # sidebar totals stay correct regardless of which page is shown.
+        folders = docs.folder_counts()
         return render("list.html", request, items=items, folder=folder, tag=tag, sort=sort,
-                      folders=folders)
+                      folders=folders, page=page, per_page=per_page, total=total,
+                      has_prev=page > 1, has_next=offset + len(items) < total)
 
     @web.get("/tags", response_class=HTMLResponse)
     def tags_page(request: Request):
@@ -207,11 +241,12 @@ def create_web_app(app: AppContext) -> FastAPI:
         top_k = max(1, min(int(top_k), 50))
         tags = [tag] if tag and tag.strip() else None
         results = []
+        truncated = False
         if q.strip():
-            results = [r.to_dict() for r in run_search(
+            hits, truncated = run_search_page(
                 db, embedder, q, mode=mode, top_k=top_k,
-                folder=folder or None, tags=tags)]
-        truncated = len(results) >= top_k
+                folder=folder or None, tags=tags)
+            results = [r.to_dict() for r in hits]
         return render("search.html", request, q=q, mode=mode, top_k=top_k,
                       folder=folder or "", tag=tag or "", results=results,
                       truncated=truncated, folders=docs.folders())
@@ -221,6 +256,13 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not user(request):
             return login_redirect()
         return render("graph.html", request, root=root or "")
+
+    @web.get("/broken-links", response_class=HTMLResponse)
+    def broken_links_page(request: Request, limit: int = 500):
+        if not user(request):
+            return login_redirect()
+        data = docs.broken_links(limit=max(1, min(int(limit), 2000)))
+        return render("broken_links.html", request, count=data["count"], links=data["links"])
 
     @web.get("/api/graph")
     def api_graph(request: Request, root: str | None = None, depth: int = 1, limit: int = 500):
@@ -240,12 +282,42 @@ def create_web_app(app: AppContext) -> FastAPI:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse({"ok": True, "html": render_markdown(content, path or "preview.md")})
 
+    @web.get("/api/doc/{path:path}/preview")
+    def api_doc_preview(path: str, request: Request):
+        # Plain-text title + excerpt for the list/search hover popover.
+        if not user(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            d = docs.preview(path)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({"ok": True, **d})
+
+    @web.get("/api/doc/{path:path}/rendered")
+    def api_doc_rendered(path: str, request: Request):
+        # Live-refresh payload: the realtime client fetches this when a WebSocket
+        # change event arrives and swaps the rendered body in place.
+        if not user(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            doc = docs.get(path)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({
+            "ok": True, "path": doc["path"], "version": doc["version"], "title": doc["title"],
+            "updated_at": doc["updated_at"], "updated_by": doc["updated_by"], "tags": doc["tags"],
+            "html": render_markdown(doc["content"], doc["path"]),
+        })
+
     @web.post("/api/upload")
     async def api_upload(request: Request, file: UploadFile = File(...)):
         p = user(request)
         if not p:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        data = await file.read()
+        data = await _read_capped(file, ATTACH_MAX_BYTES)
+        if data is None:
+            err = ValidationError(f"Attachment too large (limit {ATTACH_MAX_BYTES} bytes).")
+            return JSONResponse(err.to_dict(), status_code=err.http_status)
         try:
             res = docs.save_attachment(p, file.filename or "file", data)
         except WikiError as e:
@@ -537,5 +609,40 @@ def create_web_app(app: AppContext) -> FastAPI:
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
+
+    # ---- realtime change stream (WebSocket) -----------------------------
+    async def ws_changes(websocket: WebSocket) -> None:
+        # Session-authenticated, same-origin read-only stream of doc_changed events.
+        # Registered as a raw Starlette route so the global CSRF dependency (which
+        # injects a Request) doesn't apply to the WebSocket handshake.
+        origin = websocket.headers.get("origin")
+        if origin and urlsplit(origin).netloc != websocket.url.netloc:
+            await websocket.close(code=1008)  # cross-origin -> reject (WS hijack guard)
+            return
+        if not principal_from_session(db, websocket.session.get("sid")):
+            await websocket.close(code=1008)  # not authenticated
+            return
+        await websocket.accept()
+        app.events.bind_loop(asyncio.get_running_loop())
+        q = app.events.subscribe()
+        # Signal that the subscription is live so a client (or test) knows any change
+        # from here on will be delivered. Non-"doc_changed" frames are ignored client-side.
+        await websocket.send_json({"type": "ready"})
+        recv = asyncio.ensure_future(websocket.receive())
+        try:
+            while True:
+                getev = asyncio.ensure_future(q.get())
+                done, _ = await asyncio.wait({recv, getev}, return_when=asyncio.FIRST_COMPLETED)
+                if recv in done:
+                    getev.cancel()
+                    break  # any inbound frame/disconnect ends this read-only channel
+                await websocket.send_json(getev.result())
+        except WebSocketDisconnect:
+            pass
+        finally:
+            recv.cancel()
+            app.events.unsubscribe(q)
+
+    web.router.add_websocket_route("/ws", ws_changes)
 
     return web

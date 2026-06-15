@@ -60,6 +60,26 @@ def test_embed_pending_sweep_clears_dirty(ctx, principals):
     assert _dirty(ctx, doc_id) == 0
 
 
+def test_metadata_only_update_preserves_pending_dirty(ctx, principals):
+    # A doc with a queued-but-unembedded vector (vector_dirty=1, no vectors yet — the
+    # state reindex leaves) must NOT have that flag cleared by a metadata-only edit.
+    # Clearing it would cancel the embedding and the doc would vanish from vector
+    # search with no later retry.
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "meta.md", "# T\n\nstable body text")
+    doc_id = _doc_id(ctx, "meta.md")
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET vector_dirty=1 WHERE id=?", (doc_id,))
+        conn.execute("DELETE FROM chunk_vectors WHERE chunk_id IN "
+                     "(SELECT id FROM chunks WHERE doc_id=?)", (doc_id,))
+    cur = docs.get("meta.md")
+    # Identical body, only the title changes -> content_changed is False.
+    docs.update(p, "meta.md", cur["version"], cur["content"], title="New Title")
+    assert _dirty(ctx, doc_id) == 1  # pending flag preserved, not silently cleared
+    indexing.embed_pending(ctx.db, ctx.embedder)
+    assert _dirty(ctx, doc_id) == 0  # a later sweep actually embeds it
+
+
 def test_embed_pending_skips_doc_rechunked_mid_sweep(ctx, principals, monkeypatch):
     # The batch sweep must not mark a doc clean if its chunks changed under it; that
     # doc's vectors would be stale/missing and it would never be retried.

@@ -36,12 +36,26 @@ def _fts_match(query: str) -> str | None:
     return " ".join('"' + t.replace('"', '""') + '"' for t in toks)
 
 
-def _bm25(conn, match: str, limit: int) -> list[tuple[int, float]]:
-    rows = conn.execute(
-        "SELECT rowid AS doc_id, bm25(documents_fts, 2.0, 1.0) AS rank "
-        "FROM documents_fts WHERE documents_fts MATCH ? ORDER BY rank LIMIT ?",
-        (match, limit),
-    ).fetchall()
+def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
+         tags: list[str] | None = None) -> list[tuple[int, float]]:
+    # Push folder/tag/is_deleted filtering into the query so the LIMIT picks k docs
+    # that ALREADY satisfy the filter. Filtering *after* a fixed top-k (the old
+    # behavior) silently dropped a folder's matches whenever they ranked below the
+    # global window — zero results on a large corpus exactly when a filter is useful.
+    sql = ["SELECT f.rowid AS doc_id, bm25(documents_fts, 2.0, 1.0) AS rank "
+           "FROM documents_fts f JOIN documents d ON d.id=f.rowid "
+           "WHERE documents_fts MATCH ? AND d.is_deleted=0"]
+    params: list = [match]
+    if folder:
+        fnorm = folder.strip("/")
+        sql.append(" AND (d.folder=? OR d.folder LIKE ?)")
+        params += [fnorm, fnorm + "/%"]
+    for t in tags or []:
+        sql.append(" AND d.id IN (SELECT doc_id FROM tags WHERE tag=?)")
+        params.append(t)
+    sql.append(" ORDER BY rank LIMIT ?")
+    params.append(limit)
+    rows = conn.execute("".join(sql), params).fetchall()
     return [(r["doc_id"], r["rank"]) for r in rows]
 
 
@@ -74,21 +88,30 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
     return sorted(best.items(), key=lambda kv: kv[1][0])
 
 
-def search(
+def search_page(
     db, embedder: Embedder, query: str, *,
     mode: str = "hybrid", top_k: int = 10,
     folder: str | None = None, tags: list[str] | None = None,
-) -> list[SearchResult]:
+) -> tuple[list[SearchResult], bool]:
+    """Run a search and report truncation. Returns ``(results, truncated)`` where
+    ``truncated`` is True only when at least one more qualifying document existed
+    beyond ``top_k`` — so a corpus of exactly ``top_k`` matches reports False (no
+    misleading 'raise top_k' signal). ``results`` is capped at ``top_k``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     SEARCH_QUERIES.labels(mode).inc()
     top_k = max(1, min(int(top_k), 50))
+    want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
     k = max(top_k * 4, 40)
 
     with db.reader() as conn:
         match = _fts_match(query) if mode in ("hybrid", "bm25") else None
-        bm_list = _bm25(conn, match, k) if match else []
-        vec_list = _vector(conn, embedder, query, k) if mode in ("hybrid", "vector") else []
+        bm_list = _bm25(conn, match, k, folder=folder, tags=tags) if match else []
+        # vec0 KNN can't pre-filter by folder/tag, and collapsing chunk hits to docs
+        # yields fewer distinct docs than chunks fetched. Over-fetch chunks so the
+        # post-dedup/post-filter set still holds ~k distinct docs.
+        k_vec = min(k * 3, 600)
+        vec_list = _vector(conn, embedder, query, k_vec) if mode in ("hybrid", "vector") else []
 
         bm_rank = {doc_id: i + 1 for i, (doc_id, _) in enumerate(bm_list)}
         vec_rank = {doc_id: i + 1 for i, (doc_id, _) in enumerate(vec_list)}
@@ -147,6 +170,16 @@ def search(
                 path=d["path"], title=d["title"] or d["path"],
                 score=round(score, 6), snippet=snippet, heading=heading, version=d["version"],
             ))
-            if len(results) >= top_k:
+            if len(results) >= want:
                 break
-        return results
+    return results[:top_k], len(results) > top_k
+
+
+def search(
+    db, embedder: Embedder, query: str, *,
+    mode: str = "hybrid", top_k: int = 10,
+    folder: str | None = None, tags: list[str] | None = None,
+) -> list[SearchResult]:
+    """Backward-compatible list API: results only, no truncation flag."""
+    return search_page(db, embedder, query, mode=mode, top_k=top_k,
+                       folder=folder, tags=tags)[0]

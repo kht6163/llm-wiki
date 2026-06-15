@@ -11,6 +11,21 @@
   var csrf = (form.querySelector('input[name="csrf_token"]') || {}).value || "";
   var docPath = form.getAttribute("data-path") || "preview.md";
 
+  // Non-blocking toast (reuses realtime.js's .rt-toast styling) so an upload error
+  // doesn't yank focus out of the editor the way a modal alert() does.
+  function toast(msg) {
+    var t = document.createElement("div");
+    t.className = "rt-toast";
+    t.setAttribute("role", "status");
+    t.textContent = msg;
+    document.body.appendChild(t);
+    requestAnimationFrame(function () { t.classList.add("show"); });
+    setTimeout(function () {
+      t.classList.remove("show");
+      setTimeout(function () { t.remove(); }, 300);
+    }, 3500);
+  }
+
   // ---- live preview ----
   var timer = null;
   function renderPreview() {
@@ -93,9 +108,9 @@
         .then(function (r) { return r.json(); })
         .then(function (d) {
           if (d && d.ok && d.markdown) insertAtCaret(d.markdown + "\n");
-          else alert("업로드 실패: " + ((d && d.error && (d.error.message || d.error)) || "오류"));
+          else toast("업로드 실패: " + ((d && d.error && (d.error.message || d.error)) || "오류"));
         })
-        .catch(function () { alert("업로드 실패"); });
+        .catch(function () { toast("업로드 실패"); });
     });
   }
   editor.addEventListener("dragover", function (e) { e.preventDefault(); editor.classList.add("dropping"); });

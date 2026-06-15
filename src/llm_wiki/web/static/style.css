@@ -163,6 +163,33 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   .revtable td { border: none; padding: 2px 0; }
 }
 
+.pager { display: flex; gap: 16px; align-items: center; justify-content: center;
+  margin: 20px 0 8px; font-size: 0.9em; }
+.pager a { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; }
+
+/* Realtime change notifications (WebSocket live reflection). */
+.rt-banner { max-width: 1080px; margin: 12px auto 0; padding: 10px 14px; border-radius: 6px;
+  background: #fffbeb; border: 1px solid #fde68a; }
+.rt-toast { position: fixed; bottom: 20px; right: 20px; z-index: 50;
+  background: var(--fg); color: var(--bg); padding: 10px 16px; border-radius: 8px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.25); opacity: 0; transform: translateY(8px);
+  transition: opacity .25s ease, transform .25s ease; font-size: 0.9em; max-width: 340px; }
+.rt-toast.show { opacity: 1; transform: translateY(0); }
+
+/* Hover preview popover (list/search). */
+.doc-popover { position: absolute; z-index: 60; max-width: 360px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.12);
+  padding: 10px 12px; font-size: 0.85em; pointer-events: none; }
+.doc-popover .dp-title { font-weight: 600; margin-bottom: 4px; }
+.doc-popover .dp-excerpt { color: var(--muted); line-height: 1.5; }
+
+/* Broken-links report table. */
+.broken { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.broken th, .broken td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
+  vertical-align: top; }
+.broken th { color: var(--muted); font-weight: 600; }
+.broken code { background: var(--soft); padding: 1px 5px; border-radius: 4px; }
+
 /* Automatic dark theme — the UI is variable-driven, so a palette swap suffices. */
 @media (prefers-color-scheme: dark) {
   :root {
@@ -172,6 +199,7 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   .flash { background: #2d2510; border-color: #5c4612; }
   .error { background: #2d1517; border-color: #5c1d22; }
   .conflict { background: #2a2310; border-color: #5c4612; }
+  .rt-banner { background: #2a2310; border-color: #5c4612; }
   .newkey { background: #0f2a1d; border-color: #1c5236; }
   .results .snippet { color: var(--fg); }
   mark { background: #7a5c00; color: #fff; }

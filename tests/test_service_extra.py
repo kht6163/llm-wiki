@@ -104,6 +104,16 @@ def test_append_and_replace_section(ctx, principals):
     assert "link" in sec["content"] and sec["content"].startswith("## Refs")
 
 
+def test_append_section_keeps_line_boundary_without_trailing_newline(ctx, principals):
+    # The target is the final section and its last line has no trailing newline;
+    # the appended block must start on its own line, not glue onto that word.
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "nl.md", "# T\n\n## A\nfirstline")
+    out = docs.append_section(p, "nl.md", "A", "appended")
+    assert "firstlineappended" not in out["content"]
+    assert "firstline\nappended" in out["content"]
+
+
 def test_section_not_found(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "s2.md", "# T\n\n## A\nx\n")
