@@ -30,6 +30,7 @@ class Principal:
     user_id: int
     username: str
     role: str
+    via: str = "?"  # surface that resolved this identity: web | mcp | cli
 
     @property
     def can_write(self) -> bool:
@@ -111,7 +112,7 @@ def principal_from_session(db: Database, sid: str | None) -> Principal | None:
             "WHERE s.id=? AND s.expires_at > ? AND u.is_active=1",
             (sid, now),
         ).fetchone()
-    return Principal(row["id"], row["username"], row["role"]) if row else None
+    return Principal(row["id"], row["username"], row["role"], via="web") if row else None
 
 
 def delete_session(db: Database, sid: str | None) -> None:
@@ -172,7 +173,7 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
     if _should_stamp_last_used(row["id"]):
         with db.writer() as conn:
             conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now_iso(), row["id"]))
-    return Principal(row["uid"], row["username"], row["role"])
+    return Principal(row["uid"], row["username"], row["role"], via="mcp")
 
 
 def list_api_keys(db: Database, user_id: int) -> list[dict]:

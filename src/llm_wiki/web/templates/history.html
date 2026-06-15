@@ -14,6 +14,9 @@
       <td>{{ r.created_at }}</td>
       <td>
         <a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a>
+        {% if r.version > 1 %}
+          · <a href="/doc/{{ path|urlpath }}/diff?from={{ r.version - 1 }}&to={{ r.version }}">변경점</a>
+        {% endif %}
         {% if user.can_write and r.version != current_version %}
           · <form method="post" action="/doc/{{ path|urlpath }}/rev/{{ r.version }}/restore" class="inline"
                   onsubmit="return confirm('v{{ r.version }} 내용으로 되돌릴까요? (새 버전으로 기록됩니다)')">

@@ -78,15 +78,43 @@ def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
         conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
 
 
-def embed_pending(db, embedder: Embedder, doc_id: int | None = None) -> int:
-    """Embed a single doc, or sweep all docs with vector_dirty=1. Returns count."""
+def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64) -> int:
+    """Embed a single doc, or sweep all docs with vector_dirty=1. Returns the number
+    of documents embedded.
+
+    The sweep path (doc_id is None, used by reindex) batches encode calls across
+    *all* dirty chunks and writes every vector in one transaction, instead of one
+    encode + one writer transaction per document. This turns a large-vault reembed
+    from O(docs) torch/commit round-trips into O(chunks/batch)."""
+    if doc_id is not None:
+        embed_doc(db, embedder, doc_id)
+        return 1
+
     with db.reader() as conn:
-        if doc_id is None:
-            ids = [r[0] for r in conn.execute(
-                "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0"
-            )]
-        else:
-            ids = [doc_id]
-    for did in ids:
-        embed_doc(db, embedder, did)
-    return len(ids)
+        rows = conn.execute(
+            "SELECT c.id AS chunk_id, c.text AS text "
+            "FROM chunks c JOIN documents d ON d.id=c.doc_id "
+            "WHERE d.vector_dirty=1 AND d.is_deleted=0 ORDER BY c.doc_id, c.ordinal"
+        ).fetchall()
+        dirty = [r[0] for r in conn.execute(
+            "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0")]
+    if not dirty:
+        return 0
+    if rows:
+        texts = [r["text"] for r in rows]
+        vectors: list = []
+        for i in range(0, len(texts), batch_size):
+            vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
+        with db.writer() as conn:
+            for r, emb in zip(rows, vectors, strict=False):
+                conn.execute(
+                    "INSERT OR REPLACE INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
+                    (r["chunk_id"], Embedder.serialize(emb)),
+                )
+            conn.executemany(
+                "UPDATE documents SET vector_dirty=0 WHERE id=?", [(d,) for d in dirty])
+    else:
+        with db.writer() as conn:
+            conn.executemany(
+                "UPDATE documents SET vector_dirty=0 WHERE id=?", [(d,) for d in dirty])
+    return len(dirty)

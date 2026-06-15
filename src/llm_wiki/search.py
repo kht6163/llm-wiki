@@ -51,11 +51,20 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
         "WHERE embedding MATCH ? AND k=? ORDER BY distance",
         (Embedder.serialize(qv), limit),
     ).fetchall()
+    if not rows:
+        return []
+    # Resolve all matched chunks in one query instead of one SELECT per hit.
+    ids = [r["chunk_id"] for r in rows]
+    ph = ",".join("?" * len(ids))
+    chunk_map = {
+        c["id"]: c
+        for c in conn.execute(
+            f"SELECT id, doc_id, heading, text FROM chunks WHERE id IN ({ph})", ids
+        )
+    }
     best: dict[int, tuple] = {}  # doc_id -> (distance, heading, text)
     for r in rows:
-        ch = conn.execute(
-            "SELECT doc_id, heading, text FROM chunks WHERE id=?", (r["chunk_id"],)
-        ).fetchone()
+        ch = chunk_map.get(r["chunk_id"])
         if not ch:
             continue
         d = ch["doc_id"]

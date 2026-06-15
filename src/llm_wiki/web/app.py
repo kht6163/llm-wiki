@@ -5,6 +5,7 @@ embedding work. Authorization is delegated to the shared service layer.
 """
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 from urllib.parse import quote
 
@@ -18,6 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from ..markdown_render import render_markdown
 from ..runtime import AppContext
 from ..search import search as run_search
+from ..services import audit
 from ..services import users as users_svc
 from ..services.auth import (
     Principal,
@@ -40,6 +42,24 @@ from .security import (
 )
 
 _HERE = Path(__file__).parent
+
+
+def _diff_lines(a_text: str, b_text: str) -> list[dict]:
+    """Unified line diff classified for template rendering (text is escaped by Jinja)."""
+    out: list[dict] = []
+    for line in difflib.unified_diff(a_text.splitlines(), b_text.splitlines(), lineterm="", n=3):
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("@@"):
+            cls = "hunk"
+        elif line.startswith("+"):
+            cls = "add"
+        elif line.startswith("-"):
+            cls = "del"
+        else:
+            cls = "ctx"
+        out.append({"cls": cls, "text": line})
+    return out
 
 
 def create_web_app(app: AppContext) -> FastAPI:
@@ -96,9 +116,12 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not p:
             login_limiter.record_failure(ip_key)
             login_limiter.record_failure(user_key)
+            audit.record_tx(db, actor=uname or "-", via="web", action="login_failed",
+                            target=None, outcome="error", detail=f"ip={ip}")
             return render("login.html", request, status=401, error="Invalid username or password.")
         login_limiter.reset(ip_key)
         login_limiter.reset(user_key)
+        audit.record_tx(db, actor=p.username, via="web", action="login", detail=f"ip={ip}")
         # Drop any pre-login session state (fixation hardening), then bind the new
         # session. A fresh CSRF token is minted on the next rendered page.
         request.session.clear()
@@ -113,7 +136,21 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.get("/healthz")
     def healthz():
+        # Liveness: cheap, always ok if the process is up.
         return JSONResponse({"ok": True})
+
+    @web.get("/readyz")
+    def readyz():
+        # Readiness: DB reachable AND the embedding model loaded. Orchestrators
+        # should route traffic only once this returns 200.
+        try:
+            with db.reader() as conn:
+                conn.execute("SELECT 1").fetchone()
+            ready = embedder.is_loaded
+        except Exception:
+            ready = False
+        code = 200 if ready else 503
+        return JSONResponse({"ok": ready, "ready": ready, "model_loaded": embedder.is_loaded}, status_code=code)
 
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
@@ -122,7 +159,13 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not user(request):
             return login_redirect()
         items = docs.list_docs(folder=folder, tag=tag, limit=1000, sort=sort)
-        return render("list.html", request, items=items, folder=folder, tag=tag, sort=sort)
+        folder_counts: dict[str, int] = {}
+        for d in items:
+            if d["folder"]:
+                folder_counts[d["folder"]] = folder_counts.get(d["folder"], 0) + 1
+        folders = sorted(folder_counts.items())
+        return render("list.html", request, items=items, folder=folder, tag=tag, sort=sort,
+                      folders=folders)
 
     @web.get("/tags", response_class=HTMLResponse)
     def tags_page(request: Request):
@@ -150,6 +193,18 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not user(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse(docs.graph(root=root or None, depth=depth, limit=limit))
+
+    @web.get("/api/complete")
+    def api_complete(request: Request, q: str = ""):
+        if not user(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return JSONResponse({"ok": True, "items": docs.complete(q, limit=10)})
+
+    @web.post("/api/preview")
+    def api_preview(request: Request, content: str = Form(""), path: str = Form("preview.md")):
+        if not user(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return JSONResponse({"ok": True, "html": render_markdown(content, path or "preview.md")})
 
     @web.get("/go")
     def go(request: Request, target: str, **_):
@@ -206,7 +261,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         except ConflictError as e:
             return render("edit.html", request, status=409, is_new=False, path=path, title=title,
                           content=content, base_version=e.extra.get("current_version"),
-                          conflict=e.extra, error=None, can_write=p.can_write)
+                          conflict=e.extra, error=None, can_write=p.can_write,
+                          conflict_diff=_diff_lines(content, e.extra.get("current_content") or ""))
         except WikiError as e:
             return render("edit.html", request, status=e.http_status, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
@@ -261,6 +317,21 @@ def create_web_app(app: AppContext) -> FastAPI:
         html = render_markdown(rev["content"], rev["path"])
         return render("revision.html", request, rev=rev, html=html)
 
+    @web.get("/doc/{path:path}/diff", response_class=HTMLResponse)
+    def diff_view(path: str, request: Request):
+        if not user(request):
+            return login_redirect()
+        try:
+            frm = int(request.query_params.get("from") or 0)
+            to = int(request.query_params.get("to") or 0)
+            a = docs.revision(path, frm)
+            b = docs.revision(path, to)
+        except (ValueError, WikiError) as e:
+            msg = getattr(e, "message", "Invalid revision numbers.")
+            return render("error.html", request, status=getattr(e, "http_status", 400), message=msg)
+        return render("diff.html", request, path=a["path"], a=a, b=b,
+                      diff=_diff_lines(a["content"], b["content"]))
+
     @web.post("/doc/{path:path}/rev/{version}/restore")
     def restore_revision(path: str, version: int, request: Request):
         p = user(request)
@@ -308,6 +379,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
         token = create_api_key(db, p.user_id, name)
+        audit.record_tx(db, actor=p.username, via="web", action="key_mint", target=name)
         return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=token)
 
     @web.post("/settings/keys/{key_id}/revoke")
@@ -316,6 +388,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not p:
             return login_redirect()
         revoke_api_key(db, p.user_id, key_id)
+        audit.record_tx(db, actor=p.username, via="web", action="key_revoke", target=str(key_id))
         return RedirectResponse("/settings", status_code=303)
 
     # ---- admin ----------------------------------------------------------
@@ -342,6 +415,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             return resp
         try:
             create_user(db, username, password, role)
+            audit.record_tx(db, actor=p.username, via="web", action="user_create",
+                            target=username, detail=f"role={role}")
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
@@ -353,6 +428,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             return resp
         try:
             users_svc.set_role(db, uid, role)
+            audit.record_tx(db, actor=p.username, via="web", action="role_change",
+                            target=str(uid), detail=f"role={role}")
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
@@ -364,6 +441,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             return resp
         try:
             users_svc.set_active(db, uid, bool(active))
+            audit.record_tx(db, actor=p.username, via="web", action="user_active",
+                            target=str(uid), detail=f"active={bool(active)}")
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
@@ -375,6 +454,7 @@ def create_web_app(app: AppContext) -> FastAPI:
             return resp
         try:
             users_svc.set_password(db, uid, password)
+            audit.record_tx(db, actor=p.username, via="web", action="password_change", target=str(uid))
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
@@ -386,6 +466,7 @@ def create_web_app(app: AppContext) -> FastAPI:
             return resp
         try:
             users_svc.delete_user(db, uid)
+            audit.record_tx(db, actor=p.username, via="web", action="user_delete", target=str(uid))
         except WikiError as e:
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)

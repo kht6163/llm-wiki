@@ -29,6 +29,14 @@ class Embedder:
         return self._model
 
     @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def warm(self) -> None:
+        """Eagerly load the model so the first request (and readiness) isn't slow."""
+        self._load()
+
+    @property
     def dim(self) -> int:
         model = self._load()
         getter = getattr(model, "get_embedding_dimension", None) or model.get_sentence_embedding_dimension

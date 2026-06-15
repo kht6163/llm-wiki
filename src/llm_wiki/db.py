@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -133,7 +133,27 @@ CREATE INDEX IF NOT EXISTS idx_links_src ON links(src_doc_id);
 CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst_doc_id);
 CREATE INDEX IF NOT EXISTS idx_links_dst_path ON links(dst_path_norm);
 CREATE INDEX IF NOT EXISTS idx_links_dst_name ON links(dst_name);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id      INTEGER PRIMARY KEY,
+  ts      TEXT NOT NULL,
+  actor   TEXT,                 -- username or api-key prefix ('-' for anonymous)
+  via     TEXT NOT NULL,        -- web | mcp | cli
+  action  TEXT NOT NULL,        -- login, login_failed, key_mint, doc_create, role_change, ...
+  target  TEXT,                 -- document path / affected username / key prefix
+  outcome TEXT NOT NULL,        -- ok | error | forbidden | conflict
+  detail  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 """
+
+# Numbered forward migrations for EXISTING databases, applied in order inside the
+# schema transaction. New *tables* belong in SCHEMA_SQL (IF NOT EXISTS covers fresh
+# and existing DBs); use a migration only for changes IF NOT EXISTS can't express —
+# ALTER TABLE ADD COLUMN, index/constraint changes, data backfills. Each entry is
+# (target_version, ddl). Example:
+#   (3, "ALTER TABLE documents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
+MIGRATIONS: list[tuple[int, str]] = []
 
 
 def connect(path: Path | str) -> sqlite3.Connection:
@@ -212,10 +232,30 @@ class Database:
             conn = self.connect()
             try:
                 conn.executescript(SCHEMA_SQL)
-                if get_meta(conn, "schema_version") is None:
-                    set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+                self._apply_migrations(conn)
             finally:
                 conn.close()
+
+    def _apply_migrations(self, conn: sqlite3.Connection) -> None:
+        """Bring an existing DB up to SCHEMA_VERSION. Fresh DBs get the latest
+        schema from SCHEMA_SQL above and are simply stamped. Refuses to run against
+        a DB written by a newer version of the code (downgrade guard)."""
+        stored = get_meta(conn, "schema_version")
+        if stored is None:  # brand-new DB — SCHEMA_SQL already created the latest schema
+            set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+            return
+        current = int(stored)
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema_version is {current}, newer than this build supports "
+                f"({SCHEMA_VERSION}). Upgrade llm-wiki to match the database."
+            )
+        for target, ddl in MIGRATIONS:
+            if current < target <= SCHEMA_VERSION:
+                conn.executescript(ddl)
+                current = target
+        if int(stored) < SCHEMA_VERSION:
+            set_meta(conn, "schema_version", str(SCHEMA_VERSION))
 
     def ensure_vector_table(self, dim: int) -> None:
         if dim <= 0:

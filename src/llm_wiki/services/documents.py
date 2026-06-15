@@ -9,6 +9,7 @@ from the latest revision (see ``recover_pending``).
 from __future__ import annotations
 
 import os
+import re
 import uuid
 from pathlib import Path
 
@@ -25,8 +26,40 @@ from ..util import (
     safe_join,
     sha256_hex,
 )
+from . import audit
 from .auth import Principal
 from .errors import ConflictError, ForbiddenError, NotFoundError, ValidationError
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+
+def _locate_section(body: str, heading: str):
+    """Find a markdown section by heading text. Returns (lines, start, end, level)
+    where start is the heading line index and end is the exclusive index of the
+    next heading at the same-or-higher level (the section's subtree), or None."""
+    lines = body.splitlines(keepends=True)
+    target = heading.strip().lower()
+    start: int | None = None
+    level = 0
+    for i, line in enumerate(lines):
+        m = _HEADING_RE.match(line.rstrip("\n"))
+        if m and m.group(2).strip().lower() == target:
+            start, level = i, len(m.group(1))
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        m = _HEADING_RE.match(lines[j].rstrip("\n"))
+        if m and len(m.group(1)) <= level:
+            end = j
+            break
+    return lines, start, end, level
+
+
+def _as_block(text: str) -> str:
+    """Normalize inserted text to end with exactly one trailing newline."""
+    return text.rstrip("\n") + "\n"
 
 
 class DocumentService:
@@ -47,6 +80,18 @@ class DocumentService:
         conn.execute("DELETE FROM tags WHERE doc_id=?", (doc_id,))
         for t in tags:
             conn.execute("INSERT OR IGNORE INTO tags(doc_id, tag) VALUES(?,?)", (doc_id, t))
+
+    def _tags_for_ids(self, conn, ids: list[int]) -> dict[int, list[str]]:
+        """One grouped query for many docs' tags, instead of one query per doc."""
+        if not ids:
+            return {}
+        ph = ",".join("?" * len(ids))
+        out: dict[int, list[str]] = {}
+        for row in conn.execute(
+            f"SELECT doc_id, tag FROM tags WHERE doc_id IN ({ph}) ORDER BY tag", ids
+        ):
+            out.setdefault(row["doc_id"], []).append(row["tag"])
+        return out
 
     def _latest_body(self, conn, doc_id: int) -> str:
         r = conn.execute(
@@ -135,11 +180,12 @@ class DocumentService:
         params += [max(1, min(int(limit), 1000)), max(0, int(offset))]
         out = []
         with self.db.reader() as conn:
-            for r in conn.execute(q, params).fetchall():
-                tags = [t[0] for t in conn.execute("SELECT tag FROM tags WHERE doc_id=?", (r["id"],))]
+            rows = conn.execute(q, params).fetchall()
+            tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
+            for r in rows:
                 out.append({
                     "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
-                    "folder": r["folder"], "tags": tags, "updated_at": r["updated_at"],
+                    "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
                 })
         return out
 
@@ -156,6 +202,21 @@ class DocumentService:
             params.append(tag)
         with self.db.reader() as conn:
             return conn.execute(q, params).fetchone()[0]
+
+    def complete(self, q: str, limit: int = 10) -> list[dict]:
+        """Path/title prefix-ish matches for wikilink autocomplete."""
+        q = (q or "").strip()
+        if not q:
+            return []
+        like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT path, title FROM documents WHERE is_deleted=0 AND "
+                "(path LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\') "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (like, like, max(1, min(int(limit), 25))),
+            ).fetchall()
+        return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
     def tags(self) -> list[dict]:
         """Tag vocabulary across non-deleted documents, most-used first."""
@@ -280,6 +341,8 @@ class DocumentService:
             indexing.rechunk(conn, doc_id, content)
             indexing.reindex_links(conn, doc_id, content, folder)
             graph.backfill_links_for(conn, doc_id, norm, stem)
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_create", target=rel, detail=f"v{new_version}")
 
         mtime = self._write_file(rel, content)
         with self.db.writer() as conn:
@@ -329,6 +392,8 @@ class DocumentService:
             if content_changed:
                 indexing.rechunk(conn, doc_id, content)
             indexing.reindex_links(conn, doc_id, content, folder)
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_update", target=rel, detail=f"v{new_version}")
 
         mtime = self._write_file(rel, content)
         with self.db.writer() as conn:
@@ -336,6 +401,121 @@ class DocumentService:
         if content_changed:
             indexing.embed_doc(self.db, self.embedder, doc_id)
         return self.get(rel)
+
+    # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
+    def get_section(self, path: str, heading: str) -> dict:
+        doc = self.get(path)
+        loc = _locate_section(doc["content"], heading)
+        if not loc:
+            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
+        lines, start, end, _ = loc
+        return {"path": doc["path"], "heading": heading, "version": doc["version"],
+                "content": "".join(lines[start:end])}
+
+    def replace_section(self, principal: Principal, path: str, heading: str, text: str) -> dict:
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        doc = self.get(path)
+        loc = _locate_section(doc["content"], heading)
+        if not loc:
+            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
+        lines, start, end, _ = loc
+        # Keep the heading line; replace its body up to the next same/higher heading.
+        body = "".join(lines[:start + 1]) + _as_block(text) + "".join(lines[end:])
+        return self.update(principal, doc["path"], doc["version"], body)
+
+    def append_section(self, principal: Principal, path: str, heading: str, text: str) -> dict:
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        doc = self.get(path)
+        loc = _locate_section(doc["content"], heading)
+        if not loc:
+            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
+        lines, start, end, _ = loc
+        body = "".join(lines[:end]) + _as_block(text) + "".join(lines[end:])
+        return self.update(principal, doc["path"], doc["version"], body)
+
+    def patch(self, principal: Principal, path: str, find: str, replace: str,
+              base_version: int | None = None, count: int = 1) -> dict:
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        if not find:
+            raise ValidationError("'find' text is required.")
+        doc = self.get(path)
+        occurrences = doc["content"].count(find)
+        if occurrences == 0:
+            raise NotFoundError("Search text not found; nothing patched.", path=doc["path"])
+        if count and occurrences > count:
+            raise ValidationError(
+                f"Search text appears {occurrences} times (limit {count}); make it more "
+                f"specific or raise 'count'.")
+        new_body = doc["content"].replace(find, replace, count if count else -1)
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, new_body)
+
+    def move(self, principal: Principal, path: str, new_path: str) -> dict:
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot move documents (read/search only).")
+        rel, new_rel = normalize_rel_path(path), normalize_rel_path(new_path)
+        norm, new_norm = path_norm(rel), path_norm(new_rel)
+        if norm == new_norm:
+            return self.get(rel)
+        new_folder, new_stem = folder_of(new_rel), basename_stem(new_rel).lower()
+        now = now_iso()
+        with self.db.writer() as conn:
+            row = conn.execute(
+                "SELECT id, version, title, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+            if not row or row["is_deleted"]:
+                raise NotFoundError("No document at this path.", path=rel)
+            clash = conn.execute(
+                "SELECT 1 FROM documents WHERE path_norm=?", (new_norm,)).fetchone()
+            if clash:
+                raise ConflictError("The destination path is already occupied.", path=new_rel)
+            doc_id, new_version = row["id"], row["version"] + 1
+            body = self._latest_body(conn, doc_id)
+            conn.execute(
+                "UPDATE documents SET path=?, path_norm=?, folder=?, version=version+1, "
+                "file_state='pending', updated_at=?, updated_by=? WHERE id=?",
+                (new_rel, new_norm, new_folder, now, principal.user_id, doc_id),
+            )
+            conn.execute(
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
+                "VALUES(?,?,?,?,?,?, 'rename', ?)",
+                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, now),
+            )
+            # Incoming links that resolved to the old path/name are now stale; drop
+            # their resolution and re-resolve anything pointing at the new path/name.
+            graph.unresolve_incoming(conn, doc_id)
+            graph.backfill_links_for(conn, doc_id, new_norm, new_stem)
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_move", target=f"{rel} -> {new_rel}")
+        self._trash_file(rel)
+        mtime = self._write_file(new_rel, body)
+        with self.db.writer() as conn:
+            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+        return self.get(new_rel)
+
+    def recent_changes(self, limit: int = 20, since: str | None = None,
+                       until: str | None = None) -> list[dict]:
+        """Most-recently-updated non-deleted documents, optionally bounded by an
+        ISO-8601 updated_at window (e.g. '2026-06-01')."""
+        q = "SELECT id, path, title, version, folder, updated_at FROM documents WHERE is_deleted=0"
+        params: list = []
+        if since:
+            q += " AND updated_at >= ?"
+            params.append(since)
+        if until:
+            q += " AND updated_at <= ?"
+            params.append(until)
+        q += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        with self.db.reader() as conn:
+            rows = conn.execute(q, params).fetchall()
+            tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
+            return [{
+                "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
+                "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
+            } for r in rows]
 
     def delete(self, principal: Principal, path: str, base_version: int | None = None) -> dict:
         if not principal.can_write:
@@ -368,6 +548,8 @@ class DocumentService:
             indexing.clear_chunks(conn, doc_id)
             graph.unresolve_incoming(conn, doc_id)
             conn.execute("DELETE FROM links WHERE src_doc_id=?", (doc_id,))
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_delete", target=rel, detail=f"v{new_version}")
         self._trash_file(rel)
         return {"ok": True, "path": rel, "deleted": True}
 

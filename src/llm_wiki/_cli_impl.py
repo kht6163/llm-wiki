@@ -162,8 +162,12 @@ def _serve(args) -> int:
     if args.mcp_port:
         settings.mcp_port = args.mcp_port
 
+    from .logconf import configure_logging
+    configure_logging(settings.log_level)
+
     print("Loading embedding model… (first run downloads it from HuggingFace)")
     ctx = build_context(settings, full=True)
+    ctx.embedder.warm()  # load weights now so the first request isn't slow / failing readiness
     if not args.no_recover:
         n = ctx.docs.recover_pending()
         if n:
@@ -171,6 +175,15 @@ def _serve(args) -> int:
 
     web_app = create_web_app(ctx)
     mcp_app = create_mcp_server(ctx).streamable_http_app()
+
+    # Unauthenticated health route on the MCP app (for orchestrators / probes).
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route
+
+    async def _mcp_health(_req):
+        return JSONResponse({"ok": True, "model_loaded": ctx.embedder.is_loaded})
+
+    mcp_app.router.routes.append(Route("/healthz", _mcp_health, methods=["GET"]))
 
     print(f"Web UI : http://{settings.host}:{settings.gui_port}")
     print(f"MCP    : http://{settings.host}:{settings.mcp_port}/mcp  (Authorization: Bearer <api_key>)")

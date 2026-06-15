@@ -169,46 +169,56 @@ def build_graph(
     id_set = set(doc_ids)
     nodes: dict[str, dict] = {}
     path_by_id: dict[int, str] = {}
-    for did in doc_ids:
-        d = conn.execute("SELECT id, path, title, folder FROM documents WHERE id=?", (did,)).fetchone()
-        tags = [t[0] for t in conn.execute("SELECT tag FROM tags WHERE doc_id=?", (did,))]
-        path_by_id[did] = d["path"]
-        nodes[d["path"]] = {
-            "id": d["path"], "label": d["title"] or d["path"], "exists": True,
-            "folder": d["folder"], "tags": tags, "degree": 0,
-            "is_root": (root_norm is not None and d["path"].lower() == root_norm),
-        }
+    link_rows: list = []
+    if doc_ids:
+        # Batch the node metadata, tags, and outgoing edges into three queries
+        # rather than 3×N per-node queries (N up to the 2000-node cap).
+        ph = ",".join("?" * len(doc_ids))
+        tag_map: dict[int, list[str]] = {}
+        for tr in conn.execute(f"SELECT doc_id, tag FROM tags WHERE doc_id IN ({ph})", doc_ids):
+            tag_map.setdefault(tr["doc_id"], []).append(tr["tag"])
+        for d in conn.execute(
+            f"SELECT id, path, title, folder FROM documents WHERE id IN ({ph})", doc_ids
+        ):
+            path_by_id[d["id"]] = d["path"]
+            nodes[d["path"]] = {
+                "id": d["path"], "label": d["title"] or d["path"], "exists": True,
+                "folder": d["folder"], "tags": sorted(tag_map.get(d["id"], [])), "degree": 0,
+                "is_root": (root_norm is not None and d["path"].lower() == root_norm),
+            }
+        link_rows = conn.execute(
+            f"SELECT src_doc_id, dst_doc_id, dst_name, is_resolved, link_type, alias, anchor "
+            f"FROM links WHERE src_doc_id IN ({ph})", doc_ids
+        ).fetchall()
 
     edges: list[dict] = []
     eid = 0
-    for did in doc_ids:
-        src = path_by_id[did]
-        for lk in conn.execute(
-            "SELECT dst_doc_id, dst_name, is_resolved, link_type, alias, anchor "
-            "FROM links WHERE src_doc_id=?", (did,)
-        ):
-            if lk["dst_doc_id"] is not None:
-                if lk["dst_doc_id"] not in id_set:
-                    continue
-                target_id = path_by_id[lk["dst_doc_id"]]
-            else:
-                if not include_unresolved:
-                    continue
-                target_id = "unresolved:" + (lk["dst_name"] or "?")
-                if target_id not in nodes:
-                    nodes[target_id] = {
-                        "id": target_id, "label": lk["dst_name"] or "?", "exists": False,
-                        "folder": None, "tags": [], "degree": 0, "is_root": False,
-                    }
-            eid += 1
-            edges.append({
-                "id": f"e{eid}", "source": src, "target": target_id,
-                "type": lk["link_type"], "resolved": bool(lk["is_resolved"]),
-                "alias": lk["alias"], "anchor": lk["anchor"],
-            })
-            nodes[src]["degree"] += 1
-            if target_id in nodes:
-                nodes[target_id]["degree"] += 1
+    for lk in link_rows:
+        src = path_by_id.get(lk["src_doc_id"])
+        if src is None:
+            continue
+        if lk["dst_doc_id"] is not None:
+            if lk["dst_doc_id"] not in id_set:
+                continue
+            target_id = path_by_id[lk["dst_doc_id"]]
+        else:
+            if not include_unresolved:
+                continue
+            target_id = "unresolved:" + (lk["dst_name"] or "?")
+            if target_id not in nodes:
+                nodes[target_id] = {
+                    "id": target_id, "label": lk["dst_name"] or "?", "exists": False,
+                    "folder": None, "tags": [], "degree": 0, "is_root": False,
+                }
+        eid += 1
+        edges.append({
+            "id": f"e{eid}", "source": src, "target": target_id,
+            "type": lk["link_type"], "resolved": bool(lk["is_resolved"]),
+            "alias": lk["alias"], "anchor": lk["anchor"],
+        })
+        nodes[src]["degree"] += 1
+        if target_id in nodes:
+            nodes[target_id]["degree"] += 1
 
     return {"ok": True, "root": root_path, "depth": depth, "truncated": truncated,
             "nodes": list(nodes.values()), "edges": edges}

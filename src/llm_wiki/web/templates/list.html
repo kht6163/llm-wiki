@@ -13,17 +13,32 @@
     </select>
   </form>
 </div>
-{% if not items %}
-  <p class="muted">문서가 없습니다. {% if user.can_write %}<a href="/new">새 문서 만들기</a>{% endif %}</p>
-{% endif %}
-<ul class="doclist">
-  {% for d in items %}
-  <li>
-    <a class="title" href="/doc/{{ d.path|urlpath }}">{{ d.title }}</a>
-    <span class="path">{{ d.path }}</span>
-    {% for t in d.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
-    <span class="meta">v{{ d.version }} · {{ d.updated_at }}</span>
-  </li>
-  {% endfor %}
-</ul>
+<div class="list-layout">
+  <aside class="folders">
+    <h3>폴더</h3>
+    <ul>
+      <li><a href="/" {% if not folder %}class="active"{% endif %}>전체</a></li>
+      {% for name, n in folders %}
+        <li><a href="/?folder={{ name|urlpath }}" {% if folder==name %}class="active"{% endif %}>{{ name }} <span class="muted">{{ n }}</span></a></li>
+      {% else %}
+        <li class="muted">폴더 없음</li>
+      {% endfor %}
+    </ul>
+  </aside>
+  <div class="list-main">
+    {% if not items %}
+      <p class="muted">문서가 없습니다. {% if user.can_write %}<a href="/new">새 문서 만들기</a>{% endif %}</p>
+    {% endif %}
+    <ul class="doclist">
+      {% for d in items %}
+      <li>
+        <a class="title" href="/doc/{{ d.path|urlpath }}">{{ d.title }}</a>
+        <span class="path">{{ d.path }}</span>
+        {% for t in d.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
+        <span class="meta">v{{ d.version }} · {{ d.updated_at }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+</div>
 {% endblock %}

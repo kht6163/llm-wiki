@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}비교 · {{ path }}{% endblock %}
+{% block content %}
+<h1>비교 · <a href="/doc/{{ path|urlpath }}">{{ path }}</a></h1>
+<p class="muted">v{{ a.version }} ({{ a.created_at }}) → v{{ b.version }} ({{ b.created_at }}) ·
+  <a href="/doc/{{ path|urlpath }}/history">이력으로</a></p>
+{% if not diff %}
+  <p class="muted">두 버전의 내용이 동일합니다.</p>
+{% else %}
+<pre class="diff">{% for d in diff %}<span class="d-{{ d.cls }}">{{ d.text }}</span>
+{% endfor %}</pre>
+{% endif %}
+{% endblock %}

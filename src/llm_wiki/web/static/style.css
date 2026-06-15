@@ -101,6 +101,32 @@ button:disabled { background: #9ca3af; cursor: not-allowed; }
 .taglist { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
 .taglist li { display: flex; align-items: center; gap: 6px; }
 
+.list-layout { display: grid; grid-template-columns: 220px 1fr; gap: 24px; }
+@media (max-width: 760px) { .list-layout { grid-template-columns: 1fr; } }
+.folders { border-right: 1px solid var(--line); padding-right: 16px; font-size: 0.9em; }
+.folders h3 { font-size: 0.9em; margin: 6px 0; }
+.folders ul { list-style: none; padding: 0; margin: 0; }
+.folders li { padding: 2px 0; }
+.folders a.active { font-weight: 600; }
+
+/* diff view */
+pre.diff { font-size: 0.85em; line-height: 1.45; }
+.diff .d-add { display: block; background: #e6ffec; color: #04260f; }
+.diff .d-del { display: block; background: #ffebe9; color: #3a0a07; }
+.diff .d-hunk { display: block; color: var(--muted); }
+.diff .d-ctx { display: block; }
+
+/* editor: side-by-side textarea + live preview */
+.editor-pane { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+@media (max-width: 760px) { .editor-pane { grid-template-columns: 1fr; } }
+.editor-pane textarea { min-height: 60vh; }
+.preview { border: 1px solid var(--line); border-radius: 6px; padding: 12px; min-height: 60vh; overflow: auto; background: var(--bg); }
+
+/* wikilink autocomplete */
+.autocomplete { position: absolute; z-index: 50; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-height: 240px; overflow: auto; min-width: 280px; }
+.autocomplete .ac-item { padding: 6px 10px; font-size: 0.85em; cursor: pointer; white-space: nowrap; }
+.autocomplete .ac-item.active, .autocomplete .ac-item:hover { background: var(--soft); }
+
 /* Automatic dark theme — the UI is variable-driven, so a palette swap suffices. */
 @media (prefers-color-scheme: dark) {
   :root {
@@ -113,4 +139,6 @@ button:disabled { background: #9ca3af; cursor: not-allowed; }
   .newkey { background: #0f2a1d; border-color: #1c5236; }
   .results .snippet { color: var(--fg); }
   mark { background: #7a5c00; color: #fff; }
+  .diff .d-add { background: #12261a; color: #aff5c6; }
+  .diff .d-del { background: #2d1517; color: #ffc9c4; }
 }

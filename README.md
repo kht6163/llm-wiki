@@ -10,7 +10,8 @@
 - 🕸 **링크 그래프** — 위키링크/마크다운 링크를 파싱해 SQLite에 저장, 백링크·미해석(broken) 링크 추적
 - 👤 **역할 기반 권한** — `admin`/`editor`/`viewer`. 웹은 ID/비밀번호 로그인, MCP는 사용자별 API 키(Bearer)
 - 🛡 **보안 기본기** — 세션 CSRF 토큰 + 동일 출처 검사, 로그인 레이트리밋, 보안 응답 헤더(CSP·X-Frame-Options 등), 비밀번호 최소 8자
-- 🎨 **편의 기능** — 다크모드(OS 설정 자동), 리비전 1‑클릭 롤백, 태그 색인 페이지, 원문(.md) 다운로드, 목록 정렬
+- 🎨 **편의 기능** — 다크모드(OS 설정 자동), 리비전 1‑클릭 롤백·diff 비교, 에디터 라이브 프리뷰·`[[위키링크]]` 자동완성, 폴더 사이드바, 태그 색인, 원문(.md) 다운로드, 목록 정렬
+- 🩺 **운영** — 스키마 마이그레이션(버전 가드), 구조화 로깅 + 감사 로그(`audit_log`), `/healthz`·`/readyz` 헬스체크, 기동 시 모델 워밍
 
 ## 요구사항
 
@@ -75,14 +76,18 @@ uv run llm-wiki create-api-key --username admin --name my-agent
 | 툴 | 권한 | 설명 |
 |---|---|---|
 | `search_documents(query, mode, top_k, folder?, tags?)` | 읽기 | 하이브리드/BM25/벡터 검색. `count`+`truncated`(top_k 초과 가능성) 반환 |
-| `read_document(path)` | 읽기 | 본문 + 현재 `version`(=업데이트용 base_version) |
+| `read_document(path, section?, max_chars?)` | 읽기 | 본문 + 현재 `version`. `section`은 헤딩 단위, `max_chars`는 길이 제한 |
 | `list_documents(folder?, tag?, …)` | 읽기 | 문서 목록. `count`/`total`/`has_more`로 페이징 |
+| `list_recent_changes(limit?, since?, until?)` | 읽기 | 최근 수정 문서(ISO 날짜 범위 필터) |
 | `get_tags()` | 읽기 | 태그 목록 + 사용 횟수(필터용 어휘 탐색) |
 | `get_links(path)` / `get_backlinks(path)` | 읽기 | 나가는/들어오는 링크 |
 | `get_revisions(path)` / `get_revision(path, version)` | 읽기 | 이력/특정 버전 |
 | `get_graph(root?, depth, limit, …)` | 읽기 | `{nodes, edges}` 그래프 |
 | `create_document(path, content, title?, tags?)` | 쓰기 | 새 문서 |
 | `update_document(path, base_version, content, …)` | 쓰기 | **base_version 필수**, 불일치 시 `conflict` 반환 |
+| `patch_document(path, find, replace, base_version?, count?)` | 쓰기 | 고유 문자열 치환(토큰 절약). 모호하면 `validation` |
+| `replace_section / append_section(path, heading, text)` | 쓰기 | 헤딩 섹션 단위 편집(전체 본문 불필요) |
+| `move_document(path, new_path)` | 쓰기 | 이름 변경/이동(이력 보존·링크 재해석) |
 | `delete_document(path, base_version?)` | 쓰기 | 소프트 삭제 |
 
 충돌 시 응답 예:
@@ -129,6 +134,7 @@ docker compose up -d                                             # 웹(8080) + M
 - torch는 pyproject의 `pytorch-cpu` 인덱스를 따라 **CPU 휠**로 설치되어 이미지가 가볍습니다.
 - 임베딩 모델 캐시는 `hf-models` 볼륨에 보존되어 재시작 시 재다운로드하지 않습니다.
 - `./data`(DB)·`./vault`(문서)는 호스트에 바인드 마운트됩니다. TLS 뒤라면 `COOKIE_SECURE=true`를 설정하세요.
+- 헬스체크: 웹 `/healthz`(liveness)·`/readyz`(DB + 모델 로드 확인), MCP `:8081/healthz`.
 
 ## 테스트 & 품질
 

@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # set COOKIE_SECURE=true when serving behind TLS / a reverse proxy.
     cookie_secure: bool = False
 
+    # Application log level (DEBUG/INFO/WARNING/ERROR).
+    log_level: str = "INFO"
+
     def ensure_dirs(self) -> None:
         self.vault_path.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)

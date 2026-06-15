@@ -24,9 +24,10 @@ async def test_tools_registered(ctx):
     mcp = create_mcp_server(ctx)
     names = {t.name for t in await mcp.list_tools()}
     expected = {
-        "search_documents", "read_document", "list_documents", "get_tags",
-        "get_links", "get_backlinks", "get_revisions", "get_revision", "get_graph",
-        "create_document", "update_document", "delete_document",
+        "search_documents", "read_document", "list_documents", "list_recent_changes",
+        "get_tags", "get_links", "get_backlinks", "get_revisions", "get_revision", "get_graph",
+        "create_document", "update_document", "patch_document", "replace_section",
+        "append_section", "move_document", "delete_document",
     }
     assert expected <= names, names
 

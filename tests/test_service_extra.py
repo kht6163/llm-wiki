@@ -87,3 +87,72 @@ def test_password_policy_min_length(ctx):
         create_user(ctx.db, "shorty", "1234567", "viewer")  # 7 chars
     uid = create_user(ctx.db, "okuser", "12345678", "viewer")  # 8 chars
     assert uid > 0
+
+
+# -- targeted edits: section / patch / move --------------------------------
+def test_append_and_replace_section(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "s.md", "# Title\n\n## Notes\nfirst\n\n## Refs\nlink\n")
+    out = docs.append_section(p, "s.md", "Notes", "second")
+    assert "first" in out["content"] and "second" in out["content"]
+    # append targets the right section (before "## Refs")
+    assert out["content"].index("second") < out["content"].index("## Refs")
+    out = docs.replace_section(p, "s.md", "Notes", "rewritten")
+    assert "rewritten" in out["content"] and "first" not in out["content"]
+    assert "link" in out["content"]  # other section untouched
+    sec = docs.get_section("s.md", "Refs")
+    assert "link" in sec["content"] and sec["content"].startswith("## Refs")
+
+
+def test_section_not_found(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "s2.md", "# T\n\n## A\nx\n")
+    from llm_wiki.services.errors import NotFoundError
+    with pytest.raises(NotFoundError):
+        docs.append_section(p, "s2.md", "Nonexistent", "y")
+
+
+def test_patch_unique_ambiguous_and_missing(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "p.md", "alpha beta alpha")
+    with pytest.raises(ValidationError):  # appears twice, count=1
+        docs.patch(p, "p.md", "alpha", "X")
+    out = docs.patch(p, "p.md", "beta", "BETA")
+    assert "BETA" in out["content"]
+    from llm_wiki.services.errors import NotFoundError
+    with pytest.raises(NotFoundError):
+        docs.patch(p, "p.md", "missing", "Y")
+
+
+def test_move_document_and_links(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "old.md", "# Old\n\nbody")
+    out = docs.move(p, "old.md", "sub/new.md")
+    assert out["path"] == "sub/new.md"
+    assert not docs.exists("old.md") and docs.exists("sub/new.md")
+    # a rename revision was recorded
+    ops = {r["op"] for r in docs.revisions("sub/new.md")["revisions"]}
+    assert "rename" in ops
+    # moving onto an existing path is rejected
+    docs.create(p, "taken.md", "x")
+    with pytest.raises(ConflictError):
+        docs.move(p, "sub/new.md", "taken.md")
+
+
+def test_recent_changes_window(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "r1.md", "one")
+    docs.create(p, "r2.md", "two")
+    recent = docs.recent_changes(limit=10)
+    assert {d["path"] for d in recent} >= {"r1.md", "r2.md"}
+    # an impossible window returns nothing
+    assert docs.recent_changes(limit=10, until="1990-01-01T00:00:00Z") == []
+
+
+def test_audit_log_records_writes(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "a.md", "body")
+    docs.delete(p, "a.md")
+    from llm_wiki.services import audit
+    actions = {row["action"] for row in audit.recent(ctx.db)}
+    assert {"doc_create", "doc_delete"} <= actions

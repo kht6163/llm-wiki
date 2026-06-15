@@ -142,6 +142,42 @@ def test_security_headers_present(client):
     assert "content-security-policy" in h
 
 
+def test_diff_route(client):
+    login(client, "admin")
+    create_doc(client, "diffy.md", "line one\nline two")
+    client.post(
+        "/doc/diffy.md/edit",
+        data={"content": "line one\nline two changed", "base_version": "1",
+              "csrf_token": _token(client, "/doc/diffy.md/edit")},
+    )
+    r = client.get("/doc/diffy.md/diff?from=1&to=2")
+    assert r.status_code == 200 and "changed" in r.text and "d-add" in r.text
+
+
+def test_preview_api(client):
+    login(client, "admin")
+    r = client.post("/api/preview", data={"content": "# Hi\n\n**bold**", "path": "x.md",
+                                          "csrf_token": _token(client, "/new")})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and "<strong>bold</strong>" in body["html"]
+
+
+def test_complete_api(client):
+    login(client, "admin")
+    create_doc(client, "notes/meeting.md", "# Meeting\n\nbody")
+    r = client.get("/api/complete?q=meet")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert any(it["path"] == "notes/meeting.md" for it in items)
+
+
+def test_readiness_probe(client):
+    r = client.get("/readyz")
+    assert r.status_code == 200 and r.json()["ready"] is True
+    assert client.get("/healthz").status_code == 200
+
+
 def test_api_key_minted_in_response_not_session(client):
     login(client, "admin")
     r = client.post("/settings/keys", data={"name": "agent", "csrf_token": _token(client, "/settings")})
