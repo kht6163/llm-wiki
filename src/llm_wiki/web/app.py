@@ -605,7 +605,9 @@ def create_web_app(app: AppContext) -> FastAPI:
         except (ValueError, WikiError) as e:
             msg = getattr(e, "message", "Invalid revision numbers.")
             return render("error.html", request, status=getattr(e, "http_status", 400), message=msg)
+        current_version = docs.revisions(path, limit=1)["current_version"]
         return render("diff.html", request, path=a["path"], a=a, b=b,
+                      current_version=current_version,
                       diff=_diff_lines(a["content"], b["content"]))
 
     @web.post("/doc/{path:path}/rev/{version}/restore")
@@ -614,9 +616,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not p:
             return login_redirect()
         try:
-            rev = docs.revision(path, version)
-            current = docs.get(path)
-            doc = docs.update(p, path, current["version"], rev["content"], title=rev["title"])
+            doc = docs.restore_revision(p, path, version)
         except ConflictError:
             request.session["flash"] = "복원 실패: 그 사이 다른 변경이 있었습니다. 다시 시도하세요."
             return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)

@@ -1,7 +1,18 @@
 {% extends "base.html" %}
 {% block title %}비교 · {{ path }}{% endblock %}
 {% block content %}
-<h1>비교 · <a href="/doc/{{ path|urlpath }}">{{ path }}</a></h1>
+<div class="doc-head">
+  <h1>비교 · <a href="/doc/{{ path|urlpath }}">{{ path }}</a></h1>
+  {% if user.can_write and a.version != current_version %}
+  <div class="doc-actions">
+    <form method="post" action="/doc/{{ path|urlpath }}/rev/{{ a.version }}/restore" class="inline"
+          onsubmit="return confirm('v{{ a.version }} 내용으로 되돌릴까요? (현재 v{{ current_version }} → 새 버전으로 기록됩니다)')">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="primary">v{{ a.version }}로 되돌리기</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
 <p class="muted">v{{ a.version }} ({{ a.created_at|dt }}) → v{{ b.version }} ({{ b.created_at|dt }}) ·
   <a href="/doc/{{ path|urlpath }}/history">이력으로</a></p>
 {% if not diff %}

@@ -128,6 +128,19 @@ def test_restore_revision_route(client):
     assert "first version body" in client.get("/doc/rollback.md/raw").text
 
 
+def test_diff_page_offers_revert_to_older_version(client):
+    login(client, "admin")
+    create_doc(client, "d.md", "alpha")
+    client.post(
+        "/doc/d.md/edit",
+        data={"content": "beta", "base_version": "1", "csrf_token": _token(client, "/doc/d.md/edit")},
+    )
+    html = client.get("/doc/d.md/diff?from=1&to=2").text
+    # The diff offers a one-click revert to the older (from) version.
+    assert 'action="/doc/d.md/rev/1/restore"' in html
+    assert "되돌리기" in html
+
+
 def test_raw_download(client):
     login(client, "admin")
     create_doc(client, "raw.md", "# Raw\n\nplain markdown")

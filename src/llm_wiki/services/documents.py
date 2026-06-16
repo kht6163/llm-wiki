@@ -709,23 +709,116 @@ class DocumentService:
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, body)
 
+    def append_to_document(self, principal: Principal, path: str, text: str,
+                           ensure_heading: str | None = None,
+                           base_version: int | None = None) -> dict:
+        """Append a text block to the document — the natural agent-journaling
+        primitive (decision logs, daily notes). With ``ensure_heading`` the block
+        goes at the end of that heading's section, creating the heading (h2) at the
+        document end if it doesn't exist yet; without it, the block lands at the very
+        end. Like the section editors, ``base_version`` defaults to the server-read
+        version so a plain append doesn't need a round-trip and won't spuriously
+        conflict."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        if not text or not text.strip():
+            raise ValidationError("'text' is required.")
+        doc = self.get(path)
+        body = doc["content"]
+        if ensure_heading and ensure_heading.strip():
+            heading = ensure_heading.strip().lstrip("#").strip()
+            loc = _locate_section(body, heading)
+            if loc:
+                lines, _start, end, _ = loc
+                head = "".join(lines[:end])
+                if head and not head.endswith("\n"):
+                    head += "\n"
+                new_body = head + _as_block(text) + "".join(lines[end:])
+            else:
+                base = body.rstrip("\n")
+                prefix = (base + "\n\n") if base else ""
+                new_body = f"{prefix}## {heading}\n\n{_as_block(text)}"
+        else:
+            base = body.rstrip("\n")
+            prefix = (base + "\n\n") if base else ""
+            new_body = prefix + _as_block(text)
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, new_body)
+
     def patch(self, principal: Principal, path: str, find: str, replace: str,
-              base_version: int | None = None, count: int = 1) -> dict:
+              base_version: int | None = None, count: int = 1,
+              mode: str = "literal", occurrence: int | None = None) -> dict:
+        """Find-and-replace a substring (``mode='literal'``) or a regular expression
+        (``mode='regex'``, ``re.MULTILINE``; ``replace`` may use ``\\1`` backrefs).
+        ``occurrence`` (1-based) targets a single match deterministically — the way
+        out of "appears N times" failures on repetitive content; otherwise ``count``
+        bounds how many matches may be replaced (0/None = all)."""
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         if not find:
             raise ValidationError("'find' text is required.")
+        if mode not in ("literal", "regex"):
+            raise ValidationError("mode must be 'literal' or 'regex'.")
+        if occurrence is not None and occurrence < 1:
+            raise ValidationError("occurrence is 1-based (must be >= 1).")
         doc = self.get(path)
-        occurrences = doc["content"].count(find)
-        if occurrences == 0:
-            raise NotFoundError("Search text not found; nothing patched.", path=doc["path"])
-        if count and occurrences > count:
-            raise ValidationError(
-                f"Search text appears {occurrences} times (limit {count}); make it more "
-                f"specific or raise 'count'.")
-        new_body = doc["content"].replace(find, replace, count if count else -1)
+        content, rel = doc["content"], doc["path"]
+
+        if mode == "regex":
+            if len(find) > 1000:
+                raise ValidationError("regex pattern too long (max 1000 chars).")
+            try:
+                pat = re.compile(find, re.MULTILINE)
+            except re.error as e:
+                raise ValidationError(f"invalid regex: {e}") from None
+            matches = list(pat.finditer(content))
+            n = len(matches)
+            if n == 0:
+                raise NotFoundError("Pattern not found; nothing patched.", path=rel)
+            if occurrence is not None:
+                if occurrence > n:
+                    raise ValidationError(f"occurrence {occurrence} out of range (1..{n}).")
+                m = matches[occurrence - 1]
+                new_body = content[:m.start()] + m.expand(replace) + content[m.end():]
+            else:
+                if count and n > count:
+                    raise ValidationError(
+                        f"Pattern matches {n} times (limit {count}); narrow it, pass "
+                        f"'occurrence', or raise 'count'.")
+                new_body = pat.sub(replace, content, count=count or 0)
+        else:
+            occurrences = content.count(find)
+            if occurrences == 0:
+                raise NotFoundError("Search text not found; nothing patched.", path=rel)
+            if occurrence is not None:
+                if occurrence > occurrences:
+                    raise ValidationError(f"occurrence {occurrence} out of range (1..{occurrences}).")
+                idx = -len(find)
+                for _ in range(occurrence):
+                    idx = content.find(find, idx + len(find))
+                new_body = content[:idx] + replace + content[idx + len(find):]
+            else:
+                if count and occurrences > count:
+                    raise ValidationError(
+                        f"Search text appears {occurrences} times (limit {count}); make it more "
+                        f"specific, pass 'occurrence', or raise 'count'.")
+                new_body = content.replace(find, replace, count if count else -1)
+
         bv = doc["version"] if base_version is None else int(base_version)
-        return self.update(principal, doc["path"], bv, new_body)
+        return self.update(principal, rel, bv, new_body)
+
+    def restore_revision(self, principal: Principal, path: str, version: int,
+                         base_version: int | None = None) -> dict:
+        """Replay a past revision's body as a new edit (one CAS update) — a server-side
+        undo. The old body is loaded here and never has to travel through the caller,
+        so reverting a large document is a single small call. ``base_version`` defaults
+        to the current version; pass it to reject the revert with 'conflict' if the
+        document changed since you looked."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        rev = self.revision(path, int(version))
+        bv = self.get(rev["path"])["version"] if base_version is None else int(base_version)
+        return self.update(principal, rev["path"], bv, rev["content"], title=rev["title"])
 
     def toggle_task(self, principal: Principal, path: str, line: int | None = None,
                     *, index: int | None = None, base_version: int | None = None) -> dict:

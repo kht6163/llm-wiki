@@ -42,7 +42,8 @@ async def test_tools_registered(ctx):
         "get_backlinks", "get_revisions", "get_revision", "get_graph",
         "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
-        "append_section", "patch_tags", "move_document", "delete_document",
+        "append_section", "append_to_document", "patch_tags", "move_document",
+        "delete_document", "restore_revision",
     }
     assert expected <= names, names
 
@@ -97,6 +98,29 @@ async def test_list_activity_reports_agent_surface(editor_mcp):
 async def test_list_activity_rejects_non_document_action(editor_mcp):
     d = _payload(await editor_mcp.call_tool("list_activity", {"action": "login_failed"}))
     assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_append_to_document_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "log.md", "content": "# Log\n\na\n"}))
+    d = _payload(await editor_mcp.call_tool("append_to_document", {"path": "log.md", "text": "b"}))
+    assert d["ok"] and d["content"].rstrip().endswith("b")
+
+
+async def test_patch_regex_occurrence_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "r.md", "content": "- [ ] a\n- [ ] b\n"}))
+    d = _payload(await editor_mcp.call_tool(
+        "patch_document",
+        {"path": "r.md", "find": r"^- \[ \]", "replace": "- [x]", "mode": "regex", "occurrence": 2}))
+    assert d["ok"] and d["content"] == "- [ ] a\n- [x] b\n"
+
+
+async def test_restore_revision_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "rr.md", "content": "first"}))
+    _payload(await editor_mcp.call_tool(
+        "update_document", {"path": "rr.md", "base_version": 1, "content": "second"}))
+    d = _payload(await editor_mcp.call_tool("restore_revision", {"path": "rr.md", "version": 1}))
+    assert d["ok"] and d["content"] == "first" and d["version"] == 3
 
 
 async def test_viewer_write_forbidden(ctx, principals, monkeypatch):

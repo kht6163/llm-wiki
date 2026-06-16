@@ -332,17 +332,55 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.update(
             p, path, base_version, content, title, tags)}, "update_document")
 
-    @mcp.tool(description="Find-and-replace a unique substring in a document (token-cheap edit; "
-                          "editor/admin only). Fails 'not_found' if absent, 'validation' if it "
-                          "appears more than 'count' times. base_version optional (defaults to "
-                          "current); the edit runs through the same optimistic-locking update.")
+    @mcp.tool(description="Find-and-replace in a document (token-cheap edit; editor/admin only). "
+                          "mode='literal' (default) matches a substring; mode='regex' matches a "
+                          "Python regex (re.MULTILINE; 'replace' may use \\1 backrefs). Set "
+                          "'occurrence' (1-based) to target exactly the Nth match — the way out of "
+                          "'appears N times' when content is repetitive; otherwise 'count' bounds "
+                          "how many matches may be replaced. Fails 'not_found' if absent, "
+                          "'validation' on an out-of-range occurrence / bad regex / too many "
+                          "matches. base_version optional (defaults to current); runs through the "
+                          "same optimistic-locking update.")
     async def patch_document(
         ctx: Context, path: str, find: str, replace: str,
         base_version: int | None = None,
         count: Annotated[int, Field(ge=1, description="Max occurrences to replace / allow.")] = 1,
+        mode: Annotated[Literal["literal", "regex"],
+                        Field(description="Match 'find' literally or as a regex.")] = "literal",
+        occurrence: Annotated[int | None, Field(ge=1,
+                              description="Replace only this 1-based match.")] = None,
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **docs.patch(
-            p, path, find, replace, base_version=base_version, count=count)}, "patch_document")
+            p, path, find, replace, base_version=base_version, count=count,
+            mode=mode, occurrence=occurrence)}, "patch_document")
+
+    @mcp.tool(description="Append a text block to a document (editor/admin only) — the natural "
+                          "journaling primitive for logs/daily notes. With 'ensure_heading' the "
+                          "block goes at the end of that heading's section, creating the heading "
+                          "if missing; without it, at the very end. No base_version needed: it "
+                          "reads the current version server-side, so a plain append is one call "
+                          "and won't spuriously conflict.")
+    async def append_to_document(
+        ctx: Context, path: str, text: str,
+        ensure_heading: Annotated[str | None,
+                                  Field(description="Append under this heading (created if absent).")] = None,
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **docs.append_to_document(
+            p, path, text, ensure_heading=ensure_heading, base_version=base_version)},
+            "append_to_document")
+
+    @mcp.tool(description="Restore a past revision's content as a new edit (editor/admin only) — a "
+                          "one-call server-side undo. The old body is loaded server-side (it never "
+                          "travels through you), so reverting a large document is cheap. Pass "
+                          "base_version to reject with 'conflict' if the document changed since you "
+                          "looked; omit to revert on top of the current version.")
+    async def restore_revision(
+        ctx: Context, path: str, version: int,
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **docs.restore_revision(
+            p, path, version, base_version=base_version)}, "restore_revision")
 
     @mcp.tool(description="Replace the body under a heading (the heading line is kept; "
                           "editor/admin only). Token-cheap; reads latest server-side. Pass "
