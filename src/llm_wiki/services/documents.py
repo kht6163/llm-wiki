@@ -181,6 +181,9 @@ class DocumentService:
             if not d or d["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
             body = self._latest_body(conn, d["id"])
+            lv = conn.execute(
+                "SELECT via FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1", (d["id"],)
+            ).fetchone()
             tags = [t[0] for t in conn.execute(
                 "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],))]
             return {
@@ -188,6 +191,7 @@ class DocumentService:
                 "version": d["version"], "tags": tags, "folder": d["folder"],
                 "created_at": d["created_at"], "updated_at": d["updated_at"],
                 "updated_by": self._username(conn, d["updated_by"]),
+                "last_via": lv["via"] if lv else None,
             }
 
     def exists(self, path: str) -> bool:
@@ -201,7 +205,13 @@ class DocumentService:
     def list_docs(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at") -> list[dict]:
         sort_col = {"updated_at": "updated_at", "title": "title", "path": "path"}.get(sort, "updated_at")
         order = "DESC" if sort_col == "updated_at" else "ASC"
-        q = "SELECT id, path, title, version, folder, updated_at FROM documents WHERE is_deleted=0"
+        # The correlated subquery resolves each row's latest-revision surface (the
+        # idx_revisions_doc(doc_id, version DESC) index makes it a single seek), so
+        # the listing can mark which entries an agent/CLI touched last.
+        q = ("SELECT id, path, title, version, folder, updated_at, "
+             "(SELECT via FROM revisions r WHERE r.doc_id=documents.id "
+             " ORDER BY r.version DESC LIMIT 1) AS last_via "
+             "FROM documents WHERE is_deleted=0")
         params: list = []
         if folder:
             f = folder.strip("/")
@@ -220,6 +230,7 @@ class DocumentService:
                 out.append({
                     "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
                     "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
+                    "last_via": r["last_via"],
                 })
         return out
 
@@ -444,7 +455,7 @@ class DocumentService:
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             rows = conn.execute(
-                "SELECT r.version, r.op, r.created_at, r.title, u.username AS author "
+                "SELECT r.version, r.op, r.via, r.created_at, r.title, u.username AS author "
                 "FROM revisions r LEFT JOIN users u ON u.id=r.author_id "
                 "WHERE r.doc_id=? ORDER BY r.version DESC LIMIT ?",
                 (d["id"], max(1, min(int(limit), 500))),
@@ -459,7 +470,7 @@ class DocumentService:
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             r = conn.execute(
-                "SELECT r.version, r.body, r.title, r.op, r.created_at, u.username AS author "
+                "SELECT r.version, r.body, r.title, r.op, r.via, r.created_at, u.username AS author "
                 "FROM revisions r LEFT JOIN users u ON u.id=r.author_id "
                 "WHERE r.doc_id=? AND r.version=?",
                 (d["id"], int(version)),
@@ -467,7 +478,7 @@ class DocumentService:
             if not r:
                 raise NotFoundError(f"No revision {version} for this document.", path=rel)
             return {"path": rel, "version": r["version"], "title": r["title"], "content": r["body"],
-                    "op": r["op"], "author": r["author"], "created_at": r["created_at"]}
+                    "op": r["op"], "via": r["via"], "author": r["author"], "created_at": r["created_at"]}
 
     def backlinks(self, path: str) -> dict:
         rel = normalize_rel_path(path)
@@ -564,9 +575,9 @@ class DocumentService:
                 )
                 doc_id, new_version = cur.lastrowid, 1
             conn.execute(
-                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
-                "VALUES(?,?,?,?,?,?, 'create', ?)",
-                (doc_id, new_version, content, final_title, chash, principal.user_id, now),
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                "VALUES(?,?,?,?,?,?, 'create', ?, ?)",
+                (doc_id, new_version, content, final_title, chash, principal.user_id, principal.via, now),
             )
             self._set_tags(conn, doc_id, tagset)
             indexing.reindex_fts(conn, doc_id, final_title, content)
@@ -581,7 +592,8 @@ class DocumentService:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         indexing.embed_doc(self.db, self.embedder, doc_id)
         DOC_WRITES.labels("create").inc()
-        self._emit("create", rel, new_version, title=final_title)
+        self._emit("create", rel, new_version, title=final_title,
+                   updated_by=principal.username, via=principal.via)
         return self.get(rel)
 
     def update(self, principal: Principal, path: str, base_version: int, content: str,
@@ -621,9 +633,9 @@ class DocumentService:
                 raise self._conflict(conn, doc_id, rel)
             new_version = int(base_version) + 1
             conn.execute(
-                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
-                "VALUES(?,?,?,?,?,?, 'edit', ?)",
-                (doc_id, new_version, content, final_title, chash, principal.user_id, now),
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                "VALUES(?,?,?,?,?,?, 'edit', ?, ?)",
+                (doc_id, new_version, content, final_title, chash, principal.user_id, principal.via, now),
             )
             self._set_tags(conn, doc_id, tagset)
             indexing.reindex_fts(conn, doc_id, final_title, content)
@@ -640,7 +652,8 @@ class DocumentService:
             indexing.embed_doc(self.db, self.embedder, doc_id)
         DOC_WRITES.labels("update").inc()
         self._emit("update", rel, new_version, title=final_title,
-                   updated_by=principal.username, content_changed=content_changed)
+                   updated_by=principal.username, via=principal.via,
+                   content_changed=content_changed)
         return self.get(rel)
 
     # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
@@ -793,9 +806,9 @@ class DocumentService:
                 (new_rel, new_norm, new_folder, now, principal.user_id, doc_id),
             )
             conn.execute(
-                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
-                "VALUES(?,?,?,?,?,?, 'rename', ?)",
-                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, now),
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                "VALUES(?,?,?,?,?,?, 'rename', ?, ?)",
+                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, principal.via, now),
             )
             # Incoming links that resolved to the old path/name are now stale; drop
             # their resolution and re-resolve anything pointing at the new path/name.
@@ -809,7 +822,8 @@ class DocumentService:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         DOC_WRITES.labels("move").inc()
         # Keyed on the OLD path so a viewer of the moved doc can follow it to `to`.
-        self._emit("move", rel, new_version, to=new_rel)
+        self._emit("move", rel, new_version, to=new_rel,
+                   updated_by=principal.username, via=principal.via)
         return self.get(new_rel)
 
     def recent_changes(self, limit: int = 20, since: str | None = None,
@@ -857,9 +871,9 @@ class DocumentService:
                 (now, principal.user_id, doc_id),
             )
             conn.execute(
-                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
-                "VALUES(?,?,?,?,?,?, 'delete', ?)",
-                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, now),
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                "VALUES(?,?,?,?,?,?, 'delete', ?, ?)",
+                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, principal.via, now),
             )
             indexing.remove_fts(conn, doc_id)
             indexing.clear_chunks(conn, doc_id)
@@ -869,7 +883,8 @@ class DocumentService:
                          action="doc_delete", target=rel, detail=f"v{new_version}")
         self._trash_file(rel)
         DOC_WRITES.labels("delete").inc()
-        self._emit("delete", rel, new_version)
+        self._emit("delete", rel, new_version,
+                   updated_by=principal.username, via=principal.via)
         return {"ok": True, "path": rel, "deleted": True}
 
     def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
@@ -987,8 +1002,8 @@ class DocumentService:
                     )
                     doc_id, new_version, is_new = cur.lastrowid, 1, True
                 conn.execute(
-                    "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, created_at) "
-                    "VALUES(?,?,?,?,?,NULL, 'external-reconcile', ?)",
+                    "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                    "VALUES(?,?,?,?,?,NULL, 'external-reconcile', 'cli', ?)",
                     (doc_id, new_version, content, title, chash, now),
                 )
                 self._set_tags(conn, doc_id, tagset)

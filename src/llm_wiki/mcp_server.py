@@ -18,6 +18,7 @@ from .metrics import MCP_CALLS, MCP_LATENCY
 from .ratelimit import RateLimiter
 from .runtime import AppContext
 from .search import search_page as run_search_page
+from .services import audit
 from .services.auth import Principal, principal_from_api_key
 from .services.errors import UnauthorizedError, ValidationError, WikiError
 from .util import normalize_client_ip
@@ -220,6 +221,35 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             return {"ok": True, "count": len(items), "limit": limit, "since": since,
                     "until": until, "has_more": len(items) >= limit, "documents": items}
         return await _call(ctx, fn, "list_recent_changes")
+
+    @mcp.tool(description="Recent document activity across the whole vault (newest first): who/what "
+                          "created, edited, moved, deleted, reconciled, or uploaded — and over which "
+                          "surface ('via' is web=human, mcp=agent, cli). Unlike list_recent_changes "
+                          "(current docs by updated_at) this includes deletes/moves and the human-vs-"
+                          "agent axis, so an agent can reconcile what changed since its last run. "
+                          "Optional filters: 'since'/'until' (ISO-8601 on the event timestamp), 'via', "
+                          "and 'action' (must be one of the document actions). Security/account events "
+                          "are not exposed here.")
+    async def list_activity(
+        ctx: Context,
+        limit: Annotated[int, Field(ge=1, le=500, description="Max events (1..500).")] = 100,
+        since: Annotated[str | None, Field(description="ISO-8601 lower bound on the event time.")] = None,
+        until: Annotated[str | None, Field(description="ISO-8601 upper bound on the event time.")] = None,
+        via: Annotated[Literal["web", "mcp", "cli"] | None,
+                       Field(description="Restrict to one surface.")] = None,
+        action: Annotated[str | None,
+                          Field(description="One document action, e.g. 'doc_update'.")] = None,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            if action is not None and action not in audit.DOC_ACTIONS:
+                raise ValidationError(
+                    f"action must be one of {audit.DOC_ACTIONS} (security events are not exposed).")
+            events = audit.recent(db, limit=limit, since=since, until=until, via=via,
+                                  action=action, actions=audit.DOC_ACTIONS)
+            return {"ok": True, "count": len(events), "limit": limit, "since": since,
+                    "until": until, "via": via, "actions": list(audit.DOC_ACTIONS),
+                    "events": events}
+        return await _call(ctx, fn, "list_activity")
 
     @mcp.tool(description="Vault-wide broken (unresolved) links: each wikilink/markdown link "
                           "that points at a non-existent document. Use after renames/cleanup to "

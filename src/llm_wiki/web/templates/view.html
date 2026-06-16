@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_badges.html" import via_badge %}
 {% block title %}{{ doc.title }}{% endblock %}
 {% block content %}
 <link rel="stylesheet" href="{{ static('vendor/hljs-theme.css') }}">
@@ -24,6 +25,7 @@
   <div class="doc-meta">
     <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at|dt }}
     {% if doc.updated_by %} · {{ doc.updated_by }}{% endif %}
+    {{ via_badge(doc.last_via) }}
     {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
   </div>
   <div class="rendered" id="doc-rendered">{{ html|safe }}</div>

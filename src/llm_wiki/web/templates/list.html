@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_badges.html" import via_badge %}
 {% block title %}문서 목록{% endblock %}
 {% block content %}
 <div id="rt-meta" data-mode="list" hidden></div>
@@ -35,6 +36,8 @@
       <li>
         <a class="title" href="/doc/{{ d.path|urlpath }}">{{ d.title }}</a>
         <span class="path">{{ d.path }}</span>
+        {# Only flag rows an agent/CLI touched last; a 사람 badge on every row would be noise. #}
+        {% if d.last_via and d.last_via != 'web' %}{{ via_badge(d.last_via) }}{% endif %}
         {% for t in d.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
         <span class="meta">v{{ d.version }} · {{ d.updated_at|dt }}</span>
       </li>

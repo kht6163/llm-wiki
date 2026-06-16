@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS revisions (
   author_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
   op           TEXT NOT NULL DEFAULT 'edit'
                  CHECK(op IN ('create','edit','rename','delete','external-reconcile')),
+  via          TEXT NOT NULL DEFAULT 'web',  -- surface that authored it: web | mcp | cli
   created_at   TEXT NOT NULL,
   UNIQUE(doc_id, version)
 );
@@ -170,7 +171,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
 # version at the last fully-applied step (resumable). For a multi-step change, use
 # several entries so each step is independently atomic. Example:
 #   (3, "ALTER TABLE documents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
-MIGRATIONS: list[tuple[int, str]] = []
+MIGRATIONS: list[tuple[int, str]] = [
+    # v3: record which surface authored each revision (web | mcp | cli) so history
+    # can tell a human edit from an agent edit. Pre-existing rows predate the MCP
+    # write surface in practice, so 'web' is the safe backfill default.
+    (3, "ALTER TABLE revisions ADD COLUMN via TEXT NOT NULL DEFAULT 'web'"),
+]
 
 
 def connect(path: Path | str) -> sqlite3.Connection:
@@ -276,7 +282,17 @@ class Database:
             # fully-applied migration, so a re-run resumes from there.
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(ddl)
+                try:
+                    conn.execute(ddl)
+                except sqlite3.OperationalError as e:
+                    # ADD COLUMN is idempotent. A fresh DB already carries the column
+                    # from SCHEMA_SQL and never runs migrations; but a DB whose stamp
+                    # sits below this column's version (e.g. created with the current
+                    # schema, then rewound) would re-attempt the ALTER. "Duplicate
+                    # column" therefore means "already applied" — a no-op success, so
+                    # still advance the stamp. Any other operational error is real.
+                    if "duplicate column name" not in str(e).lower():
+                        raise
                 set_meta(conn, "schema_version", str(target))
                 conn.execute("COMMIT")
             except Exception:

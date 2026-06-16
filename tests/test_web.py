@@ -157,6 +157,30 @@ def test_broken_links_requires_auth(client):
     assert r.status_code == 303 and r.headers["location"] == "/login"
 
 
+def test_history_shows_authoring_surface_badge(client):
+    login(client, "admin")
+    create_doc(client, "h.md", "# H\n\nbody")  # authored over the web == 사람
+    html = client.get("/doc/h.md/history").text
+    assert "via-badge" in html and "사람" in html
+
+
+def test_activity_page_visible_to_editor_not_viewer(client):
+    login(client, "alice")  # editor
+    create_doc(client, "act.md", "# A\n\nbody")
+    r = client.get("/activity")
+    assert r.status_code == 200
+    assert "활동" in r.text and "문서 생성" in r.text  # Korean action label, not raw action
+    # A viewer has no edit footprint to audit and is refused.
+    client.get("/logout")
+    login(client, "bob")  # viewer
+    assert client.get("/activity").status_code == 403
+
+
+def test_activity_requires_auth(client):
+    r = client.get("/activity", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+
+
 def test_api_doc_preview_returns_title_and_excerpt(client):
     login(client, "admin")
     create_doc(client, "prev.md", "# Preview Title\n\nThe quick brown fox jumps over.", title="Preview Title")

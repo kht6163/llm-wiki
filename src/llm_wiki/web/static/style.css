@@ -133,6 +133,18 @@ h1 { font-size: 1.6em; }
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 7px; color: var(--fg-muted); }
 .tag:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 
+/* Authorship surface: 사람(web, neutral) vs 에이전트(mcp, accent) vs CLI(amber).
+   The accent on the agent badge is the product's identity colour — co-editing by
+   an LLM agent is the thing this badge exists to make visible. */
+.via-badge { font-size: 0.7em; font-family: var(--font-mono); border-radius: var(--r-sm);
+  padding: 1px 6px; border: 1px solid var(--line); background: var(--inset);
+  color: var(--fg-muted); white-space: nowrap; }
+.via-badge.via-mcp { color: var(--accent); background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--line)); }
+.via-badge.via-cli { color: var(--warn); background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
+.outcome-bad { color: var(--warn); font-family: var(--font-mono); }
+
 .layout { display: grid; grid-template-columns: 1fr 280px; gap: 28px; }
 @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
 .doc-head { display: flex; align-items: center; gap: 16px; }

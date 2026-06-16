@@ -15,6 +15,7 @@
     { label: "새 문서 만들기", hint: "create", run: function () { location.href = "/new"; }, keep: function () { return W.canWrite; } },
     { label: "문서 목록", hint: "home list", run: function () { location.href = "/"; } },
     { label: "그래프 보기", hint: "graph", run: function () { location.href = "/graph"; } },
+    { label: "활동 피드", hint: "activity feed changes audit", run: function () { location.href = "/activity"; }, keep: function () { return W.canWrite; } },
     { label: "태그 보기", hint: "tags", run: function () { location.href = "/tags"; } },
     { label: "깨진 링크", hint: "broken links", run: function () { location.href = "/broken-links"; } },
     { label: "검색 페이지", hint: "search", run: function () { location.href = "/search"; } },

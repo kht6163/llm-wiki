@@ -38,7 +38,7 @@ async def test_tools_registered(ctx):
     names = {t.name for t in await mcp.list_tools()}
     expected = {
         "search_documents", "read_document", "get_outline", "list_documents",
-        "list_recent_changes", "list_broken_links", "get_tags", "get_links",
+        "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
         "get_backlinks", "get_revisions", "get_revision", "get_graph",
         "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
@@ -81,6 +81,22 @@ async def test_create_then_read_roundtrip(editor_mcp):
     assert read["ok"] and "body" in read["content"]
     outline = _payload(await editor_mcp.call_tool("get_outline", {"path": "m.md"}))
     assert any(h["text"] == "M" for h in outline["headings"])
+
+
+async def test_list_activity_reports_agent_surface(editor_mcp):
+    # An agent's own write shows up in the activity feed attributed to via='mcp'.
+    _payload(await editor_mcp.call_tool("create_document", {"path": "act.md", "content": "# A\n\nbody"}))
+    d = _payload(await editor_mcp.call_tool("list_activity", {}))
+    assert d["ok"] and d["count"] >= 1
+    created = [e for e in d["events"] if e["action"] == "doc_create" and e["target"] == "act.md"]
+    assert created and created[0]["via"] == "mcp"
+    # Only document actions are exposed (never login/key/role events).
+    assert all(e["action"] in d["actions"] for e in d["events"])
+
+
+async def test_list_activity_rejects_non_document_action(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("list_activity", {"action": "login_failed"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
 async def test_viewer_write_forbidden(ctx, principals, monkeypatch):

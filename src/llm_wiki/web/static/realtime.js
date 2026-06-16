@@ -14,6 +14,19 @@
     return p.split("/").map(encodeURIComponent).join("/");
   }
 
+  // Human-readable label for the surface that authored a change.
+  function viaLabel(via) {
+    return via === "mcp" ? "에이전트" : via === "cli" ? "CLI" : via === "web" ? "사람" : "";
+  }
+
+  // "에이전트(alice)" when both are known; falls back to whichever exists.
+  function whoVia(ev) {
+    var via = viaLabel(ev && ev.via);
+    var who = ev && ev.updated_by;
+    if (via && who) return via + "(" + who + ")";
+    return via || who || "";
+  }
+
   function banner(html, kind) {
     var el = document.getElementById("rt-banner");
     if (!el) {
@@ -55,8 +68,9 @@
         document.querySelectorAll('input[name="base_version"]').forEach(function (i) {
           i.value = d.version;
         });
-        toast("문서가 v" + d.version + "(으)로 업데이트되었습니다" +
-              (d.updated_by ? " · " + d.updated_by : ""));
+        // Prefer the live event's surface attribution; fall back to the fetched doc.
+        var who = whoVia(ev) || (d.updated_by || "");
+        toast("문서가 v" + d.version + "(으)로 업데이트되었습니다" + (who ? " · " + who : ""));
       })
       .catch(function () {});
   }
@@ -83,7 +97,7 @@
     // create / update
     if (ev.version && ev.version <= version) return; // stale or our own echo
     if (mode === "edit") {
-      var who = ev.updated_by ? " · " + ev.updated_by : "";
+      var who = whoVia(ev) ? " · " + whoVia(ev) : "";
       banner("⚠ 다른 곳에서 이 문서가 변경되었습니다 (v" + ev.version + who +
              "). 지금 저장하면 충돌로 거부될 수 있습니다. 변경분을 합치려면 다시 여세요.", "warn");
     } else {

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -118,6 +119,26 @@ def _human_dt(value: object) -> object:
         return value
     utc_text = f"{m.group(1)} {m.group(2)}"
     return Markup('<time class="dt" datetime="{}">{}</time>').format(s, utc_text)
+
+
+# Activity-feed time windows -> an ISO-8601 lower bound on the audit `ts` (which is
+# stored UTC, so lexical >= comparison is correct). "all" means no lower bound.
+_ACTIVITY_WINDOWS = ("today", "24h", "7d", "30d", "all")
+
+
+def _window_since(window: str) -> str | None:
+    now = datetime.now(UTC)
+    if window == "today":
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif window == "24h":
+        start = now - timedelta(days=1)
+    elif window == "30d":
+        start = now - timedelta(days=30)
+    elif window == "all":
+        return None
+    else:  # default / "7d"
+        start = now - timedelta(days=7)
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def create_web_app(app: AppContext) -> FastAPI:
@@ -305,6 +326,27 @@ def create_web_app(app: AppContext) -> FastAPI:
         data = docs.broken_links(limit=max(1, min(int(limit), 2000)))
         return render("broken_links.html", request, count=data["count"], links=data["links"])
 
+    @web.get("/activity", response_class=HTMLResponse)
+    def activity_page(request: Request, window: str = "7d", via: str | None = None,
+                      action: str | None = None):
+        # "Who/what changed the vault, and over which surface." Editors see document
+        # activity; admins additionally see security/account events (login, keys,
+        # role changes) since those are theirs to audit.
+        p = user(request)
+        if not p:
+            return login_redirect()
+        if not p.can_write:
+            return render("error.html", request, status=403,
+                          message="활동 피드는 편집자 이상만 볼 수 있습니다.")
+        window = window if window in _ACTIVITY_WINDOWS else "7d"
+        via_f = via if via in ("web", "mcp", "cli") else None
+        scope = None if p.can_admin else audit.DOC_ACTIONS
+        events = audit.recent(db, limit=300, since=_window_since(window),
+                              via=via_f, action=(action or None), actions=scope)
+        return render("activity.html", request, events=events, window=window,
+                      windows=_ACTIVITY_WINDOWS, via=via_f or "", action=action or "",
+                      is_admin=p.can_admin, doc_actions=audit.DOC_ACTIONS)
+
     @web.get("/api/graph")
     def api_graph(request: Request, root: str | None = None, depth: int = 1, limit: int = 500):
         if not user(request):
@@ -399,7 +441,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             return JSONResponse(e.to_dict(), status_code=e.http_status)
         return JSONResponse({
             "ok": True, "path": doc["path"], "version": doc["version"], "title": doc["title"],
-            "updated_at": doc["updated_at"], "updated_by": doc["updated_by"], "tags": doc["tags"],
+            "updated_at": doc["updated_at"], "updated_by": doc["updated_by"],
+            "last_via": doc.get("last_via"), "tags": doc["tags"],
             "html": render_markdown(doc["content"], doc["path"]),
         })
 

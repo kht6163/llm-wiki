@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% from "_badges.html" import via_badge %}
+{% block title %}활동{% endblock %}
+{% block content %}
+{% set action_labels = {
+  "doc_create": "문서 생성", "doc_update": "문서 수정", "doc_move": "문서 이동",
+  "doc_delete": "문서 삭제", "doc_reconcile": "외부 동기화", "attachment_upload": "첨부 업로드",
+  "login": "로그인", "login_failed": "로그인 실패", "key_mint": "API 키 발급",
+  "key_revoke": "API 키 폐기", "user_create": "사용자 생성", "role_change": "역할 변경",
+  "user_active": "계정 활성/비활성", "password_change": "비밀번호 변경", "user_delete": "사용자 삭제",
+  "doc_reconcile_skip": "동기화 건너뜀"
+} %}
+{# Single-path doc actions whose target is a clickable document path. doc_move's
+   target is "old -> new", so it isn't linkable as one path. #}
+{% set linkable = ["doc_create", "doc_update", "doc_delete", "doc_reconcile", "attachment_upload"] %}
+<h1>활동 <span class="muted">{{ events|length }}건</span></h1>
+<p class="muted">
+  볼트의 변경 이력입니다 — 누가/무엇이(<strong>출처</strong>: 사람·에이전트·CLI) 언제 바꿨는지.
+  {% if is_admin %}관리자에게는 인증·계정 이벤트까지 표시됩니다.{% else %}문서·첨부 활동을 표시합니다.{% endif %}
+</p>
+
+<form class="listsort" method="get" action="/activity">
+  <label>기간
+    <select name="window" onchange="this.form.submit()">
+      {% set wlabel = {"today": "오늘", "24h": "최근 24시간", "7d": "최근 7일", "30d": "최근 30일", "all": "전체"} %}
+      {% for w in windows %}<option value="{{ w }}" {{ 'selected' if window==w }}>{{ wlabel[w] }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>출처
+    <select name="via" onchange="this.form.submit()">
+      <option value="" {{ 'selected' if not via }}>전체</option>
+      <option value="web" {{ 'selected' if via=='web' }}>사람</option>
+      <option value="mcp" {{ 'selected' if via=='mcp' }}>에이전트</option>
+      <option value="cli" {{ 'selected' if via=='cli' }}>CLI</option>
+    </select>
+  </label>
+  {% if action %}<input type="hidden" name="action" value="{{ action }}">{% endif %}
+</form>
+
+{% if not events %}
+  <p class="muted">해당 조건의 활동이 없습니다.</p>
+{% else %}
+<table class="revtable">
+  <thead><tr><th scope="col">시각</th><th scope="col">출처</th><th scope="col">동작</th><th scope="col">행위자</th><th scope="col">대상</th><th scope="col">결과</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+    <tr>
+      <td>{{ e.ts|dt }}</td>
+      <td>{{ via_badge(e.via) }}</td>
+      <td>{{ action_labels.get(e.action, e.action) }}{% if e.detail %} <span class="muted">{{ e.detail }}</span>{% endif %}</td>
+      <td>{{ e.actor or '—' }}</td>
+      <td>
+        {% if e.target and e.action in linkable %}
+          <a href="/doc/{{ e.target|urlpath }}">{{ e.target }}</a>
+        {% elif e.target %}{{ e.target }}{% else %}—{% endif %}
+      </td>
+      <td>{% if e.outcome == 'ok' %}<span class="muted">정상</span>{% else %}<span class="outcome-bad">{{ e.outcome }}</span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -36,6 +36,7 @@
     <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">{{ icon("command") }}</button>
     {% if user.can_write %}<a class="ribbon-btn" href="/new" {% if nav_path == '/new' %}aria-current="page"{% endif %} title="새 문서" aria-label="새 문서">{{ icon("file-plus") }}</a>{% endif %}
     <a class="ribbon-btn" href="/graph" {% if nav_path == '/graph' %}aria-current="page"{% endif %} title="그래프" aria-label="그래프">{{ icon("network") }}</a>
+    {% if user.can_write %}<a class="ribbon-btn" href="/activity" {% if nav_path == '/activity' %}aria-current="page"{% endif %} title="활동" aria-label="활동">{{ icon("activity") }}</a>{% endif %}
     <a class="ribbon-btn" href="/broken-links" {% if nav_path == '/broken-links' %}aria-current="page"{% endif %} title="깨진 링크" aria-label="깨진 링크">{{ icon("unlink") }}</a>
     <span class="ribbon-spacer"></span>
     <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">{{ icon("contrast") }}</button>

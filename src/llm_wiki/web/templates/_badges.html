@@ -1,0 +1,13 @@
+{# Authorship-surface badge: which surface authored an edit. web=사람(human, via the
+   web UI), mcp=에이전트(an LLM agent via the MCP API), cli=CLI/외부 동기화. Renders
+   nothing for an unknown/empty value. Usage:
+   {% from "_badges.html" import via_badge %}{{ via_badge(r.via) }} #}
+{% macro via_badge(via) -%}
+{%- set labels = {"web": "사람", "mcp": "에이전트", "cli": "CLI"} -%}
+{%- set titles = {"web": "사람이 웹에서 편집", "mcp": "에이전트가 MCP로 편집", "cli": "CLI/외부 동기화"} -%}
+{%- if via and via in labels -%}
+<span class="via-badge via-{{ via }}" title="{{ titles[via] }}">{{ labels[via] }}</span>
+{%- elif via -%}
+<span class="via-badge">{{ via }}</span>
+{%- endif -%}
+{%- endmacro %}
