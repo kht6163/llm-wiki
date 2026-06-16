@@ -199,6 +199,12 @@ class DocumentService:
             "SELECT version, title, updated_by, updated_at FROM documents WHERE id=?", (doc_id,)
         ).fetchone()
         body = self._latest_body(conn, doc_id)
+        # The surface of the COMPETING edit: an agent that loses a CAS race can use this
+        # to decide whether to back off (current_via='web' -> a human is editing) or
+        # rebase-and-retry (current_via='mcp'/'cli' -> another agent/import).
+        lv = conn.execute(
+            "SELECT via FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1", (doc_id,)
+        ).fetchone()
         msg = message or (
             f"Update rejected: the document changed since you read it. The current "
             f"version is {d['version']}. Re-read current_content below, reapply your "
@@ -207,7 +213,7 @@ class DocumentService:
         return ConflictError(
             msg, path=rel, current_version=d["version"], current_title=d["title"],
             current_content=body, updated_by=self._username(conn, d["updated_by"]),
-            updated_at=d["updated_at"],
+            updated_at=d["updated_at"], current_via=lv["via"] if lv else None,
         )
 
     def _write_file(self, rel: str, body: str) -> float:
@@ -246,6 +252,29 @@ class DocumentService:
                 "version": d["version"], "tags": tags, "folder": d["folder"],
                 "created_at": d["created_at"], "updated_at": d["updated_at"],
                 "updated_by": self._username(conn, d["updated_by"]),
+                "last_via": lv["via"] if lv else None,
+            }
+
+    def info(self, path: str) -> dict:
+        """Document metadata WITHOUT the body — a cheap poll for an agent to check
+        ``version``/``updated_by``/``last_via`` before deciding to re-read or rebase.
+        Same shape as ``get()`` minus ``content``; skips loading the (possibly large)
+        latest-revision body, so polling 'has this changed since version N' is cheap."""
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.reader() as conn:
+            d = conn.execute("SELECT * FROM documents WHERE path_norm=?", (norm,)).fetchone()
+            if not d or d["is_deleted"]:
+                raise NotFoundError("No document at this path.", path=rel)
+            lv = conn.execute(
+                "SELECT via FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1", (d["id"],)
+            ).fetchone()
+            tags = [t[0] for t in conn.execute(
+                "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],))]
+            return {
+                "path": d["path"], "title": d["title"], "version": d["version"],
+                "tags": tags, "folder": d["folder"], "created_at": d["created_at"],
+                "updated_at": d["updated_at"], "updated_by": self._username(conn, d["updated_by"]),
                 "last_via": lv["via"] if lv else None,
             }
 

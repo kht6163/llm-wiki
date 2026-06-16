@@ -37,7 +37,7 @@ async def test_tools_registered(ctx):
     mcp = create_mcp_server(ctx)
     names = {t.name for t in await mcp.list_tools()}
     expected = {
-        "search_documents", "read_document", "get_outline", "list_documents",
+        "search_documents", "read_document", "get_document_info", "get_outline", "list_documents",
         "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
         "get_backlinks", "resolve_links", "get_revisions", "get_revision", "get_graph",
         "assemble_context", "get_related_documents",
@@ -186,12 +186,36 @@ async def test_viewer_write_forbidden(ctx, principals, monkeypatch):
     assert d["ok"] is False and d["error"]["code"] == "forbidden"
 
 
+async def test_get_document_info_metadata_only(editor_mcp):
+    # Cheap poll: returns version/last_via WITHOUT the body, so an agent can detect a
+    # change since the version it holds before re-downloading the full note.
+    _payload(await editor_mcp.call_tool("create_document", {"path": "i.md", "content": "# I\n\nthe body"}))
+    d = _payload(await editor_mcp.call_tool("get_document_info", {"path": "i.md"}))
+    assert d["ok"] and d["version"] == 1 and d["last_via"] == "mcp"
+    assert "content" not in d  # body deliberately omitted
+    miss = _payload(await editor_mcp.call_tool("get_document_info", {"path": "nope.md"}))
+    assert miss["ok"] is False and miss["error"]["code"] == "not_found"
+
+
+async def test_list_activity_actor_filter(editor_mcp):
+    # actor filter lets an agent scope the feed to (or away from) one editor.
+    _payload(await editor_mcp.call_tool("create_document", {"path": "af.md", "content": "# A\n\nx"}))
+    mine = _payload(await editor_mcp.call_tool("list_activity", {"actor": "alice"}))
+    assert mine["ok"] and mine["actor"] == "alice" and mine["count"] >= 1
+    assert all(e["actor"] == "alice" for e in mine["events"])
+    other = _payload(await editor_mcp.call_tool("list_activity", {"actor": "nobody-else"}))
+    assert other["ok"] and other["count"] == 0
+
+
 async def test_update_conflict_envelope(editor_mcp):
     _payload(await editor_mcp.call_tool("create_document", {"path": "c.md", "content": "v1"}))
     d = _payload(await editor_mcp.call_tool(
         "update_document", {"path": "c.md", "base_version": 0, "content": "v2"}))
     assert d["ok"] is False and d["error"]["code"] == "conflict"
     assert d["error"]["current_version"] == 1
+    # The envelope names the COMPETING edit's surface so an agent can choose to back
+    # off (human/web) vs rebase (agent/mcp). The create above came over mcp.
+    assert d["error"]["current_via"] == "mcp"
 
 
 async def test_section_base_version_conflict_via_tool(editor_mcp):

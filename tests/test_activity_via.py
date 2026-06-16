@@ -4,13 +4,36 @@
 (external/reconcile) — so co-editing by humans and agents is legible in history and
 the activity feed.
 """
+import pytest
+
 from llm_wiki.services import audit
 from llm_wiki.services.auth import Principal
+from llm_wiki.services.errors import ConflictError, NotFoundError
 
 
 def _p(principals, via: str) -> Principal:
     e = principals["editor"]
     return Principal(e.user_id, e.username, e.role, via=via)
+
+
+def test_info_is_body_free_metadata(ctx, principals):
+    docs = ctx.docs
+    docs.create(_p(principals, "mcp"), "meta.md", "# Meta\n\nthe body text")
+    info = docs.info("meta.md")
+    assert info["version"] == 1 and info["last_via"] == "mcp" and info["title"] == "Meta"
+    assert "content" not in info  # the whole point: no body load
+    with pytest.raises(NotFoundError):
+        docs.info("missing.md")
+
+
+def test_conflict_envelope_carries_competing_surface(ctx, principals):
+    docs = ctx.docs
+    docs.create(_p(principals, "mcp"), "race.md", "v1")        # competing edit over web…
+    docs.update(_p(principals, "web"), "race.md", 1, "v2")
+    with pytest.raises(ConflictError) as ei:                   # …agent retries on stale base
+        docs.update(_p(principals, "mcp"), "race.md", 1, "v2-from-agent")
+    assert ei.value.extra["current_via"] == "web"             # so it knows a human edited
+    assert ei.value.extra["current_version"] == 2
 
 
 def test_revision_records_authoring_surface(ctx, principals):

@@ -185,6 +185,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             return {"ok": True, **d}
         return await _call(ctx, fn, "read_document")
 
+    @mcp.tool(description="Cheap metadata-only check for a document: returns version, title, tags, "
+                          "folder, updated_at, updated_by, and last_via (web=human, mcp=agent, cli) "
+                          "WITHOUT the body. Poll this to see if a doc changed since the 'version' you "
+                          "hold (and who/what touched it last) before re-reading the full body or "
+                          "retrying an edit — far cheaper than read_document on a large note.")
+    async def get_document_info(ctx: Context, path: str) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, **docs.info(path)}, "get_document_info")
+
     @mcp.tool(description="The heading outline of a document: a flat list of {level, text, line} "
                           "for navigation and for picking exact 'heading' values to pass to "
                           "read_document(section=)/replace_section/append_section.")
@@ -230,8 +238,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "(current docs by updated_at) this includes deletes/moves and the human-vs-"
                           "agent axis, so an agent can reconcile what changed since its last run. "
                           "Optional filters: 'since'/'until' (ISO-8601 on the event timestamp), 'via', "
-                          "and 'action' (must be one of the document actions). Security/account events "
-                          "are not exposed here.")
+                          "and 'action' (must be one of the document actions). Pass 'actor' (a "
+                          "username) to see only — or, paired with your own username, to exclude — "
+                          "one editor's changes, e.g. ask 'what did OTHER actors change since T' to "
+                          "reconcile concurrent edits. Security/account events are not exposed here.")
     async def list_activity(
         ctx: Context,
         limit: Annotated[int, Field(ge=1, le=500, description="Max events (1..500).")] = 100,
@@ -241,16 +251,18 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                        Field(description="Restrict to one surface.")] = None,
         action: Annotated[str | None,
                           Field(description="One document action, e.g. 'doc_update'.")] = None,
+        actor: Annotated[str | None,
+                         Field(description="Restrict to one actor (username).")] = None,
     ) -> dict:
         def fn(_p: Principal) -> dict:
             if action is not None and action not in audit.DOC_ACTIONS:
                 raise ValidationError(
                     f"action must be one of {audit.DOC_ACTIONS} (security events are not exposed).")
             events = audit.recent(db, limit=limit, since=since, until=until, via=via,
-                                  action=action, actions=audit.DOC_ACTIONS)
+                                  actor=actor, action=action, actions=audit.DOC_ACTIONS)
             return {"ok": True, "count": len(events), "limit": limit, "since": since,
-                    "until": until, "via": via, "actions": list(audit.DOC_ACTIONS),
-                    "events": events}
+                    "until": until, "via": via, "actor": actor,
+                    "actions": list(audit.DOC_ACTIONS), "events": events}
         return await _call(ctx, fn, "list_activity")
 
     @mcp.tool(description="Vault-wide broken (unresolved) links: each wikilink/markdown link "
