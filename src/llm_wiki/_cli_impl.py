@@ -19,7 +19,7 @@ from .db import SCHEMA_VERSION, get_meta
 from .mcp_server import create_mcp_server
 from .runtime import build_context
 from .services import users as users_svc
-from .services.auth import create_api_key, create_user
+from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
 from .util import now_iso
 from .web import create_web_app
@@ -55,6 +55,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("reindex", help="Reconcile the DB with the on-disk vault (external edits).")
     r.add_argument("--reembed", action="store_true", help="Recompute all embeddings.")
+
+    im = sub.add_parser(
+        "import", help="Bulk-import an external directory of markdown/Obsidian notes.")
+    im.add_argument("--from", dest="from_", required=True,
+                    help="Source directory of markdown/Obsidian notes.")
+    im.add_argument("--into", required=True,
+                    help="Target vault folder (pass --into '' for the root).")
+    im.add_argument("--on-conflict", choices=["skip", "overwrite", "rename"], default="skip",
+                    help="What to do when a live document already occupies the target path.")
+    im.add_argument("--include", action="append",
+                    help="Glob(s) of source-relative paths to import (default: markdown files).")
+    im.add_argument("--no-recurse", action="store_true",
+                    help="Only import files directly in --from (don't descend).")
+    im.add_argument("--import-attachments", action="store_true",
+                    help="Also copy referenced images/files into _attachments and rewrite links.")
+    im.add_argument("--no-embed", action="store_true",
+                    help="Skip embedding now (leaves docs for a later 'reindex --reembed').")
+    im.add_argument("--dry-run", action="store_true", help="Print the plan; write nothing.")
+    im.add_argument("--force", action="store_true",
+                    help="Required to actually overwrite (with --on-conflict overwrite).")
 
     b = sub.add_parser("backup", help="Write a consistent (WAL-safe) copy of the database.")
     b.add_argument("--out", required=True, help="Destination .db path for the snapshot.")
@@ -97,6 +117,8 @@ def _dispatch(args) -> int:
         return _create_api_key(args)
     if args.cmd == "reindex":
         return _reindex(args)
+    if args.cmd == "import":
+        return _import(args)
     if args.cmd == "backup":
         return _backup(args)
     if args.cmd == "snapshot":
@@ -159,6 +181,94 @@ def _reindex(args) -> int:
         for m in res["missing_files"]:
             print(f"  - {m}")
     return 0
+
+
+_IMPORT_LABELS = {"create": "CREATE", "revive": "REVIVE", "skip": "SKIP",
+                  "rename": "RENAME", "overwrite": "OVERWRITE"}
+
+
+def _import(args) -> int:
+    """Thin wrapper over DocumentService.import_from_directory: validate the source,
+    gate destructive overwrite, attribute to an admin/editor, then print the report."""
+    src = Path(args.from_).expanduser()
+    if not src.is_dir():
+        print(f"configuration error: source directory not found: {src}")
+        return 2
+    if args.on_conflict == "overwrite" and not args.dry_run and not args.force:
+        print("error: overwrite mode is destructive; re-run with --dry-run to preview "
+              "or pass --force.")
+        return 1
+    ctx = build_context(full=True)
+    vault = Path(ctx.settings.vault_path).resolve()
+    srcr = src.resolve()
+    if srcr == vault or vault in srcr.parents or srcr in vault.parents:
+        print(f"configuration error: --from overlaps the vault (self-import): {src}")
+        return 2
+
+    # Attribute the import to a real user so revisions/audit carry an author (prefer
+    # an admin); via='cli-import' distinguishes a bulk import from manual CLI edits.
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT id, username, role FROM users WHERE is_active=1 AND role IN ('admin','editor') "
+            "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, id LIMIT 1").fetchone()
+    if not row:
+        print("error: no admin or editor user to attribute the import to; run "
+              "'create-admin' first.")
+        return 1
+    principal = Principal(row["id"], row["username"], row["role"], via="cli-import")
+
+    kwargs: dict = dict(
+        into=args.into, on_conflict=args.on_conflict, recurse=not args.no_recurse,
+        import_attachments=args.import_attachments, embed=not args.no_embed,
+        dry_run=args.dry_run)
+    if args.include:
+        kwargs["include"] = tuple(args.include)
+    report = ctx.docs.import_from_directory(principal, srcr, **kwargs)
+    _print_import_report(report, srcr, args.into, args.dry_run, args.import_attachments)
+    return 1 if report["errors"] else 0
+
+
+def _print_import_report(report: dict, src: Path, into: str, dry_run: bool,
+                         show_attach: bool) -> None:
+    dest = into.strip("/") if into and into.strip("/") else "(root)"
+    print(f"{'Importing' if dry_run else 'Imported'} from {src} into vault/{dest}:")
+    docs = [p for p in report["plan"] if p["action"] != "attach"]
+    for p in sorted(docs, key=lambda x: x["target"].lower()):
+        tag = _IMPORT_LABELS.get(p["action"], p["action"].upper())
+        if p["action"] == "rename":
+            print(f"  {tag:<9} {p['src']} -> {p['target']}")
+        elif p.get("reason"):
+            print(f"  {tag:<9} {p['target']} ({p['reason']})")
+        else:
+            print(f"  {tag:<9} {p['target']}")
+    if show_attach:
+        for p in sorted((q for q in report["plan"] if q["action"] == "attach"),
+                        key=lambda x: x["target"].lower()):
+            print(f"  {'ATTACH':<9} {p['src']} -> {p['target']}")
+
+    a = report["attachments"]
+    if dry_run:
+        line = (f"Would create {report['created']}, revive {report['revived']}, "
+                f"skip {report['skipped']}, rename {report['renamed']}, "
+                f"overwrite {report['overwritten']} ({report['scanned']} files scanned)")
+        line += (f"; attachments {a['copied']} copied, {a['skipped']} skipped."
+                 if show_attach else ".")
+    else:
+        line = (f"created={report['created']} revived={report['revived']} "
+                f"skipped={report['skipped']} renamed={report['renamed']} "
+                f"overwritten={report['overwritten']} ({report['scanned']} scanned)")
+        if show_attach:
+            line += f" · attachments {a['copied']}/{a['skipped']}"
+        line += f" · embedded={report['embedded']}"
+    print(line)
+
+    for w in report["warnings"]:
+        print(f"  WARNING: {w}")
+    for e in report["errors"]:
+        print(f"  ERROR: {e['path']}: {e['error']}")
+    if not dry_run and report["broken_links"]:
+        print(f"{len(report['broken_links'])} link(s) created by this import are still "
+              f"unresolved.")
 
 
 def _backup(args) -> int:
