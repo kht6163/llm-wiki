@@ -10,6 +10,7 @@
 
   var csrf = (form.querySelector('input[name="csrf_token"]') || {}).value || "";
   var docPath = form.getAttribute("data-path") || "preview.md";
+  var slashMenuOpen = false;  // set by the slash-command module below
 
   // Non-blocking toast (reuses realtime.js's .rt-toast styling) so an upload error
   // doesn't yank focus out of the editor the way a modal alert() does.
@@ -41,6 +42,22 @@
   }
   function schedulePreview() { clearTimeout(timer); timer = setTimeout(renderPreview, 300); }
   editor.addEventListener("input", schedulePreview);
+
+  // ---- live status-bar word/char count (mirrors util.word_count) ----
+  var cjkRe = /[぀-ヿ㐀-䶿一-鿿가-힣豈-﫿]/g;
+  var elWords = document.getElementById("sb-words");
+  var elChars = document.getElementById("sb-chars");
+  function updateCount() {
+    if (!elWords && !elChars) return;
+    var v = editor.value || "";
+    var cjk = (v.match(cjkRe) || []).length;
+    var latin = v.replace(cjkRe, " ").split(/\s+/).filter(Boolean).length;
+    if (elWords) elWords.textContent = (cjk + latin) + " 단어";
+    if (elChars) elChars.textContent = v.length + " 자";
+  }
+  editor.addEventListener("input", updateCount);
+  updateCount();
+
   if (toggle) {
     toggle.addEventListener("change", function () {
       preview.style.display = toggle.checked ? "" : "none";
@@ -85,12 +102,15 @@
     schedulePreview();
   }
   editor.addEventListener("keydown", function (e) {
+    if (slashMenuOpen) return;  // slash module owns the keys while its menu is open
     if (e.key === "Tab" && ac.hidden) { e.preventDefault(); indent(e.shiftKey); return; }
     if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
     var k = e.key.toLowerCase();
     if (k === "b") { e.preventDefault(); wrap("**", "**"); }
     else if (k === "i") { e.preventDefault(); wrap("*", "*"); }
     else if (k === "k") { e.preventDefault(); makeLink(); }
+    else if (k === "e") { e.preventDefault(); wrap("==", "=="); }       // highlight
+    else if (k === "d") { e.preventDefault(); wrap("~~", "~~"); }       // strikethrough
   });
 
   // ---- image / file upload (drag & drop, paste) ----
@@ -205,4 +225,142 @@
     else if (e.key === "Escape") { closeAc(); }
   });
   editor.addEventListener("blur", function () { setTimeout(closeAc, 150); });
+
+  // ---- "/" slash commands ------------------------------------------------
+  var CARET = String.fromCharCode(0);  // sentinel marking where the caret lands
+  function two(n) { return n < 10 ? "0" + n : "" + n; }
+  function today() { var d = new Date(); return d.getFullYear() + "-" + two(d.getMonth() + 1) + "-" + two(d.getDate()); }
+  function clock() { var d = new Date(); return two(d.getHours()) + ":" + two(d.getMinutes()); }
+
+  var SLASH = [
+    { label: "제목 1", hint: "h1 heading title", text: "# " + CARET },
+    { label: "제목 2", hint: "h2 heading", text: "## " + CARET },
+    { label: "제목 3", hint: "h3 heading", text: "### " + CARET },
+    { label: "글머리 목록", hint: "bullet list ul", text: "- " + CARET },
+    { label: "번호 목록", hint: "ordered list ol", text: "1. " + CARET },
+    { label: "할 일 (체크박스)", hint: "task todo checkbox", text: "- [ ] " + CARET },
+    { label: "인용", hint: "quote blockquote", text: "> " + CARET },
+    { label: "콜아웃: 정보", hint: "callout info note", text: "> [!info]\n> " + CARET },
+    { label: "콜아웃: 팁", hint: "callout tip", text: "> [!tip]\n> " + CARET },
+    { label: "콜아웃: 경고", hint: "callout warning warn", text: "> [!warning]\n> " + CARET },
+    { label: "콜아웃: 위험", hint: "callout danger error", text: "> [!danger]\n> " + CARET },
+    { label: "코드 블록", hint: "code fence block", text: "```\n" + CARET + "\n```" },
+    { label: "표", hint: "table grid", text: "| 열1 | 열2 |\n| --- | --- |\n| " + CARET + " |  |" },
+    { label: "구분선", hint: "hr divider rule", text: "\n---\n" + CARET },
+    { label: "링크", hint: "link url", text: "[" + CARET + "](url)" },
+    { label: "위키링크", hint: "wikilink internal", text: "[[" + CARET + "]]" },
+    { label: "이미지", hint: "image img", text: "![" + CARET + "](url)" },
+    { label: "오늘 날짜", hint: "date today", text: function () { return today() + CARET; } },
+    { label: "현재 시각", hint: "time now clock", text: function () { return clock() + CARET; } }
+  ];
+
+  var slash = document.createElement("div");
+  slash.className = "slash-menu";
+  slash.hidden = true;
+  document.body.appendChild(slash);
+  var slashItems = [], slashIndex = 0, slashTrigger = null;
+
+  function closeSlash() { slash.hidden = true; slashMenuOpen = false; slashIndex = 0; slashTrigger = null; }
+
+  function slashTriggerAt() {
+    var pos = editor.selectionStart;
+    if (pos !== editor.selectionEnd) return null;
+    var upto = editor.value.slice(0, pos);
+    var line = upto.slice(upto.lastIndexOf("\n") + 1);
+    var m = line.match(/(?:^|\s)\/([^\s/]*)$/);
+    if (!m) return null;
+    return { slashPos: pos - m[1].length - 1, query: m[1] };
+  }
+
+  function fuzzySlash(q, s) {
+    q = q.toLowerCase(); s = s.toLowerCase();
+    if (!q) return true;
+    var i = 0;
+    for (var j = 0; j < s.length && i < q.length; j++) if (s[j] === q[i]) i++;
+    return i === q.length;
+  }
+
+  function showSlash(matches) {
+    slashItems = matches;
+    if (!matches.length) { closeSlash(); return; }
+    slash.innerHTML = "";
+    matches.forEach(function (it, i) {
+      var el = document.createElement("div");
+      el.className = "slash-item" + (i === 0 ? " active" : "");
+      el.textContent = it.label;
+      el.addEventListener("mousedown", function (ev) { ev.preventDefault(); pickSlash(i); });
+      slash.appendChild(el);
+    });
+    var c = caretCoords(editor, editor.selectionStart);
+    slash.style.left = c.left + "px";
+    slash.style.top = c.top + "px";
+    slash.hidden = false;
+    slashMenuOpen = true;
+    slashIndex = 0;
+  }
+  function highlightSlash() {
+    Array.prototype.forEach.call(slash.children, function (c, i) { c.classList.toggle("active", i === slashIndex); });
+  }
+  function pickSlash(i) {
+    var cmd = slashItems[i];
+    if (!cmd || !slashTrigger) { closeSlash(); return; }
+    var pos = editor.selectionStart;
+    editor.setRangeText("", slashTrigger.slashPos, pos, "end");  // drop "/query"
+    var at = editor.selectionStart;
+    var snippet = typeof cmd.text === "function" ? cmd.text() : cmd.text;
+    var caretMark = snippet.indexOf(CARET);
+    var clean = snippet.replace(CARET, "");
+    editor.setRangeText(clean, at, at, "end");
+    var caret = caretMark >= 0 ? at + caretMark : at + clean.length;
+    editor.setSelectionRange(caret, caret);
+    closeSlash();
+    editor.focus();
+    schedulePreview();
+  }
+
+  editor.addEventListener("input", function () {
+    var t = slashTriggerAt();
+    if (!t) { closeSlash(); return; }
+    slashTrigger = t;
+    showSlash(SLASH.filter(function (c) { return fuzzySlash(t.query, c.label + " " + (c.hint || "")); }));
+  });
+  editor.addEventListener("keydown", function (e) {
+    if (!slashMenuOpen) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); e.stopImmediatePropagation(); slashIndex = Math.min(slashIndex + 1, slashItems.length - 1); highlightSlash(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); e.stopImmediatePropagation(); slashIndex = Math.max(slashIndex - 1, 0); highlightSlash(); }
+    else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopImmediatePropagation(); pickSlash(slashIndex); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); closeSlash(); }
+  });
+  editor.addEventListener("blur", function () { setTimeout(closeSlash, 150); });
+
+  // Caret pixel coordinates in a <textarea> via the mirror-div technique: clone the
+  // textarea's text + styles into a hidden div and measure a marker at the caret.
+  function caretCoords(ta, pos) {
+    var rect = ta.getBoundingClientRect();
+    var style = getComputedStyle(ta);
+    var div = document.createElement("div");
+    ["boxSizing", "width", "paddingTop", "paddingRight", "paddingBottom", "paddingLeft",
+     "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth",
+     "fontFamily", "fontSize", "fontWeight", "fontStyle", "letterSpacing", "lineHeight",
+     "textTransform", "wordSpacing", "tabSize"].forEach(function (p) { div.style[p] = style[p]; });
+    div.style.position = "absolute";
+    div.style.visibility = "hidden";
+    div.style.whiteSpace = "pre-wrap";
+    div.style.wordWrap = "break-word";
+    div.style.overflow = "hidden";
+    div.style.top = (rect.top + window.scrollY) + "px";
+    div.style.left = (rect.left + window.scrollX) + "px";
+    div.style.width = ta.clientWidth + "px";
+    div.textContent = ta.value.slice(0, pos);
+    var span = document.createElement("span");
+    span.textContent = ta.value.slice(pos) || ".";
+    div.appendChild(span);
+    document.body.appendChild(div);
+    var lh = parseInt(style.lineHeight, 10) || (parseInt(style.fontSize, 10) * 1.4);
+    var top = rect.top + window.scrollY + span.offsetTop - ta.scrollTop + lh;
+    var left = rect.left + window.scrollX + span.offsetLeft - ta.scrollLeft;
+    document.body.removeChild(div);
+    left = Math.min(left, rect.left + window.scrollX + ta.clientWidth - 220);
+    return { left: Math.max(rect.left + window.scrollX, left), top: top };
+  }
 })();

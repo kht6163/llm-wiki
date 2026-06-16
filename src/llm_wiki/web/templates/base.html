@@ -5,33 +5,122 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}llm-wiki{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // Apply saved theme + sidebar widths before first paint (no flash). Mirrors
+    // shell.js defaults; kept tiny and dependency-free.
+    (function () {
+      try {
+        var t = localStorage.getItem("wiki-theme");
+        if (t) document.documentElement.setAttribute("data-theme", t);
+        var lw = localStorage.getItem("wiki-left-w");
+        var rw = localStorage.getItem("wiki-right-w");
+        var r = document.documentElement.style;
+        if (lw) r.setProperty("--left-w", lw + "px");
+        if (rw) r.setProperty("--right-w", rw + "px");
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
-<header class="topbar">
-  <a class="brand" href="/">📚 llm-wiki</a>
-  <form class="searchbox" action="/search" method="get" role="search">
-    <input type="search" name="q" placeholder="검색…" aria-label="검색" value="{{ q|default('') }}">
-  </form>
-  {% if user %}
-  <nav class="nav" aria-label="주 메뉴">
-    <details class="navmenu">
-      <summary aria-label="메뉴 열기">☰ 메뉴</summary>
-      <div class="navlinks">
-        <a href="/">문서</a>
-        <a href="/tags">태그</a>
-        <a href="/graph">그래프</a>
-        <a href="/broken-links">깨진 링크</a>
-        {% if user.can_write %}<a href="/new">새 문서</a>{% endif %}
-        <a href="/settings">API 키</a>
-        {% if user.can_admin %}<a href="/admin/users">사용자</a>{% endif %}
-        <span class="who">{{ user.username }} · {{ user.role }}</span>
-        <a href="/logout">로그아웃</a>
-      </div>
-    </details>
+{% if user %}
+<div class="app-shell" id="app-shell">
+  <nav class="ribbon" aria-label="도구 모음">
+    <a class="ribbon-btn brand" href="/" title="홈" aria-label="홈">📚</a>
+    <button class="ribbon-btn" type="button" data-action="toggle-left" title="사이드바 (Ctrl/⌘+\)" aria-label="좌측 사이드바 토글">🗂️</button>
+    <button class="ribbon-btn" type="button" data-action="switcher" title="빠른 이동 (Ctrl/⌘+O)" aria-label="빠른 이동">🔎</button>
+    <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">⌘</button>
+    {% if user.can_write %}<a class="ribbon-btn" href="/new" title="새 문서" aria-label="새 문서">📝</a>{% endif %}
+    <a class="ribbon-btn" href="/graph" title="그래프" aria-label="그래프">🕸️</a>
+    <a class="ribbon-btn" href="/broken-links" title="깨진 링크" aria-label="깨진 링크">🔗</a>
+    <span class="ribbon-spacer"></span>
+    <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">🌓</button>
+    <a class="ribbon-btn" href="/settings" title="API 키 / 설정" aria-label="설정">⚙️</a>
+    {% if user.can_admin %}<a class="ribbon-btn" href="/admin/users" title="사용자 관리" aria-label="사용자 관리">👥</a>{% endif %}
+    <a class="ribbon-btn" href="/logout" title="로그아웃" aria-label="로그아웃">⎋</a>
   </nav>
-  {% endif %}
-</header>
+
+  <aside class="sidebar-left" id="sidebar-left" aria-label="탐색">
+    <div class="sb-tabs" role="tablist">
+      <button class="sb-tab active" type="button" data-tab="files" role="tab" aria-selected="true">파일</button>
+      <button class="sb-tab" type="button" data-tab="search" role="tab" aria-selected="false">검색</button>
+      <button class="sb-tab" type="button" data-tab="tags" role="tab" aria-selected="false">태그</button>
+    </div>
+    <div class="sb-body">
+      <div class="sb-panel" data-panel="files">
+        <div class="tree-toolbar">
+          {% if user.can_write %}
+          <button class="tt-btn" type="button" data-action="new-doc" title="새 문서">＋ 문서</button>
+          <button class="tt-btn" type="button" data-action="new-folder" title="새 폴더">＋ 폴더</button>
+          {% endif %}
+          <span class="tt-spacer"></span>
+          <button class="tt-btn" type="button" data-action="collapse-all" title="모두 접기" aria-label="모두 접기">⊟</button>
+        </div>
+        <div class="file-tree" id="file-tree">
+          {% from "_tree.html" import render_tree %}
+          {{ render_tree(nav_tree) }}
+        </div>
+      </div>
+      <div class="sb-panel" data-panel="search" hidden>
+        <input type="search" class="sb-search-input" id="sb-search-input" placeholder="문서 검색…" aria-label="사이드바 검색">
+        <div class="sb-search-results" id="sb-search-results"></div>
+      </div>
+      <div class="sb-panel" data-panel="tags" hidden>
+        <ul class="sb-taglist">
+          {% for t in nav_tags %}
+          <li><a href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }} <span class="muted">{{ t.count }}</span></a></li>
+          {% else %}
+          <li class="muted">태그 없음</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+    <div class="sb-resizer" data-resize="left" role="separator" aria-label="좌측 폭 조절" tabindex="-1"></div>
+  </aside>
+
+  <div class="main-col">
+    <div class="main-topbar">
+      <button class="icon-btn" type="button" data-action="toggle-left" title="사이드바" aria-label="사이드바 토글">☰</button>
+      <form class="searchbox" action="/search" method="get" role="search">
+        <input type="search" name="q" placeholder="검색…  (Ctrl/⌘+O 빠른 이동)" aria-label="검색" value="{{ q|default('') }}">
+      </form>
+      <span class="topbar-spacer"></span>
+      <button class="icon-btn" type="button" data-action="toggle-right" title="문서 정보 패널" aria-label="우측 패널 토글">⊟</button>
+    </div>
+    {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
+    <main>{% block content %}{% endblock %}</main>
+  </div>
+
+  <aside class="sidebar-right" id="sidebar-right" aria-label="문서 정보">
+    <div class="sb-resizer" data-resize="right" role="separator" aria-label="우측 폭 조절" tabindex="-1"></div>
+    {% block right %}{% endblock %}
+  </aside>
+
+  <footer class="statusbar" id="statusbar">
+    {% block statusbar %}<span class="sb-stat muted">llm-wiki</span>{% endblock %}
+  </footer>
+</div>
+
+<div class="cmd-overlay" id="cmd-overlay" hidden>
+  <div class="cmd-modal" role="dialog" aria-modal="true" aria-label="명령 팔레트">
+    <input type="text" class="cmd-input" id="cmd-input" autocomplete="off" spellcheck="false" aria-label="명령 또는 문서 검색">
+    <ul class="cmd-list" id="cmd-list" role="listbox"></ul>
+    <div class="cmd-hint muted">↑↓ 이동 · Enter 실행 · Esc 닫기</div>
+  </div>
+</div>
+
+<script>
+  window.WIKI = {
+    canWrite: {{ 'true' if user.can_write else 'false' }},
+    canAdmin: {{ 'true' if user.can_admin else 'false' }},
+    csrf: {{ csrf_token|tojson }},
+    user: {{ user.username|tojson }}
+  };
+</script>
+<script src="/static/shell.js"></script>
+<script src="/static/palette.js"></script>
+{% else %}
 {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
-<main>{% block content %}{% endblock %}</main>
+<main class="login-shell">{{ self.content() }}</main>
+{% endif %}
 </body>
 </html>

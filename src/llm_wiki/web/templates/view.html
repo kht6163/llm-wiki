@@ -2,40 +2,53 @@
 {% block title %}{{ doc.title }}{% endblock %}
 {% block content %}
 <div id="rt-meta" data-path="{{ doc.path }}" data-version="{{ doc.version }}" data-mode="view" hidden></div>
-<div class="layout">
-  <article class="doc">
-    <div class="doc-head">
-      <h1>{{ doc.title }}</h1>
-      <div class="doc-actions">
-        {% if user.can_write %}
-          <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
-          <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
-                onsubmit="return confirm('이 문서를 삭제할까요?')">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="base_version" value="{{ doc.version }}">
-            <button type="submit" class="danger">삭제</button>
-          </form>
-        {% endif %}
-        <a href="/doc/{{ doc.path|urlpath }}/history">이력</a>
-        <a href="/doc/{{ doc.path|urlpath }}/raw">원문</a>
-        <a href="/graph?root={{ doc.path|urlpath }}">그래프</a>
-      </div>
+<article class="doc">
+  <div class="doc-head">
+    <h1>{{ doc.title }}</h1>
+    <div class="doc-actions">
+      {% if user.can_write %}
+        <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
+        <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
+              onsubmit="return confirm('이 문서를 삭제할까요?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="base_version" value="{{ doc.version }}">
+          <button type="submit" class="danger">삭제</button>
+        </form>
+      {% endif %}
+      <a href="/doc/{{ doc.path|urlpath }}/history">이력</a>
+      <a href="/doc/{{ doc.path|urlpath }}/raw">원문</a>
+      <a href="/graph?root={{ doc.path|urlpath }}">그래프</a>
     </div>
-    <div class="doc-meta">
-      <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at }}
-      {% if doc.updated_by %} · {{ doc.updated_by }}{% endif %}
-      {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
-    </div>
-    <div class="rendered">{{ html|safe }}</div>
-  </article>
-  <aside class="sidebar">
+  </div>
+  <div class="doc-meta">
+    <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at }}
+    {% if doc.updated_by %} · {{ doc.updated_by }}{% endif %}
+    {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
+  </div>
+  <div class="rendered" id="doc-rendered">{{ html|safe }}</div>
+</article>
+<script src="/static/realtime.js"></script>
+<script src="/static/outline.js"></script>
+<script src="/static/tasks.js"></script>
+{% endblock %}
+
+{% block right %}
+<div class="rp-tabs" role="tablist">
+  <button class="rp-tab active" type="button" data-rp="outline" role="tab">목차</button>
+  <button class="rp-tab" type="button" data-rp="links" role="tab">링크</button>
+</div>
+<div class="rp-body">
+  <div class="rp-panel" data-rp-panel="outline">
+    <nav class="outline" id="outline" aria-label="목차"><p class="muted">목차 없음</p></nav>
+  </div>
+  <div class="rp-panel" data-rp-panel="links" hidden>
     <h3>백링크 ({{ backlinks|length }})</h3>
-    <ul>
+    <ul class="rp-list">
       {% for b in backlinks %}<li><a href="/doc/{{ b.src_path|urlpath }}">{{ b.src_title or b.src_path }}</a></li>
       {% else %}<li class="muted">없음</li>{% endfor %}
     </ul>
     <h3>나가는 링크</h3>
-    <ul>
+    <ul class="rp-list">
       {% for l in outgoing %}<li>
         {% if l.dst_path %}<a href="/doc/{{ l.dst_path|urlpath }}">{{ l.dst_title or l.dst_path }}</a>
         {% else %}<span class="broken">{{ l.dst_name }} (없음)</span>{% endif %}
@@ -43,14 +56,20 @@
     </ul>
     {% if related %}
     <h3>관련 문서</h3>
-    <ul class="related">
+    <ul class="rp-list related">
       {% for r in related %}<li>
         <a href="/doc/{{ r.path|urlpath }}">{{ r.title }}</a>
         <span class="sim" title="유사도">{{ '%.0f'|format(r.score * 100) }}%</span>
       </li>{% endfor %}
     </ul>
     {% endif %}
-  </aside>
+  </div>
 </div>
-<script src="/static/realtime.js"></script>
+{% endblock %}
+
+{% block statusbar %}
+<span class="sb-stat">{{ stats.words }} 단어</span>
+<span class="sb-stat">{{ stats.chars }} 자</span>
+<span class="sb-stat">백링크 {{ backlinks|length }}</span>
+<span class="sb-stat muted">v{{ doc.version }}</span>
 {% endblock %}

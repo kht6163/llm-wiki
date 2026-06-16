@@ -54,3 +54,10 @@
 <script src="/static/editor.js"></script>
 {% if not is_new %}<script src="/static/realtime.js"></script>{% endif %}
 {% endblock %}
+
+{% block statusbar %}
+<span class="sb-stat" id="sb-words">0 단어</span>
+<span class="sb-stat" id="sb-chars">0 자</span>
+{% if not is_new %}<span class="sb-stat muted">v{{ base_version }}</span>{% endif %}
+<span class="sb-stat muted sb-hint">/ 슬래시 명령 · Ctrl/⌘+S 저장</span>
+{% endblock %}

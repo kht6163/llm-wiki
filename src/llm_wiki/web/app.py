@@ -53,7 +53,7 @@ from ..services.auth import (
 )
 from ..services.documents import ATTACH_MAX_BYTES
 from ..services.errors import ConflictError, ValidationError, WikiError
-from ..util import PathError, normalize_client_ip
+from ..util import PathError, normalize_client_ip, word_count
 from .security import (
     RateLimiter,
     SecurityHeadersMiddleware,
@@ -127,11 +127,16 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     def render(name: str, request: Request, status: int = 200, **kw) -> HTMLResponse:
         flash = request.session.pop("flash", None)
-        return templates.TemplateResponse(
-            request, name,
-            {"user": user(request), "flash": flash, "csrf_token": get_csrf_token(request), **kw},
-            status_code=status,
-        )
+        p = user(request)
+        ctx: dict = {"user": p, "flash": flash, "csrf_token": get_csrf_token(request)}
+        # The app shell (left file tree + tag list) renders on every authenticated
+        # page, so the navigation tree is a common context entry. Anonymous pages
+        # (login/error before auth) skip the DB work.
+        if p is not None:
+            ctx.setdefault("nav_tree", docs.tree())
+            ctx.setdefault("nav_tags", docs.tags()[:40])
+        ctx.update(kw)
+        return templates.TemplateResponse(request, name, ctx, status_code=status)
 
     def login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=303)
@@ -274,7 +279,60 @@ def create_web_app(app: AppContext) -> FastAPI:
     def api_complete(request: Request, q: str = ""):
         if not user(request):
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        return JSONResponse({"ok": True, "items": docs.complete(q, limit=10)})
+        return JSONResponse({"ok": True, "items": docs.complete(q, limit=12)})
+
+    @web.get("/api/tree")
+    def api_tree(request: Request):
+        # Live tree payload so the sidebar can refresh after a folder/doc change
+        # without a full page reload.
+        if not user(request):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return JSONResponse({"ok": True, "tree": docs.tree()})
+
+    @web.post("/api/folders")
+    def api_folder_create(request: Request, path: str = Form(...)):
+        p = user(request)
+        if not p:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            res = docs.create_folder(p, path)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({"ok": True, **res})
+
+    @web.post("/api/folders/{path:path}/delete")
+    def api_folder_delete(path: str, request: Request):
+        p = user(request)
+        if not p:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            res = docs.delete_folder(p, path)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({"ok": True, **res})
+
+    @web.post("/api/doc/{path:path}/move")
+    def api_doc_move(path: str, request: Request, new_path: str = Form(...)):
+        p = user(request)
+        if not p:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            doc = docs.move(p, path, new_path)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({"ok": True, "path": doc["path"]})
+
+    @web.post("/api/doc/{path:path}/toggle-task")
+    def api_toggle_task(path: str, request: Request, index: int = Form(...),
+                        base_version: int = Form(None)):
+        p = user(request)
+        if not p:
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        try:
+            doc = docs.toggle_task(p, path, index=index, base_version=base_version)
+        except WikiError as e:
+            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        return JSONResponse({"ok": True, "version": doc["version"]})
 
     @web.post("/api/preview")
     def api_preview(request: Request, content: str = Form(""), path: str = Form("preview.md")):
@@ -504,8 +562,9 @@ def create_web_app(app: AppContext) -> FastAPI:
             related = docs.related(doc["path"], limit=6)["related"]
         except WikiError:
             related = []
+        stats = word_count(doc["content"])
         return render("view.html", request, doc=doc, html=html, backlinks=backlinks,
-                      outgoing=outgoing, related=related)
+                      outgoing=outgoing, related=related, stats=stats)
 
     # ---- settings (per-user API keys) -----------------------------------
     @web.get("/settings", response_class=HTMLResponse)

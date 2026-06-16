@@ -302,7 +302,10 @@ def test_search_folder_filter(client):
     create_doc(client, "other/b.md", "alpha keyword here too")
     r = client.get("/search?q=alpha&folder=notes&top_k=10")
     assert r.status_code == 200
-    assert "notes/a.md" in r.text and "other/b.md" not in r.text
+    # Scope to the main content: the persistent file tree (left sidebar) lists every
+    # document, so assert against the search-results region only.
+    results = r.text.split("<main>")[-1]
+    assert "notes/a.md" in results and "other/b.md" not in results
 
 
 def test_traversal_path_is_400_not_500(client):
@@ -317,18 +320,25 @@ def test_home_pagination(client):
     # Create more than one page worth (per_page=50) to exercise paging.
     for i in range(55):
         create_doc(client, f"p{i:03}.md", f"doc number {i}")
-    first = client.get("/?sort=path").text
+    # Scope to the main list region: the left file tree lists every doc regardless
+    # of which page is shown, so pagination must be asserted on <main> only.
+    first = client.get("/?sort=path").text.split("<main>")[-1]
     assert "p000.md" in first and "/ 55" in first  # pager total shown
     # Page 2 holds the tail; page 1 doesn't.
-    second = client.get("/?sort=path&page=2").text
+    second = client.get("/?sort=path&page=2").text.split("<main>")[-1]
     assert "p054.md" in second and "p054.md" not in first
     assert "p000.md" not in second
 
 
-def test_nav_renders_responsive_menu(client):
+def test_shell_renders_navigation(client):
+    # The Obsidian-style app shell: ribbon + collapsible left sidebar with a file
+    # tree, and a sidebar-toggle control (the responsive navigation surface).
     login(client, "admin")
     html = client.get("/").text
-    assert 'class="navmenu"' in html and "navlinks" in html
+    assert 'class="ribbon"' in html
+    assert 'class="sidebar-left"' in html and 'id="file-tree"' in html
+    assert 'data-action="toggle-left"' in html
+    assert "/static/shell.js" in html and "/static/palette.js" in html
 
 
 # -- realtime: WebSocket live change reflection -----------------------------

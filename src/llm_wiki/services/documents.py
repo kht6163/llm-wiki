@@ -29,6 +29,7 @@ from ..metrics import DOC_WRITES
 from ..util import (
     basename_stem,
     folder_of,
+    normalize_folder_path,
     normalize_rel_path,
     now_iso,
     path_norm,
@@ -42,6 +43,9 @@ from .errors import ConflictError, ForbiddenError, NotFoundError, ValidationErro
 log = logging.getLogger("llm_wiki.documents")
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+# A markdown task-list line: "- [ ] ...", "* [x] ...", "1. [ ] ..." (captures the
+# checkbox state for click-to-toggle). Groups: (prefix, state-char, rest).
+_TASK_LINE_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\].*)$")
 
 # Uploaded images/files live under this vault subdir (excluded from the .md scan).
 ATTACH_DIR = "_attachments"
@@ -277,13 +281,142 @@ class DocumentService:
 
     def folder_counts(self) -> list[tuple[str, int]]:
         """(folder, document count) across ALL non-deleted docs — independent of any
-        list page, so the sidebar stays accurate under pagination."""
+        list page, so the sidebar stays accurate under pagination. Explicitly-created
+        empty folders are included with a count of 0."""
         with self.db.reader() as conn:
             rows = conn.execute(
                 "SELECT folder, COUNT(*) AS n FROM documents WHERE is_deleted=0 AND folder<>'' "
-                "GROUP BY folder ORDER BY folder"
+                "GROUP BY folder"
             ).fetchall()
-        return [(r["folder"], r["n"]) for r in rows]
+            empties = conn.execute("SELECT path FROM folders").fetchall()
+        counts = {r["folder"]: r["n"] for r in rows}
+        for e in empties:
+            counts.setdefault(e["path"], 0)
+        return sorted(counts.items())
+
+    def list_folders(self) -> list[str]:
+        """Every folder path that should appear in the tree: folders that hold
+        documents, every ancestor of those, and explicitly-created empty folders.
+        Sorted, root ('') excluded."""
+        paths: set[str] = set()
+        with self.db.reader() as conn:
+            for r in conn.execute(
+                "SELECT DISTINCT folder FROM documents WHERE is_deleted=0 AND folder<>''"
+            ):
+                paths.add(r["folder"])
+            for r in conn.execute("SELECT path FROM folders"):
+                paths.add(r["path"])
+        # Add every ancestor so the tree never has a gap (a/b/c implies a, a/b).
+        for p in list(paths):
+            segs = p.split("/")
+            for i in range(1, len(segs)):
+                paths.add("/".join(segs[:i]))
+        paths.discard("")
+        return sorted(paths)
+
+    def tree(self) -> dict:
+        """Hierarchical folder/document tree for the sidebar file explorer. Combines
+        document folders, their ancestors, and explicitly-created empty folders.
+        Returns a root node: {name, path, folders:[child nodes], docs:[{path,title}]}
+        with folders/docs sorted for stable rendering."""
+        with self.db.reader() as conn:
+            doc_rows = conn.execute(
+                "SELECT path, title, folder FROM documents WHERE is_deleted=0"
+            ).fetchall()
+            folder_rows = conn.execute("SELECT path FROM folders").fetchall()
+        root: dict = {"name": "", "path": "", "folders": {}, "docs": []}
+
+        def ensure(folder_path: str) -> dict:
+            node = root
+            if not folder_path:
+                return node
+            acc: list[str] = []
+            for seg in folder_path.split("/"):
+                acc.append(seg)
+                child = node["folders"].get(seg)
+                if child is None:
+                    child = {"name": seg, "path": "/".join(acc), "folders": {}, "docs": []}
+                    node["folders"][seg] = child
+                node = child
+            return node
+
+        for fr in folder_rows:
+            ensure(fr["path"])
+        for r in doc_rows:
+            ensure(r["folder"] or "")["docs"].append(
+                {"path": r["path"], "title": r["title"] or r["path"]})
+
+        def finalize(node: dict) -> dict:
+            children = sorted(node["folders"].values(), key=lambda c: c["name"].lower())
+            node["folders"] = [finalize(c) for c in children]
+            node["docs"].sort(key=lambda d: (d["title"] or "").lower())
+            return node
+
+        return finalize(root)
+
+    def create_folder(self, principal: Principal, path: str) -> dict:
+        """Persist an (initially empty) folder so it survives with no documents.
+        Idempotent-ish: a duplicate raises ConflictError. Projects a real directory
+        into the vault to mirror the DB."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot create folders (read/search only).")
+        rel = normalize_folder_path(path)
+        if not rel:
+            raise ValidationError("folder path must not be empty.")
+        norm = rel.lower()
+        now = now_iso()
+        with self.db.writer() as conn:
+            if conn.execute("SELECT 1 FROM folders WHERE path_norm=?", (norm,)).fetchone():
+                raise ConflictError("A folder already exists at this path.", path=rel)
+            if conn.execute(
+                "SELECT 1 FROM documents WHERE is_deleted=0 AND (folder=? OR folder LIKE ?)",
+                (rel, norm + "/%"),
+            ).fetchone():
+                # The folder is already populated by documents — registering it as a
+                # row is harmless but pointless; treat as already-existing.
+                raise ConflictError("A folder already exists at this path.", path=rel)
+            conn.execute(
+                "INSERT INTO folders(path, path_norm, created_at, created_by) VALUES(?,?,?,?)",
+                (rel, norm, now, principal.user_id),
+            )
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="folder_create", target=rel)
+        safe_join(self.vault, rel).mkdir(parents=True, exist_ok=True)
+        return {"ok": True, "path": rel}
+
+    def delete_folder(self, principal: Principal, path: str) -> dict:
+        """Remove an empty folder (and any explicitly-created empty subfolders).
+        Refuses if any document still lives under it."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot delete folders (read/search only).")
+        rel = normalize_folder_path(path)
+        if not rel:
+            raise ValidationError("folder path must not be empty.")
+        norm = rel.lower()
+        with self.db.writer() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE is_deleted=0 AND (folder=? OR folder LIKE ?)",
+                (rel, norm + "/%"),
+            ).fetchone()[0]
+            if n:
+                raise ValidationError(f"Folder is not empty ({n} document(s)); move or delete them first.")
+            cur = conn.execute(
+                "DELETE FROM folders WHERE path_norm=? OR path_norm LIKE ?", (norm, norm + "/%"))
+            if cur.rowcount == 0:
+                raise NotFoundError("No such folder.", path=rel)
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="folder_delete", target=rel)
+        # Best-effort: prune the now-empty projected directory tree (bottom-up,
+        # leaving any directory that still holds stray external files).
+        target = safe_join(self.vault, rel)
+        if target.is_dir():
+            for root_, _dirs, files in os.walk(target, topdown=False):
+                if not files:
+                    try:
+                        os.rmdir(root_)
+                    except OSError:
+                        pass
+        return {"ok": True, "path": rel, "deleted": True}
 
     def attachment_file(self, subpath: str) -> Path:
         """Resolve an uploaded attachment to a real file under the vault, safely.
@@ -580,6 +713,34 @@ class DocumentService:
         new_body = doc["content"].replace(find, replace, count if count else -1)
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, new_body)
+
+    def toggle_task(self, principal: Principal, path: str, line: int | None = None,
+                    *, index: int | None = None, base_version: int | None = None) -> dict:
+        """Flip a single markdown task checkbox (``- [ ]`` <-> ``- [x]``), then save
+        through the CAS update path. Target by 1-based ``line`` or by 0-based
+        ``index`` (the Nth checkbox in document order — matches the rendered
+        ``data-ti`` attribute used by click-to-toggle in the viewer)."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        doc = self.get(path)
+        lines = doc["content"].split("\n")
+        if index is not None:
+            tasks = [i for i, ln in enumerate(lines) if _TASK_LINE_RE.match(ln)]
+            if int(index) < 0 or int(index) >= len(tasks):
+                raise ValidationError("task index is out of range.")
+            idx = tasks[int(index)]
+        elif line is not None:
+            idx = int(line) - 1
+        else:
+            raise ValidationError("line or index is required.")
+        if idx < 0 or idx >= len(lines):
+            raise ValidationError("line is out of range.")
+        m = _TASK_LINE_RE.match(lines[idx])
+        if not m:
+            raise ValidationError("no task checkbox on that line.")
+        lines[idx] = m.group(1) + (" " if m.group(2).lower() == "x" else "x") + m.group(3)
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, "\n".join(lines))
 
     def patch_tags(self, principal: Principal, path: str, add: list[str] | None = None,
                    remove: list[str] | None = None) -> dict:

@@ -1,0 +1,21 @@
+{# Recursive file-explorer tree. `node` is a tree dict from DocumentService.tree():
+   {name, path, folders:[child nodes], docs:[{path,title}]}. Folders use native
+   <details> so collapse/expand works without JS; shell.js layers on persistence
+   and auto-reveal. #}
+{% macro render_tree(node) %}
+  {% for f in node.folders %}
+    <details class="tree-folder" data-folder="{{ f.path }}">
+      <summary class="tree-row tree-folder-row" data-folder="{{ f.path }}">
+        <span class="tree-twisty" aria-hidden="true"></span>
+        <span class="tree-label">{{ f.name }}</span>
+      </summary>
+      <div class="tree-children">{{ render_tree(f) }}</div>
+    </details>
+  {% endfor %}
+  {% for d in node.docs %}
+    <a class="tree-row tree-doc" href="/doc/{{ d.path|urlpath }}" data-doc="{{ d.path }}">
+      <span class="tree-twisty tree-twisty-leaf" aria-hidden="true"></span>
+      <span class="tree-label">{{ d.title }}</span>
+    </a>
+  {% endfor %}
+{% endmacro %}

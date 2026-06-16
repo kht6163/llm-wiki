@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents(folder);
 CREATE INDEX IF NOT EXISTS idx_documents_dirty ON documents(vector_dirty);
 
+-- Explicitly-created folders. Folders are otherwise derived from document paths;
+-- this table lets an empty folder persist as a first-class organizational unit
+-- ("structure first, content later"). The DB is canonical; the vault directory is
+-- a projection. Intermediate ancestors are derived at read time, so only the
+-- created leaf folder needs a row.
+CREATE TABLE IF NOT EXISTS folders (
+  path       TEXT NOT NULL,
+  path_norm  TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
+);
+
 CREATE TABLE IF NOT EXISTS tags (
   doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
   tag    TEXT NOT NULL,

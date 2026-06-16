@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -25,6 +26,20 @@ def now_iso() -> str:
 
 def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_CJK_RE = re.compile(
+    "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff]")
+
+
+def word_count(text: str) -> dict:
+    """Word and character counts for the status bar. CJK (한중일) is counted per
+    character (no spaces between words); the remainder is counted by whitespace
+    tokens. Characters include everything."""
+    text = text or ""
+    cjk = len(_CJK_RE.findall(text))
+    latin = len(_CJK_RE.sub(" ", text).split())
+    return {"words": cjk + latin, "chars": len(text)}
 
 
 def normalize_client_ip(host: str | None) -> str:
@@ -69,6 +84,25 @@ def normalize_rel_path(raw: str) -> str:
     if not rel.lower().endswith(".md"):
         rel += ".md"
     return rel
+
+
+def normalize_folder_path(raw: str) -> str:
+    """Normalize a user-supplied folder path into a clean vault-relative POSIX path
+    with no trailing slash and NO ``.md`` suffix. Rejects absolute paths and parent
+    traversal. Returns ``""`` for the vault root. Mirrors ``normalize_rel_path`` but
+    for directories (folders are an organizational namespace, not documents)."""
+    if raw is None:
+        return ""
+    p = raw.strip().replace("\\", "/")
+    parts: list[str] = []
+    for seg in p.split("/"):
+        seg = seg.strip()
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            raise PathError("path may not contain '..'")
+        parts.append(seg)
+    return "/".join(parts)
 
 
 def path_norm(rel: str) -> str:
