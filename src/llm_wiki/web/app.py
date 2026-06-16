@@ -395,10 +395,13 @@ def create_web_app(app: AppContext) -> FastAPI:
         if not p:
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         try:
-            doc = docs.move(p, path, new_path)
+            # Rewrite inbound link text too, so a move in the UI doesn't silently
+            # leave dangling references behind.
+            doc = docs.move(p, path, new_path, fix_references=True)
         except WikiError as e:
             return JSONResponse(e.to_dict(), status_code=e.http_status)
-        return JSONResponse({"ok": True, "path": doc["path"]})
+        return JSONResponse({"ok": True, "path": doc["path"],
+                             "references": doc.get("references")})
 
     @web.post("/api/doc/{path:path}/toggle-task")
     def api_toggle_task(path: str, request: Request, index: int = Form(...),

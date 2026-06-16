@@ -21,12 +21,15 @@ from ..db import Database
 from ..embedding import Embedder
 from ..markdown_utils import (
     derive_title,
+    extract_links,
     extract_tags,
     parse_frontmatter,
+    rewrite_link_target,
     set_frontmatter_tags,
 )
 from ..metrics import DOC_WRITES
 from ..util import (
+    PathError,
     basename_stem,
     folder_of,
     normalize_folder_path,
@@ -596,7 +599,7 @@ class DocumentService:
                    updated_by=principal.username, via=principal.via)
         return self.get(rel)
 
-    def update(self, principal: Principal, path: str, base_version: int, content: str,
+    def update(self, principal: Principal, path: str, base_version: int | None, content: str,
                title: str | None = None, tags: list[str] | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
@@ -873,7 +876,8 @@ class DocumentService:
             items = graph.list_broken_links(conn, limit)
         return {"count": len(items), "links": items}
 
-    def move(self, principal: Principal, path: str, new_path: str) -> dict:
+    def move(self, principal: Principal, path: str, new_path: str,
+             fix_references: bool = False) -> dict:
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot move documents (read/search only).")
         rel, new_rel = normalize_rel_path(path), normalize_rel_path(new_path)
@@ -917,7 +921,74 @@ class DocumentService:
         # Keyed on the OLD path so a viewer of the moved doc can follow it to `to`.
         self._emit("move", rel, new_version, to=new_rel,
                    updated_by=principal.username, via=principal.via)
-        return self.get(new_rel)
+        result = self.get(new_rel)
+        if fix_references:
+            # Re-resolution above fixed the GRAPH, but bodies still contain the old
+            # link text; rewrite those so the references don't show up broken.
+            result = {**result, "references": self.rename_references(principal, rel, new_rel)}
+        return result
+
+    def rename_references(self, principal: Principal, old_path: str, new_path: str) -> dict:
+        """Rewrite the link TEXT in other documents that pointed at ``old_path`` so it
+        points at ``new_path`` — the cleanup ``move`` deliberately doesn't do inline.
+        Only links that are currently broken AND keyed to the old path/name are
+        touched (path-form links and bare-name links whose stem changed); a bare name
+        that still resolves elsewhere is left alone. Each affected document gets one
+        audited revision through the CAS update path, so a single conflict skips that
+        document instead of aborting the rest.
+        Returns {from, to, docs_rewritten, links_rewritten, skipped_conflicts}."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        old_rel, new_rel = normalize_rel_path(old_path), normalize_rel_path(new_path)
+        old_norm, old_stem = path_norm(old_rel), basename_stem(old_rel).lower()
+        new_noext = new_rel[:-3] if new_rel.lower().endswith(".md") else new_rel
+        new_basename = new_noext.rsplit("/", 1)[-1]
+
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT d.path FROM links l JOIN documents d ON d.id=l.src_doc_id "
+                "WHERE d.is_deleted=0 AND l.is_resolved=0 AND "
+                "((l.dst_is_path=1 AND l.dst_path_norm=?) OR (l.dst_is_path=0 AND l.dst_name=?))",
+                (old_norm, old_stem),
+            ).fetchall()
+        candidates = [r["path"] for r in rows]
+
+        docs_rewritten = links_rewritten = skipped = 0
+        for src_path in candidates:
+            try:
+                doc = self.get(src_path)
+            except NotFoundError:
+                continue
+            body = doc["content"]
+            edits: list[tuple[int, int, str]] = []
+            for link in extract_links(body):
+                try:
+                    dpn, dname, is_path = graph._link_keys(link.target)
+                except PathError:
+                    continue
+                if not ((is_path and dpn == old_norm) or (not is_path and dname == old_stem)):
+                    continue
+                # Only repoint genuinely-broken refs; a bare name resolving elsewhere
+                # is a legitimately different target now and must be left intact.
+                if self.resolve_link(link.target, doc["path"]):
+                    continue
+                new_target = (new_rel if link.target.lower().endswith(".md") else new_noext) \
+                    if is_path else new_basename
+                edits.append((link.start, link.end, rewrite_link_target(link, new_target)))
+            if not edits:
+                continue
+            new_body = body
+            for start, end, new_raw in sorted(edits, key=lambda e: e[0], reverse=True):
+                new_body = new_body[:start] + new_raw + new_body[end:]
+            try:
+                self.update(principal, doc["path"], doc["version"], new_body)
+            except ConflictError:
+                skipped += 1
+                continue
+            docs_rewritten += 1
+            links_rewritten += len(edits)
+        return {"from": old_rel, "to": new_rel, "docs_rewritten": docs_rewritten,
+                "links_rewritten": links_rewritten, "skipped_conflicts": skipped}
 
     def recent_changes(self, limit: int = 20, since: str | None = None,
                        until: str | None = None) -> list[dict]:

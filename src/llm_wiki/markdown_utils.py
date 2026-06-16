@@ -36,6 +36,19 @@ class Chunk:
     text: str
     char_start: int
     char_end: int
+    heading_path: str | None = None  # "Install > Linux > apt" breadcrumb of ancestors
+
+
+# Mirrors the client-side heading-id slug in web/static/outline.js so a search
+# result's section anchor lands on the right rendered heading. Keep them in sync.
+_SLUG_STRIP_RE = re.compile(r"[^a-zA-Z0-9_À-￿\s-]")
+
+
+def heading_slug(text: str) -> str:
+    s = _SLUG_STRIP_RE.sub("", (text or "").lower().strip())
+    s = re.sub(r"\s+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "section"
 
 
 def _parse_simple_yaml(raw: str) -> dict:
@@ -227,6 +240,29 @@ def extract_links(text: str) -> list[Link]:
     return links
 
 
+def rewrite_link_target(link: Link, new_target: str) -> str:
+    """Rebuild a link's raw text pointing at ``new_target``, preserving the alias,
+    anchor, and (for markdown links) any title. Used by reference-rename to repoint
+    stale links after a document moves, touching only the target."""
+    if link.type == "wikilink":
+        inner = link.raw[2:-2]
+        if "|" in inner:
+            linkpart, aliaspart = inner.split("|", 1)
+        else:
+            linkpart, aliaspart = inner, None
+        anchor = ("#" + linkpart.split("#", 1)[1]) if "#" in linkpart else ""
+        new_inner = new_target + anchor + (("|" + aliaspart) if aliaspart is not None else "")
+        return f"[[{new_inner}]]"
+    # markdown: [text](url[ "title"]) — match against the raw (anchored at 0).
+    m = MDLINK_RE.match(link.raw)
+    if not m:
+        return link.raw
+    text_part, url = m.group(1), m.group(2)
+    anchor = ("#" + url.split("#", 1)[1]) if "#" in url else ""
+    title = link.raw[m.end(2):-1]  # any ` "title"` between the url and the closing ')'
+    return f"[{text_part}]({new_target}{anchor}{title})"
+
+
 def chunk_markdown(
     text: str, *, max_chars: int = 1200, overlap: int = 180
 ) -> list[Chunk]:
@@ -240,27 +276,35 @@ def chunk_markdown(
     if not body_region.strip():
         return []
 
-    # Build (heading, start, end) sections over the body region.
+    # Build (heading, heading_path, start, end) sections over the body region. The
+    # heading_path is the breadcrumb of enclosing headings (e.g. "Install > Linux"),
+    # tracked with a level stack so a matched chunk knows where it sits.
     heads = list(HEADING_RE.finditer(body_region))
-    sections: list[tuple[str | None, int, int]] = []
+    sections: list[tuple[str | None, str | None, int, int]] = []
     if not heads:
-        sections.append((None, 0, len(body_region)))
+        sections.append((None, None, 0, len(body_region)))
     else:
         if heads[0].start() > 0 and body_region[: heads[0].start()].strip():
-            sections.append((None, 0, heads[0].start()))
+            sections.append((None, None, 0, heads[0].start()))
+        stack: list[tuple[int, str]] = []
         for idx, h in enumerate(heads):
+            level, htext = len(h.group(1)), h.group(2).strip()
+            while stack and stack[-1][0] >= level:
+                stack.pop()
+            stack.append((level, htext))
+            hpath = " > ".join(t for _lvl, t in stack)
             end = heads[idx + 1].start() if idx + 1 < len(heads) else len(body_region)
-            sections.append((h.group(2).strip(), h.start(), end))
+            sections.append((htext, hpath, h.start(), end))
 
     chunks: list[Chunk] = []
     ordinal = 0
-    for heading, s, e in sections:
+    for heading, heading_path, s, e in sections:
         seg = body_region[s:e]
         if not seg.strip():
             continue
         base = meta_end + s
         if len(seg) <= max_chars:
-            chunks.append(_mk_chunk(ordinal, heading, seg, base, text))
+            chunks.append(_mk_chunk(ordinal, heading, seg, base, text, heading_path))
             ordinal += 1
             continue
         # pack by paragraphs
@@ -269,7 +313,7 @@ def chunk_markdown(
         cur_start = 0
         for ptext, pstart in paras:
             if cur and len(cur) + len(ptext) > max_chars:
-                chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text))
+                chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text, heading_path))
                 ordinal += 1
                 tail = cur[-overlap:] if overlap else ""
                 cur = tail + ptext
@@ -279,7 +323,7 @@ def chunk_markdown(
                     cur_start = pstart
                 cur += ptext
         if cur.strip():
-            chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text))
+            chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text, heading_path))
             ordinal += 1
     return chunks
 
@@ -301,7 +345,8 @@ def _split_keep_offsets(seg: str) -> list[tuple[str, int]]:
     return merged or [(seg, 0)]
 
 
-def _mk_chunk(ordinal: int, heading: str | None, seg: str, base: int, full: str) -> Chunk:
+def _mk_chunk(ordinal: int, heading: str | None, seg: str, base: int, full: str,
+              heading_path: str | None = None) -> Chunk:
     stripped = seg.strip()
     lead = len(seg) - len(seg.lstrip())
     start = base + lead
@@ -311,4 +356,5 @@ def _mk_chunk(ordinal: int, heading: str | None, seg: str, base: int, full: str)
         text=stripped,
         char_start=start,
         char_end=start + len(stripped),
+        heading_path=heading_path,
     )

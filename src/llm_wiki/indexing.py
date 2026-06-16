@@ -38,9 +38,9 @@ def rechunk(conn: sqlite3.Connection, doc_id: int, body: str) -> list[tuple[int,
     out: list[tuple[int, str]] = []
     for ch in chunk_markdown(body):
         cur = conn.execute(
-            "INSERT INTO chunks(doc_id, ordinal, heading, text, char_start, char_end) "
-            "VALUES(?,?,?,?,?,?)",
-            (doc_id, ch.ordinal, ch.heading, ch.text, ch.char_start, ch.char_end),
+            "INSERT INTO chunks(doc_id, ordinal, heading, text, char_start, char_end, heading_path) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (doc_id, ch.ordinal, ch.heading, ch.text, ch.char_start, ch.char_end, ch.heading_path),
         )
         assert cur.lastrowid is not None
         out.append((cur.lastrowid, ch.text))

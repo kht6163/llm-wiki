@@ -20,7 +20,7 @@ from .runtime import AppContext
 from .search import search_page as run_search_page
 from .services import audit
 from .services.auth import Principal, principal_from_api_key
-from .services.errors import UnauthorizedError, ValidationError, WikiError
+from .services.errors import ForbiddenError, UnauthorizedError, ValidationError, WikiError
 from .util import normalize_client_ip
 
 log = logging.getLogger("llm_wiki.mcp")
@@ -116,8 +116,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     @mcp.tool(description="Hybrid search (BM25 + embedding vector, RRF-fused). 'count' is the "
                           "number of hits returned. 'truncated' true means the result set hit "
                           "the top_k cap — raise top_k to see more. Echoes 'mode' and 'top_k'. "
-                          "Rejects an empty query with code 'validation' (so 0 results means "
-                          "'no matches', never 'bad query').")
+                          "Each hit may include 'heading' (the matched section) and 'heading_path' "
+                          "(its breadcrumb); pass 'heading' to read_document(section=) to read just "
+                          "that section. Rejects an empty query with code 'validation' (so 0 "
+                          "results means 'no matches', never 'bad query').")
     async def search_documents(
         ctx: Context,
         query: str,
@@ -417,15 +419,132 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
                           "re-resolving links (editor/admin only). Fails 'conflict' if the "
-                          "destination exists.")
-    async def move_document(ctx: Context, path: str, new_path: str) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.move(p, path, new_path)},
-                           "move_document")
+                          "destination exists. Set fix_references=true to ALSO rewrite the link "
+                          "text in other documents that pointed at the old path (otherwise those "
+                          "references go broken until repaired); the result then includes a "
+                          "'references' summary.")
+    async def move_document(
+        ctx: Context, path: str, new_path: str,
+        fix_references: Annotated[bool, Field(
+            description="Rewrite inbound links in other docs to the new path.")] = False,
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **docs.move(
+            p, path, new_path, fix_references=fix_references)}, "move_document")
+
+    @mcp.tool(description="Rewrite the link TEXT in other documents that pointed at 'old_path' so "
+                          "it points at 'new_path' (editor/admin only) — the cleanup a move leaves "
+                          "behind. Use after move_document (or to repair links from the broken-"
+                          "links list). Only currently-broken references keyed to the old "
+                          "path/name are touched. Returns {from, to, docs_rewritten, "
+                          "links_rewritten, skipped_conflicts} — one conflicted document is skipped, "
+                          "not fatal.")
+    async def rename_references(ctx: Context, old_path: str, new_path: str) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **docs.rename_references(p, old_path, new_path)},
+                           "rename_references")
 
     @mcp.tool(description="Delete (soft) a document (editor/admin only). Pass base_version to "
                           "guard against deleting a version you haven't seen. Returns "
                           "{ok, path, deleted: true} on success.")
     async def delete_document(ctx: Context, path: str, base_version: int | None = None) -> dict:
         return await _call(ctx, lambda p: docs.delete(p, path, base_version), "delete_document")
+
+    def _apply_op(principal: Principal, raw: dict) -> dict:
+        """Dispatch one batch operation to the matching single-document service call
+        (each keeps its own CAS guard, audit entry, and live-change event)."""
+        op = raw.get("op")
+        if op == "rename_references":
+            old, new = raw.get("old_path") or raw.get("path"), raw.get("new_path")
+            if not isinstance(old, str) or not isinstance(new, str):
+                raise ValidationError("'rename_references' requires 'old_path'/'path' and 'new_path'.")
+            return docs.rename_references(principal, old, new)
+        path = raw.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValidationError("each operation needs a 'path' string.")
+        if op == "create":
+            return docs.create(principal, path, raw.get("content", ""), raw.get("title"), raw.get("tags"))
+        if op == "update":
+            return docs.update(principal, path, raw.get("base_version"), raw.get("content", ""),
+                               raw.get("title"), raw.get("tags"))
+        if op == "patch":
+            return docs.patch(principal, path, raw.get("find", ""), raw.get("replace", ""),
+                              base_version=raw.get("base_version"), count=raw.get("count", 1),
+                              mode=raw.get("mode", "literal"), occurrence=raw.get("occurrence"))
+        if op == "replace_section":
+            return docs.replace_section(principal, path, raw.get("heading", ""), raw.get("text", ""),
+                                        base_version=raw.get("base_version"))
+        if op == "append_section":
+            return docs.append_section(principal, path, raw.get("heading", ""), raw.get("text", ""),
+                                       base_version=raw.get("base_version"))
+        if op == "append":
+            return docs.append_to_document(principal, path, raw.get("text", ""),
+                                           ensure_heading=raw.get("ensure_heading"),
+                                           base_version=raw.get("base_version"))
+        if op == "patch_tags":
+            return docs.patch_tags(principal, path, add=raw.get("add"), remove=raw.get("remove"))
+        if op == "move":
+            if not raw.get("new_path"):
+                raise ValidationError("'move' requires 'new_path'.")
+            return docs.move(principal, path, raw["new_path"],
+                             fix_references=bool(raw.get("fix_references", False)))
+        if op == "delete":
+            return docs.delete(principal, path, raw.get("base_version"))
+        if op == "restore":
+            if raw.get("version") is None:
+                raise ValidationError("'restore' requires 'version'.")
+            return docs.restore_revision(principal, path, raw["version"],
+                                         base_version=raw.get("base_version"))
+        raise ValidationError(f"unknown op {op!r}.")
+
+    @mcp.tool(description="Apply many single-document edits in ONE call (editor/admin only). "
+                          "'operations' is a list of {op, path, ...args}; op is one of create, "
+                          "update, patch, replace_section, append_section, append, patch_tags, "
+                          "move, delete, restore, rename_references — each takes the same args as "
+                          "its standalone tool. Returns a per-op report [{op, path, ok, version?, "
+                          "error?}] plus {applied, failed, stopped_early}. Ops are NOT one "
+                          "transaction: each commits independently with its own CAS guard. With "
+                          "stop_on_error=true (default) the first failure stops the rest (already-"
+                          "applied ops stay); false keeps going best-effort. Use for retag/relink/"
+                          "rename sweeps across many documents.")
+    async def edit_documents(
+        ctx: Context,
+        operations: Annotated[list[dict[str, Any]],
+                              Field(description="Edit operations, applied in order.")],
+        stop_on_error: Annotated[bool, Field(
+            description="Stop at the first failing op (already-applied ops are kept).")] = True,
+    ) -> dict:
+        def fn(principal: Principal) -> dict:
+            if not principal.can_write:
+                raise ForbiddenError(f"Role '{principal.role}' cannot modify documents.")
+            if not operations:
+                raise ValidationError("operations must be a non-empty list.")
+            if len(operations) > 100:
+                raise ValidationError("too many operations (max 100 per call).")
+            results: list[dict] = []
+            for raw in operations:
+                if not isinstance(raw, dict):
+                    results.append({"op": None, "path": None, "ok": False,
+                                    "error": {"code": "validation", "message": "operation must be an object"}})
+                    if stop_on_error:
+                        break
+                    continue
+                op, path = raw.get("op"), raw.get("path")
+                try:
+                    res = _apply_op(principal, raw)
+                    results.append({"op": op, "path": res.get("path", path), "ok": True,
+                                    "version": res.get("version")})
+                except WikiError as e:
+                    results.append({"op": op, "path": path, "ok": False, "error": e.to_dict()["error"]})
+                    if stop_on_error:
+                        break
+                except Exception as e:  # bad op shape (missing field, unsafe path, …)
+                    log.warning("edit_documents op=%s path=%s rejected: %s", op, path, e)
+                    results.append({"op": op, "path": path, "ok": False,
+                                    "error": {"code": "validation", "message": str(e)[:200] or "invalid operation"}})
+                    if stop_on_error:
+                        break
+            applied = sum(1 for r in results if r["ok"])
+            return {"ok": True, "applied": applied, "failed": len(results) - applied,
+                    "stopped_early": len(results) < len(operations), "results": results}
+        return await _call(ctx, fn, "edit_documents")
 
     return mcp

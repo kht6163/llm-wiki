@@ -22,11 +22,14 @@
 <ul class="results">
   {% for r in results %}
     <li>
-      <a class="title" href="/doc/{{ r.path|urlpath }}">{{ r.title }}</a>
+      {# Deep-link to the matched section when known (anchor mirrors outline.js). #}
+      <a class="title" href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.title }}</a>
       <span class="score">{{ '%.4f'|format(r.score) }}</span>
       <span class="path">{{ r.path }}</span>
       <div class="snippet">{{ r.snippet|snippet|safe }}</div>
-      {% if r.heading %}<div class="muted">↳ {{ r.heading }}</div>{% endif %}
+      {% if r.heading_path or r.heading %}
+        <div class="muted">↳ <a href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.heading_path or r.heading }}</a></div>
+      {% endif %}
     </li>
   {% else %}
     {% if q %}<li class="muted">결과 없음</li>{% endif %}

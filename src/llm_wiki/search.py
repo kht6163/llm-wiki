@@ -8,6 +8,7 @@ import re
 from dataclasses import asdict, dataclass
 
 from .embedding import Embedder
+from .markdown_utils import heading_slug
 from .metrics import SEARCH_QUERIES
 
 RRF_K = 60
@@ -22,6 +23,8 @@ class SearchResult:
     snippet: str
     heading: str | None
     version: int
+    heading_path: str | None = None   # "H1 > H2" breadcrumb of the matched section
+    anchor: str | None = None         # heading slug for a #fragment deep-link
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,17 +77,17 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
     chunk_map = {
         c["id"]: c
         for c in conn.execute(
-            f"SELECT id, doc_id, heading, text FROM chunks WHERE id IN ({ph})", ids
+            f"SELECT id, doc_id, heading, text, heading_path FROM chunks WHERE id IN ({ph})", ids
         )
     }
-    best: dict[int, tuple] = {}  # doc_id -> (distance, heading, text)
+    best: dict[int, tuple] = {}  # doc_id -> (distance, heading, text, heading_path)
     for r in rows:
         ch = chunk_map.get(r["chunk_id"])
         if not ch:
             continue
         d = ch["doc_id"]
         if d not in best or r["distance"] < best[d][0]:
-            best[d] = (r["distance"], ch["heading"], ch["text"])
+            best[d] = (r["distance"], ch["heading"], ch["text"], ch["heading_path"])
     return sorted(best.items(), key=lambda kv: kv[1][0])
 
 
@@ -174,6 +177,7 @@ def search_page(
                 continue
 
             heading = None
+            heading_path = None
             snippet = ""
             if match:
                 srow = conn.execute(
@@ -185,12 +189,15 @@ def search_page(
                     snippet = srow[0]
             if did in vec_info:
                 heading = vec_info[did][1]
+                heading_path = vec_info[did][3]
                 if not snippet:
                     snippet = vec_info[did][2][:240]
 
             results.append(SearchResult(
                 path=d["path"], title=d["title"] or d["path"],
                 score=round(score, 6), snippet=snippet, heading=heading, version=d["version"],
+                heading_path=heading_path,
+                anchor=heading_slug(heading) if heading else None,
             ))
             if len(results) >= want:
                 break

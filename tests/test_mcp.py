@@ -43,7 +43,7 @@ async def test_tools_registered(ctx):
         "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
         "append_section", "append_to_document", "patch_tags", "move_document",
-        "delete_document", "restore_revision",
+        "delete_document", "restore_revision", "rename_references", "edit_documents",
     }
     assert expected <= names, names
 
@@ -121,6 +121,51 @@ async def test_restore_revision_tool(editor_mcp):
         "update_document", {"path": "rr.md", "base_version": 1, "content": "second"}))
     d = _payload(await editor_mcp.call_tool("restore_revision", {"path": "rr.md", "version": 1}))
     assert d["ok"] and d["content"] == "first" and d["version"] == 3
+
+
+async def test_edit_documents_batch_applies_all(editor_mcp):
+    ops = [
+        {"op": "create", "path": "m1.md", "content": "# M1\n\na"},
+        {"op": "create", "path": "m2.md", "content": "# M2\n\nb"},
+        {"op": "append", "path": "m1.md", "text": "more"},
+    ]
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops}))
+    assert d["ok"] and d["applied"] == 3 and d["failed"] == 0
+    assert all(r["ok"] for r in d["results"])
+
+
+async def test_edit_documents_stop_on_error(editor_mcp):
+    # Second op fails (update with a stale base_version); stop_on_error halts the rest.
+    ops = [
+        {"op": "create", "path": "b1.md", "content": "one"},
+        {"op": "update", "path": "b1.md", "base_version": 0, "content": "two"},  # conflict
+        {"op": "create", "path": "b2.md", "content": "never"},
+    ]
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops}))
+    assert d["applied"] == 1 and d["failed"] == 1 and d["stopped_early"] is True
+    assert d["results"][1]["error"]["code"] == "conflict"
+
+
+async def test_edit_documents_best_effort(editor_mcp):
+    ops = [
+        {"op": "create", "path": "k1.md", "content": "x"},
+        {"op": "frobnicate", "path": "k1.md"},                  # unknown op -> validation
+        {"op": "create", "path": "k2.md", "content": "y"},
+    ]
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops, "stop_on_error": False}))
+    assert d["applied"] == 2 and d["failed"] == 1 and d["stopped_early"] is False
+
+
+async def test_rename_references_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "t/old.md", "content": "x"}))
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "r.md", "content": "see [link](t/old.md)"}))
+    _payload(await editor_mcp.call_tool("move_document", {"path": "t/old.md", "new_path": "t/new.md"}))
+    d = _payload(await editor_mcp.call_tool(
+        "rename_references", {"old_path": "t/old.md", "new_path": "t/new.md"}))
+    assert d["ok"] and d["docs_rewritten"] == 1
+    read = _payload(await editor_mcp.call_tool("read_document", {"path": "r.md"}))
+    assert "t/new.md" in read["content"]
 
 
 async def test_viewer_write_forbidden(ctx, principals, monkeypatch):

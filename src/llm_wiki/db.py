@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -118,13 +118,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
-  id         INTEGER PRIMARY KEY,
-  doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-  ordinal    INTEGER NOT NULL,
-  heading    TEXT,
-  text       TEXT NOT NULL,
-  char_start INTEGER NOT NULL,
-  char_end   INTEGER NOT NULL
+  id           INTEGER PRIMARY KEY,
+  doc_id       INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  ordinal      INTEGER NOT NULL,
+  heading      TEXT,
+  text         TEXT NOT NULL,
+  char_start   INTEGER NOT NULL,
+  char_end     INTEGER NOT NULL,
+  heading_path TEXT  -- "H1 > H2 > H3" breadcrumb of the chunk's enclosing headings
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 
@@ -176,6 +177,10 @@ MIGRATIONS: list[tuple[int, str]] = [
     # can tell a human edit from an agent edit. Pre-existing rows predate the MCP
     # write surface in practice, so 'web' is the safe backfill default.
     (3, "ALTER TABLE revisions ADD COLUMN via TEXT NOT NULL DEFAULT 'web'"),
+    # v4: store each chunk's heading breadcrumb so search results can show the
+    # section path and deep-link to it. NULL on pre-existing chunks until the
+    # document is next edited or a full `reindex --reembed` rebuilds chunks.
+    (4, "ALTER TABLE chunks ADD COLUMN heading_path TEXT"),
 ]
 
 

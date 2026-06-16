@@ -5,18 +5,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import io
+import json
 import signal
+import tarfile
+import tempfile
 from pathlib import Path
 
 import uvicorn
 
 from .config import ConfigError, get_settings
+from .db import SCHEMA_VERSION, get_meta
 from .mcp_server import create_mcp_server
 from .runtime import build_context
 from .services import users as users_svc
 from .services.auth import create_api_key, create_user
 from .services.errors import WikiError
+from .util import now_iso
 from .web import create_web_app
+
+SNAPSHOT_FORMAT = "llm-wiki-snapshot"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -50,6 +58,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     b = sub.add_parser("backup", help="Write a consistent (WAL-safe) copy of the database.")
     b.add_argument("--out", required=True, help="Destination .db path for the snapshot.")
+
+    sn = sub.add_parser("snapshot", help="Full snapshot (DB + vault + manifest) as a single .tar.")
+    sn.add_argument("--out", required=True, help="Destination .tar path.")
+    sn.add_argument("--force", action="store_true", help="Overwrite an existing .tar.")
+
+    rs = sub.add_parser("restore", help="Restore a full snapshot .tar (DB + vault).")
+    rs.add_argument("--in", dest="in_", required=True, help="Snapshot .tar to restore from.")
+    rs.add_argument("--force", action="store_true",
+                    help="Overwrite even if the target DB/vault is not empty.")
     return p
 
 
@@ -82,6 +99,10 @@ def _dispatch(args) -> int:
         return _reindex(args)
     if args.cmd == "backup":
         return _backup(args)
+    if args.cmd == "snapshot":
+        return _snapshot(args)
+    if args.cmd == "restore":
+        return _restore(args)
     return 2
 
 
@@ -153,7 +174,141 @@ def _backup(args) -> int:
         conn.execute("VACUUM INTO ?", (str(out),))
     print(f"Database backed up to {out}")
     print(f"NOTE: also back up the vault directory for a complete snapshot: {ctx.settings.vault_path}")
+    print("      (or use 'llm-wiki snapshot' to capture DB + vault together)")
     return 0
+
+
+def _snapshot(args) -> int:
+    """Single-file snapshot: a WAL-consistent DB copy + the whole vault (minus the
+    .tmp scratch dir) + a manifest, packed as one .tar. The companion of `restore`."""
+    ctx = build_context(full=False)
+    out = Path(args.out)
+    if out.exists() and not args.force:
+        print(f"refusing to overwrite existing file (use --force): {out}")
+        return 1
+    out.parent.mkdir(parents=True, exist_ok=True)
+    vault = Path(ctx.settings.vault_path)
+
+    with ctx.db.reader() as conn:
+        schema_version = get_meta(conn, "schema_version")
+        manifest = {
+            "format": SNAPSHOT_FORMAT,
+            "format_version": 1,
+            "schema_version": int(schema_version) if schema_version else None,
+            "embedding_model": get_meta(conn, "embedding_model"),
+            "embedding_dim": (lambda v: int(v) if v else None)(get_meta(conn, "embedding_dim")),
+            "doc_count": conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0],
+            "created_at": now_iso(),
+        }
+
+    with tempfile.TemporaryDirectory() as td:
+        snap_db = Path(td) / "wiki.db"
+        # VACUUM INTO: a transactionally-consistent copy even with WAL active.
+        with ctx.db.reader() as conn:
+            conn.execute("VACUUM INTO ?", (str(snap_db),))
+        files = 0
+        with tarfile.open(out, "w") as tar:
+            tar.add(snap_db, arcname="wiki.db")
+            if vault.exists():
+                for f in sorted(vault.rglob("*")):
+                    rel = f.relative_to(vault)
+                    if rel.parts and rel.parts[0] == ".tmp":  # scratch dir for atomic writes
+                        continue
+                    if f.is_file():
+                        tar.add(f, arcname=str(Path("vault") / rel))
+                        files += 1
+            data = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    print(f"Snapshot written to {out}")
+    print(f"  schema v{manifest['schema_version']} · {manifest['doc_count']} docs · "
+          f"{files} vault file(s) · model {manifest['embedding_model']}")
+    return 0
+
+
+def _restore(args) -> int:
+    """Restore a snapshot .tar over the configured DB + vault. Validates the manifest
+    before touching anything, refuses a non-empty target without --force, then
+    re-projects any pending docs so DB and vault converge."""
+    settings = get_settings()
+    src = Path(args.in_)
+    if not src.exists():
+        print(f"no such snapshot: {src}")
+        return 1
+    db_path, vault = Path(settings.db_path), Path(settings.vault_path)
+
+    # 1) Read + validate the manifest BEFORE clobbering anything.
+    try:
+        with tarfile.open(src, "r") as tar:
+            mf = tar.extractfile("manifest.json")
+            manifest = json.load(mf) if mf else None
+    except (tarfile.TarError, KeyError, json.JSONDecodeError):
+        manifest = None
+    if not manifest or manifest.get("format") != SNAPSHOT_FORMAT:
+        print("not a recognizable llm-wiki snapshot (missing/invalid manifest.json).")
+        return 1
+    snap_sv = manifest.get("schema_version")
+    if snap_sv is not None and int(snap_sv) > SCHEMA_VERSION:
+        print(f"snapshot schema_version {snap_sv} is newer than this build supports "
+              f"({SCHEMA_VERSION}); upgrade llm-wiki before restoring.")
+        return 1
+
+    # 2) Refuse to overwrite a populated target unless forced.
+    db_nonempty = db_path.exists() and db_path.stat().st_size > 0
+    vault_nonempty = vault.exists() and any(vault.iterdir())
+    if (db_nonempty or vault_nonempty) and not args.force:
+        print("target database or vault is not empty; pass --force to overwrite.")
+        return 1
+
+    # 3) Extract (path-traversal-safe), clearing stale WAL sidecars first.
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    vault.mkdir(parents=True, exist_ok=True)
+    for sfx in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + sfx)
+        if sidecar.exists():
+            sidecar.unlink()
+    with tarfile.open(src, "r") as tar:
+        for member in tar.getmembers():
+            if member.name == "manifest.json" or not member.isfile():
+                continue
+            if member.name == "wiki.db":
+                dest = db_path
+            elif member.name.startswith("vault/"):
+                safe = _safe_join(vault, member.name[len("vault/"):])
+                if safe is None:
+                    print(f"  skipped unsafe path in snapshot: {member.name}")
+                    continue
+                dest = safe
+            else:
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            with open(dest, "wb") as out_f:
+                out_f.write(extracted.read())
+
+    # 4) Warn on a model mismatch and re-project pending docs.
+    if manifest.get("embedding_model") and manifest["embedding_model"] != settings.embedding_model:
+        print(f"WARNING: snapshot embedding_model '{manifest['embedding_model']}' differs from "
+              f"configured '{settings.embedding_model}'. Run 'llm-wiki reindex --reembed'.")
+    ctx = build_context(full=False)  # opens the restored DB and applies any migrations
+    recovered = ctx.docs.recover_pending()
+    print(f"Restored from {src}: schema v{snap_sv} · {manifest.get('doc_count')} docs.")
+    if recovered:
+        print(f"  re-projected {recovered} pending document(s).")
+    return 0
+
+
+def _safe_join(base: Path, rel: str) -> Path | None:
+    """Resolve ``rel`` under ``base``, or None if it escapes (tar path traversal)."""
+    base = base.resolve()
+    target = (base / rel).resolve()
+    if target == base or base in target.parents:
+        return target
+    return None
 
 
 def _serve(args) -> int:
