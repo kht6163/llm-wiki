@@ -172,6 +172,17 @@ def test_api_toggle_task_route(client):
 
 
 # -- viewer surface ---------------------------------------------------------
+def test_command_palette_is_hidden_by_default(client):
+    # The palette overlay must start hidden. Its `display:flex` would otherwise
+    # override the `hidden` attribute, so a CSS guard is required and asserted.
+    login(client, "admin")
+    html = client.get("/").text
+    head = html.split('id="cmd-overlay"', 1)[1][:40]
+    assert "hidden" in head
+    css = client.get("/static/style.css").text
+    assert "[hidden]" in css and "display: none" in css
+
+
 def test_view_page_shows_outline_panel_and_statusbar(client):
     login(client, "admin")
     client.post("/new", data={"path": "doc.md", "content": "# Title\n\ntext here\n\n## Section\n",
