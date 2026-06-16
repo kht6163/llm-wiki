@@ -87,6 +87,15 @@
       <button class="icon-btn" type="button" data-action="toggle-right" title="문서 정보 패널" aria-label="우측 패널 토글">⊟</button>
     </div>
     {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
+    <!-- Defined before the content block so page scripts (e.g. editor.js) can read it. -->
+    <script>
+      window.WIKI = {
+        canWrite: {{ 'true' if user.can_write else 'false' }},
+        canAdmin: {{ 'true' if user.can_admin else 'false' }},
+        csrf: {{ csrf_token|tojson }},
+        user: {{ user.username|tojson }}
+      };
+    </script>
     <main>{% block content %}{% endblock %}</main>
   </div>
 
@@ -108,14 +117,6 @@
   </div>
 </div>
 
-<script>
-  window.WIKI = {
-    canWrite: {{ 'true' if user.can_write else 'false' }},
-    canAdmin: {{ 'true' if user.can_admin else 'false' }},
-    csrf: {{ csrf_token|tojson }},
-    user: {{ user.username|tojson }}
-  };
-</script>
 <script src="{{ static('shell.js') }}"></script>
 <script src="{{ static('palette.js') }}"></script>
 {% else %}

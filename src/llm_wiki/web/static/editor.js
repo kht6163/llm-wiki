@@ -64,4 +64,94 @@
   new MutationObserver(function () {
     api.setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light");
   }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  // =====================================================================
+  // [[ ]] wikilink typeahead. md-editor-rt bundles its own CodeMirror, so we
+  // can't add a CM extension from outside (it would be a 2nd instance). Instead
+  // we drive md-editor-rt's OWN view (api.getView()) with plain transaction
+  // specs and render the dropdown ourselves.
+  // =====================================================================
+  if (W.canWrite) setupWikiAutocomplete();
+
+  function setupWikiAutocomplete() {
+    var menu = document.createElement("div");
+    menu.className = "wiki-ac"; menu.hidden = true;
+    document.body.appendChild(menu);
+    var items = [], index = 0, fromPos = -1, timer = null;
+
+    function isOpen() { return !menu.hidden; }
+    function close() { menu.hidden = true; items = []; index = 0; fromPos = -1; }
+
+    function paint(coords) {
+      menu.innerHTML = "";
+      items.forEach(function (it, i) {
+        var row = document.createElement("div");
+        row.className = "wiki-ac-item" + (i === index ? " active" : "");
+        var t = document.createElement("span"); t.className = "wiki-ac-title"; t.textContent = it.title || it.path;
+        var p = document.createElement("span"); p.className = "wiki-ac-path muted"; p.textContent = it.path;
+        row.appendChild(t); row.appendChild(p);
+        row.addEventListener("mousedown", function (e) { e.preventDefault(); pick(i); });
+        menu.appendChild(row);
+      });
+      menu.style.left = Math.round(coords.left) + "px";
+      menu.style.top = Math.round(coords.bottom + 4) + "px";
+      menu.hidden = items.length === 0;
+    }
+    function highlight() {
+      Array.prototype.forEach.call(menu.children, function (c, i) { c.classList.toggle("active", i === index); });
+    }
+
+    function pick(i) {
+      var view = api.getView();
+      if (!view || i < 0 || i >= items.length || fromPos < 0) { close(); return; }
+      var path = items[i].path;
+      var head = view.state.selection.main.head;
+      var hasCloser = view.state.doc.sliceString(head, head + 2) === "]]";
+      var insert = path + (hasCloser ? "" : "]]");
+      view.dispatch({
+        changes: { from: fromPos, to: head, insert: insert },
+        selection: { anchor: fromPos + path.length + 2 },
+      });
+      close();
+      view.focus();
+    }
+
+    function scan() {
+      var view = api.getView();
+      if (!view) { close(); return; }
+      var head = view.state.selection.main.head;
+      var line = view.state.doc.lineAt(head);
+      var before = view.state.doc.sliceString(line.from, head);
+      var open = before.lastIndexOf("[[");
+      if (open === -1 || before.indexOf("]]", open) !== -1) { close(); return; }
+      var q = before.slice(open + 2);
+      if (q.indexOf("[") !== -1) { close(); return; }
+      fromPos = line.from + open + 2;
+      var coords = view.coordsAtPos(head) || view.coordsAtPos(fromPos);
+      if (!coords) { close(); return; }
+      clearTimeout(timer);
+      timer = setTimeout(function () {
+        fetch("/api/complete?q=" + encodeURIComponent(q), { credentials: "same-origin" })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (!d || !d.ok || !d.items || !d.items.length) { close(); return; }
+            items = d.items; index = 0; paint(coords);
+          }).catch(function () { close(); });
+      }, 100);
+    }
+
+    // Intercept nav keys before CodeMirror sees them (capture phase).
+    mountEl.addEventListener("keydown", function (e) {
+      if (!isOpen()) return;
+      if (e.key === "ArrowDown") { index = Math.min(items.length - 1, index + 1); highlight(); e.preventDefault(); e.stopPropagation(); }
+      else if (e.key === "ArrowUp") { index = Math.max(0, index - 1); highlight(); e.preventDefault(); e.stopPropagation(); }
+      else if (e.key === "Enter" || e.key === "Tab") { pick(index); e.preventDefault(); e.stopPropagation(); }
+      else if (e.key === "Escape") { close(); e.preventDefault(); e.stopPropagation(); }
+    }, true);
+    mountEl.addEventListener("input", scan);
+    mountEl.addEventListener("keyup", function (e) {
+      if (["ArrowDown", "ArrowUp", "Enter", "Tab", "Escape"].indexOf(e.key) === -1) scan();
+    });
+    document.addEventListener("mousedown", function (e) { if (!menu.contains(e.target)) close(); });
+  }
 })();

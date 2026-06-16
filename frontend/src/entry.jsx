@@ -12,6 +12,8 @@ import { MdEditor, config } from "md-editor-rt";
 import "md-editor-rt/lib/style.css";
 import hljs from "highlight.js/lib/common";
 import "highlight.js/styles/github.css";
+import Cropper from "cropperjs";
+import "cropperjs/dist/cropper.css";
 import { installWikiExtensions } from "./md-extensions.js";
 
 config({
@@ -19,6 +21,9 @@ config({
     // Provide the instance so no <script> is fetched; leave css empty so no CDN
     // <link> is injected either — colours come from the bundled github theme.
     highlight: { instance: hljs, css: {} },
+    // Bundle the image cropper too (md-editor-rt preloads it from a CDN once image
+    // upload is enabled) so the editor makes zero external requests.
+    cropper: { instance: Cropper, css: "" },
   },
   // Bring the live preview in line with the server renderer: [[wikilinks]],
   // Obsidian callouts, and ==highlight==.
@@ -47,16 +52,29 @@ function readTheme() {
 
 function mount(el, opts) {
   opts = opts || {};
-  const api = { getValue: () => opts.initialValue || "" };
+  let editorRef = null;
+  // Expose md-editor-rt's OWN CodeMirror view so page code can drive it (e.g.
+  // the [[ ]] typeahead) without importing @codemirror separately — an external
+  // import would be a second CM instance and fail to resolve.
+  const api = {
+    getValue: () => opts.initialValue || "",
+    getView: () => {
+      try { return editorRef && editorRef.current && editorRef.current.getEditorView(); }
+      catch (e) { return null; }
+    },
+  };
 
   function App() {
     const [text, setText] = React.useState(opts.initialValue || "");
     const [theme, setTheme] = React.useState(opts.theme || readTheme());
+    const ref = React.useRef(null);
+    editorRef = ref;
     // Re-point the imperative getters at the latest render's state every render.
     api.getValue = () => text;
     api.setTheme = setTheme;
 
     return React.createElement(MdEditor, {
+      ref,
       modelValue: text,
       theme,
       language: "en-US",

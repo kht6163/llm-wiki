@@ -461,3 +461,20 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   .main-col { grid-column: 2; }
 }
 
+/* ======================================================================
+   [[ ]] wikilink typeahead dropdown (rendered by static/editor.js over the
+   md-editor-rt CodeMirror). Appended to <body>, positioned at the caret.
+   ====================================================================== */
+.wiki-ac {
+  position: fixed; z-index: 99999; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.22); max-height: 280px;
+  overflow: auto; min-width: 260px; max-width: 460px; padding: 4px;
+}
+.wiki-ac[hidden] { display: none; }
+.wiki-ac-item {
+  display: flex; align-items: baseline; gap: 10px; padding: 6px 10px;
+  border-radius: 6px; cursor: pointer; white-space: nowrap;
+}
+.wiki-ac-item.active, .wiki-ac-item:hover { background: var(--soft); }
+.wiki-ac-title { font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; }
+.wiki-ac-path { font-size: 0.76em; margin-left: auto; }
