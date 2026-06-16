@@ -1,0 +1,18 @@
+{
+  "name": "llm-wiki-frontend",
+  "private": true,
+  "type": "module",
+  "description": "Dev-time build for the vendored markdown editor bundle. The built artifact (web/static/vendor/md-editor.bundle.{js,css}) is committed, so the Python runtime needs no Node at all — this only runs when the editor is changed.",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "md-editor-rt": "^6.5.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

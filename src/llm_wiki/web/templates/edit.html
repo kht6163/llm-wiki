@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{% if is_new %}새 문서{% else %}편집{% endif %}{% endblock %}
 {% block content %}
-<link rel="stylesheet" href="{{ static('vendor/easymde.min.css') }}">
+<link rel="stylesheet" href="{{ static('vendor/md-editor.bundle.css') }}">
 <h1>{% if is_new %}새 문서{% else %}편집 · {{ path }}{% endif %}</h1>
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if conflict %}
@@ -35,7 +35,10 @@
     <input type="hidden" name="base_version" value="{{ base_version }}">
   {% endif %}
   <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="(비우면 자동 추출)"></label>
-  <textarea id="editor" name="content" aria-label="마크다운 본문">{{ content }}</textarea>
+  <!-- The textarea is the form field (carries content on submit); md-editor-rt
+       mounts into #md-editor-mount and mirrors its value back into it. -->
+  <textarea id="editor" name="content" aria-label="마크다운 본문" hidden>{{ content }}</textarea>
+  <div id="md-editor-mount"></div>
   <div class="form-actions">
     <button type="submit" {% if not can_write %}disabled{% endif %}>저장</button>
     {% if not is_new %}<a href="/doc/{{ path|urlpath }}">취소</a>{% endif %}
@@ -45,7 +48,7 @@
 {% if not is_new %}
 <div id="rt-meta" data-path="{{ path }}" data-version="{{ base_version }}" data-mode="edit" hidden></div>
 {% endif %}
-<script src="{{ static('vendor/easymde.min.js') }}"></script>
+<script src="{{ static('vendor/md-editor.bundle.js') }}"></script>
 <script src="{{ static('editor.js') }}"></script>
 {% if not is_new %}<script src="{{ static('realtime.js') }}"></script>{% endif %}
 {% endblock %}
@@ -54,5 +57,5 @@
 <span class="sb-stat" id="sb-words">0 단어</span>
 <span class="sb-stat" id="sb-chars">0 자</span>
 {% if not is_new %}<span class="sb-stat muted">v{{ base_version }}</span>{% endif %}
-<span class="sb-stat muted sb-hint">/ 슬래시 명령 · Ctrl/⌘+S 저장</span>
+<span class="sb-stat muted sb-hint">Ctrl/⌘+S 저장</span>
 {% endblock %}
