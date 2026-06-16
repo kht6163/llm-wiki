@@ -22,3 +22,7 @@ __pycache__/
 # Local agent / editor config (kept locally, not committed)
 /CLAUDE.md
 /.claude/
+# Design context docs (kept locally, not committed)
+/PRODUCT.md
+/DESIGN.md
+/.impeccable/

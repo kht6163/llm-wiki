@@ -23,20 +23,21 @@
 </head>
 <body>
 {% if user %}
+{% from "_icons.html" import icon %}
 <div class="app-shell" id="app-shell">
   <nav class="ribbon" aria-label="도구 모음">
-    <a class="ribbon-btn brand" href="/" title="홈" aria-label="홈">📚</a>
-    <button class="ribbon-btn" type="button" data-action="toggle-left" title="사이드바 (Ctrl/⌘+\)" aria-label="좌측 사이드바 토글">🗂️</button>
-    <button class="ribbon-btn" type="button" data-action="switcher" title="빠른 이동 (Ctrl/⌘+O)" aria-label="빠른 이동">🔎</button>
-    <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">⌘</button>
-    {% if user.can_write %}<a class="ribbon-btn" href="/new" title="새 문서" aria-label="새 문서">📝</a>{% endif %}
-    <a class="ribbon-btn" href="/graph" title="그래프" aria-label="그래프">🕸️</a>
-    <a class="ribbon-btn" href="/broken-links" title="깨진 링크" aria-label="깨진 링크">🔗</a>
+    <a class="ribbon-btn brand" href="/" title="홈" aria-label="홈">{{ icon("book") }}</a>
+    <button class="ribbon-btn" type="button" data-action="toggle-left" title="사이드바 (Ctrl/⌘+\)" aria-label="좌측 사이드바 토글">{{ icon("panel-left") }}</button>
+    <button class="ribbon-btn" type="button" data-action="switcher" title="빠른 이동 (Ctrl/⌘+O)" aria-label="빠른 이동">{{ icon("search") }}</button>
+    <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">{{ icon("command") }}</button>
+    {% if user.can_write %}<a class="ribbon-btn" href="/new" title="새 문서" aria-label="새 문서">{{ icon("file-plus") }}</a>{% endif %}
+    <a class="ribbon-btn" href="/graph" title="그래프" aria-label="그래프">{{ icon("network") }}</a>
+    <a class="ribbon-btn" href="/broken-links" title="깨진 링크" aria-label="깨진 링크">{{ icon("unlink") }}</a>
     <span class="ribbon-spacer"></span>
-    <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">🌓</button>
-    <a class="ribbon-btn" href="/settings" title="API 키 / 설정" aria-label="설정">⚙️</a>
-    {% if user.can_admin %}<a class="ribbon-btn" href="/admin/users" title="사용자 관리" aria-label="사용자 관리">👥</a>{% endif %}
-    <a class="ribbon-btn" href="/logout" title="로그아웃" aria-label="로그아웃">⎋</a>
+    <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">{{ icon("contrast") }}</button>
+    <a class="ribbon-btn" href="/settings" title="API 키 / 설정" aria-label="설정">{{ icon("settings") }}</a>
+    {% if user.can_admin %}<a class="ribbon-btn" href="/admin/users" title="사용자 관리" aria-label="사용자 관리">{{ icon("users") }}</a>{% endif %}
+    <a class="ribbon-btn" href="/logout" title="로그아웃" aria-label="로그아웃">{{ icon("log-out") }}</a>
   </nav>
 
   <aside class="sidebar-left" id="sidebar-left" aria-label="탐색">
@@ -53,7 +54,7 @@
           <button class="tt-btn" type="button" data-action="new-folder" title="새 폴더">＋ 폴더</button>
           {% endif %}
           <span class="tt-spacer"></span>
-          <button class="tt-btn" type="button" data-action="collapse-all" title="모두 접기" aria-label="모두 접기">⊟</button>
+          <button class="tt-btn tt-icon" type="button" data-action="collapse-all" title="모두 접기" aria-label="모두 접기">{{ icon("collapse") }}</button>
         </div>
         <div class="file-tree" id="file-tree">
           {% from "_tree.html" import render_tree %}
@@ -79,12 +80,12 @@
 
   <div class="main-col">
     <div class="main-topbar">
-      <button class="icon-btn" type="button" data-action="toggle-left" title="사이드바" aria-label="사이드바 토글">☰</button>
+      <button class="icon-btn" type="button" data-action="toggle-left" title="사이드바" aria-label="사이드바 토글">{{ icon("panel-left") }}</button>
       <form class="searchbox" action="/search" method="get" role="search">
         <input type="search" name="q" placeholder="검색…  (Ctrl/⌘+O 빠른 이동)" aria-label="검색" value="{{ q|default('') }}">
       </form>
       <span class="topbar-spacer"></span>
-      <button class="icon-btn" type="button" data-action="toggle-right" title="문서 정보 패널" aria-label="우측 패널 토글">⊟</button>
+      <button class="icon-btn" type="button" data-action="toggle-right" title="문서 정보 패널" aria-label="우측 패널 토글">{{ icon("panel-right") }}</button>
     </div>
     {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
     <!-- Defined before the content block so page scripts (e.g. editor.js) can read it. -->
