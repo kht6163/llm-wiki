@@ -470,3 +470,69 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   .statusbar { grid-column: 1 / -1; }
   .main-col { grid-column: 2; }
 }
+
+/* ======================================================================
+   EasyMDE markdown editor (vendored) — themed to the app palette. Toolbar
+   glyphs are supplied here because FontAwesome is intentionally NOT loaded
+   (offline). The preview is server-rendered, so `.rendered`-style rules also
+   apply to the preview panes.
+   ====================================================================== */
+.EasyMDEContainer { width: 100%; }
+.EasyMDEContainer .CodeMirror {
+  border: 1px solid var(--line); border-top: 0; border-radius: 0 0 8px 8px;
+  background: var(--bg); color: var(--fg); min-height: 60vh;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em;
+}
+.editor-toolbar {
+  border: 1px solid var(--line); border-radius: 8px 8px 0 0; background: var(--soft); opacity: 1;
+}
+.editor-toolbar button { color: var(--fg); border: 1px solid transparent; }
+.editor-toolbar button:hover, .editor-toolbar button.active { background: var(--line); border-color: var(--line); }
+.editor-toolbar i.separator { border-left: 1px solid var(--line); border-right: 1px solid var(--bg); }
+.editor-statusbar { color: var(--muted); }
+.CodeMirror-cursor { border-left-color: var(--fg); }
+.cm-s-easymde .CodeMirror-selected, .CodeMirror-selected { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+.editor-preview, .editor-preview-side { background: var(--bg); color: var(--fg); }
+.editor-preview img, .editor-preview-side img { max-width: 100%; }
+.editor-preview table, .editor-preview-side table { border-collapse: collapse; }
+.editor-preview th, .editor-preview td,
+.editor-preview-side th, .editor-preview-side td { border: 1px solid var(--line); padding: 4px 10px; }
+.editor-preview blockquote, .editor-preview-side blockquote {
+  border-left: 3px solid var(--line); margin: 0; padding-left: 14px; color: var(--muted);
+}
+
+/* Toolbar glyphs (no FontAwesome): map each button class to a plain glyph. */
+.editor-toolbar button::before { font-family: inherit; font-style: normal; font-weight: 400; line-height: 1; }
+.editor-toolbar .fa-bold::before { content: "B"; font-weight: 800; }
+.editor-toolbar .fa-italic::before { content: "I"; font-style: italic; }
+.editor-toolbar .fa-header::before { content: "H"; font-weight: 700; }
+.editor-toolbar .fa-quote-left::before { content: "\201D"; font-weight: 700; }
+.editor-toolbar .fa-list-ul::before { content: "\2022\2009\2261"; }
+.editor-toolbar .fa-list-ol::before { content: "1.\2009\2261"; font-size: 0.78em; }
+.editor-toolbar .fa-code::before { content: "</>"; font-size: 0.78em; }
+.editor-toolbar .fa-table::before { content: "\25A6"; }
+.editor-toolbar .fa-link::before { content: "\1F517"; }
+.editor-toolbar .fa-picture-o::before { content: "\1F5BC"; }
+.editor-toolbar .mde-wikilink::before { content: "[[ ]]"; font-size: 0.66em; font-weight: 700; }
+.editor-toolbar .fa-eye::before { content: "\1F441"; }
+.editor-toolbar .fa-columns::before { content: "\25A5"; }
+.editor-toolbar .fa-arrows-alt::before { content: "\26F6"; }
+
+/* dark theme for the editor */
+[data-theme="dark"] .EasyMDEContainer .CodeMirror { background: var(--bg); color: var(--fg); border-color: var(--line); }
+[data-theme="dark"] .editor-toolbar { background: var(--soft); border-color: var(--line); }
+[data-theme="dark"] .editor-toolbar button { color: var(--fg); }
+[data-theme="dark"] .editor-toolbar button:hover, [data-theme="dark"] .editor-toolbar button.active { background: var(--line); }
+[data-theme="dark"] .editor-preview, [data-theme="dark"] .editor-preview-side { background: var(--bg); color: var(--fg); }
+[data-theme="dark"] .CodeMirror-cursor { border-left-color: var(--fg); }
+
+/* completion menu (wikilink autocomplete + slash commands) on CodeMirror */
+.cm-complete {
+  position: absolute; z-index: 80; background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); max-height: 280px; overflow: auto;
+  min-width: 240px; padding: 4px;
+}
+.cm-item { display: flex; align-items: baseline; gap: 10px; padding: 6px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap; }
+.cm-item.active, .cm-item:hover { background: var(--soft); }
+.cm-label { font-size: 0.88em; }
+.cm-sub { font-size: 0.76em; margin-left: auto; }

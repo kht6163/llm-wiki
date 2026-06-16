@@ -172,6 +172,19 @@ def test_list_page_includes_preview_hook(client):
     assert "/static/preview.js" in client.get("/").text
 
 
+def test_edit_page_uses_vendored_easymde(client):
+    # The editor is EasyMDE (vendored, offline). The page must load both vendor
+    # assets, keep the #editor textarea, and the assets must actually serve.
+    login(client, "admin")
+    create_doc(client, "e.md", "# T\n\nbody")
+    html = client.get("/doc/e.md/edit").text
+    assert "/static/vendor/easymde.min.js" in html
+    assert "/static/vendor/easymde.min.css" in html
+    assert 'id="editor"' in html and "/static/editor.js" in html
+    assert client.get("/static/vendor/easymde.min.js").status_code == 200
+    assert client.get("/static/vendor/easymde.min.css").status_code == 200
+
+
 def test_security_headers_present(client):
     login(client, "admin")
     h = client.get("/").headers
