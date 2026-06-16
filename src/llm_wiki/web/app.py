@@ -108,6 +108,21 @@ def create_web_app(app: AppContext) -> FastAPI:
     # <mark> through so stored content can't inject HTML into the results page.
     templates.env.filters["snippet"] = lambda s: bleach.clean(s or "", tags=["mark"], strip=True)
 
+    # Cache-busting for static assets: append the file's mtime as ?v=… so a changed
+    # CSS/JS file gets a fresh URL and the browser can't serve a stale copy (no more
+    # "hard-refresh to see the fix"). Templates reference assets via {{ static(...) }}.
+    _static_dir = _HERE / "static"
+
+    def _static_url(path: str) -> str:
+        rel = str(path).lstrip("/")
+        try:
+            ver = int((_static_dir / rel).stat().st_mtime)
+        except OSError:
+            ver = 0
+        return f"/static/{rel}?v={ver}"
+
+    templates.env.globals["static"] = _static_url
+
     # A global dependency enforces CSRF (same-origin + per-session token) on every
     # unsafe method; safe methods pass through. Forms carry the token via a hidden
     # field rendered from render()'s context.

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{% if is_new %}새 문서{% else %}편집{% endif %}{% endblock %}
 {% block content %}
-<link rel="stylesheet" href="/static/vendor/easymde.min.css">
+<link rel="stylesheet" href="{{ static('vendor/easymde.min.css') }}">
 <h1>{% if is_new %}새 문서{% else %}편집 · {{ path }}{% endif %}</h1>
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if conflict %}
@@ -45,9 +45,9 @@
 {% if not is_new %}
 <div id="rt-meta" data-path="{{ path }}" data-version="{{ base_version }}" data-mode="edit" hidden></div>
 {% endif %}
-<script src="/static/vendor/easymde.min.js"></script>
-<script src="/static/editor.js"></script>
-{% if not is_new %}<script src="/static/realtime.js"></script>{% endif %}
+<script src="{{ static('vendor/easymde.min.js') }}"></script>
+<script src="{{ static('editor.js') }}"></script>
+{% if not is_new %}<script src="{{ static('realtime.js') }}"></script>{% endif %}
 {% endblock %}
 
 {% block statusbar %}

@@ -27,9 +27,9 @@
   </div>
   <div class="rendered" id="doc-rendered">{{ html|safe }}</div>
 </article>
-<script src="/static/realtime.js"></script>
-<script src="/static/outline.js"></script>
-<script src="/static/tasks.js"></script>
+<script src="{{ static('realtime.js') }}"></script>
+<script src="{{ static('outline.js') }}"></script>
+<script src="{{ static('tasks.js') }}"></script>
 {% endblock %}
 
 {% block right %}

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}llm-wiki{% endblock %}</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="{{ static('style.css') }}">
   <script>
     // Apply saved theme + sidebar widths before first paint (no flash). Mirrors
     // shell.js defaults; kept tiny and dependency-free.
@@ -116,8 +116,8 @@
     user: {{ user.username|tojson }}
   };
 </script>
-<script src="/static/shell.js"></script>
-<script src="/static/palette.js"></script>
+<script src="{{ static('shell.js') }}"></script>
+<script src="{{ static('palette.js') }}"></script>
 {% else %}
 {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
 <main class="login-shell">{{ self.content() }}</main>

@@ -10,7 +10,7 @@
 </div>
 <div id="cy"></div>
 <p id="gempty" class="muted" hidden>표시할 노드가 없습니다. 중심 문서 경로를 확인하거나, 문서 사이에 <code>[[위키링크]]</code>를 추가해 보세요.</p>
-<script src="/static/vendor/cytoscape.min.js"></script>
+<script src="{{ static('vendor/cytoscape.min.js') }}"></script>
 <script>
 async function reloadGraph() {
   const root = document.getElementById('root').value.trim();
