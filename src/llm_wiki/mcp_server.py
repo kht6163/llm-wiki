@@ -17,7 +17,6 @@ from pydantic import Field
 from .metrics import MCP_CALLS, MCP_LATENCY
 from .ratelimit import RateLimiter
 from .runtime import AppContext
-from .search import search_page as run_search_page
 from .services import audit
 from .services.auth import Principal, principal_from_api_key
 from .services.errors import ForbiddenError, UnauthorizedError, ValidationError, WikiError
@@ -54,7 +53,7 @@ def _client_ip(ctx: Context) -> str:
 
 
 def create_mcp_server(app: AppContext) -> FastMCP:
-    db, embedder, docs = app.db, app.embedder, app.docs
+    db, docs = app.db, app.docs
     mcp = FastMCP(name="llm-wiki", stateless_http=True, json_response=True)
     # Throttle Bearer-auth failures per client IP so a leaked endpoint can't be
     # used to brute-force API keys (the web login is limited separately).
@@ -132,8 +131,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         def fn(_p: Principal) -> dict:
             if not query or not query.strip():
                 raise ValidationError("query must not be empty.")
-            results, truncated = run_search_page(db, embedder, query, mode=mode, top_k=top_k,
-                                                 folder=folder, tags=tags)
+            results, truncated = docs.search_page(query, mode=mode, top_k=top_k,
+                                                  folder=folder, tags=tags)
             capped = max(1, min(int(top_k), 50))
             return {"ok": True, "mode": mode, "top_k": capped, "count": len(results),
                     "truncated": truncated,

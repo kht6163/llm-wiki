@@ -138,13 +138,16 @@ def _as_block(text: str) -> str:
 
 
 class DocumentService:
-    def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str, events=None):
+    def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str, events=None,
+                 search_params: search.FusionParams | None = None):
         self.db = db
         self.embedder = embedder
         self.vault = Path(vault_path)
         # Optional EventHub for live change notifications (web WebSocket). None in
         # contexts that don't serve (tests/CLI) -> _emit is a silent no-op.
         self.events = events
+        # Hybrid-search fusion tuning (from Settings); defaults match the old constants.
+        self.search_params = search_params or search.DEFAULT_FUSION
 
     # ---- helpers --------------------------------------------------------
     def _emit(self, op: str, path: str, version: int, **extra) -> None:
@@ -586,6 +589,15 @@ class DocumentService:
         with self.db.reader() as conn:
             return graph.build_graph(conn, root, depth, limit, include_unresolved)
 
+    def search_page(self, query: str, *, mode: str = "hybrid", top_k: int = 10,
+                    folder: str | None = None, tags: list[str] | None = None
+                    ) -> tuple[list[search.SearchResult], bool]:
+        """Hybrid search returning ``(results, truncated)``, applying this service's
+        configured fusion tuning (``search_params``). The single entry point both the
+        web and MCP surfaces go through so tuning is honored uniformly."""
+        return search.search_page(self.db, self.embedder, query, mode=mode, top_k=top_k,
+                                  folder=folder, tags=tags, params=self.search_params)
+
     def related(self, path: str, limit: int = 8) -> dict:
         """Documents semantically similar to this one (via the shared chunk-vector
         index). Empty list when the document has no embeddings yet."""
@@ -608,7 +620,8 @@ class DocumentService:
             raise ValidationError("question must not be empty.")
         return search.assemble_context(
             self.db, self.embedder, question, max_chars=max_chars,
-            max_sources=max_sources, mode=mode, folder=folder, tags=tags)
+            max_sources=max_sources, mode=mode, folder=folder, tags=tags,
+            params=self.search_params)
 
     def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
         """Resolve a wikilink/markdown target to an existing document path, or None."""

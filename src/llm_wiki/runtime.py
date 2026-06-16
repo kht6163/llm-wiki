@@ -12,6 +12,7 @@ from .config import Settings, get_settings
 from .db import Database
 from .embedding import Embedder, get_embedder
 from .events import EventHub
+from .search import FusionParams
 from .services.documents import DocumentService
 
 
@@ -34,5 +35,12 @@ def build_context(settings: Settings | None = None, *, full: bool = True) -> App
     else:
         db.ensure_schema()
     events = EventHub()
-    docs = DocumentService(db, embedder, settings.vault_path, events=events)
+    fusion = FusionParams(
+        rrf_k=settings.rrf_k,
+        candidate_factor=settings.search_candidate_factor,
+        candidate_min=settings.search_candidate_min,
+        vector_factor=settings.search_vector_factor,
+        vector_cap=settings.search_vector_cap,
+    )
+    docs = DocumentService(db, embedder, settings.vault_path, events=events, search_params=fusion)
     return AppContext(settings=settings, db=db, embedder=embedder, docs=docs, events=events)

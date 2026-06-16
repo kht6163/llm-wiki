@@ -11,8 +11,21 @@ from .embedding import Embedder
 from .markdown_utils import heading_slug
 from .metrics import SEARCH_QUERIES
 
-RRF_K = 60
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
+
+
+@dataclass(frozen=True)
+class FusionParams:
+    """Tunable knobs for hybrid retrieval + RRF fusion. Defaults match the values that
+    were hardcoded before they were promoted to config (see Settings.rrf_k etc.)."""
+    rrf_k: int = 60            # RRF constant: larger flattens per-leg rank influence
+    candidate_factor: int = 4  # BM25/candidate over-fetch: k = max(top_k*factor, min)
+    candidate_min: int = 40
+    vector_factor: int = 3     # vector over-fetch: k_vec = min(k*factor, cap)
+    vector_cap: int = 600
+
+
+DEFAULT_FUSION = FusionParams()
 
 
 @dataclass
@@ -92,7 +105,8 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
 
 
 def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
-          folder: str | None, tags: list[str] | None):
+          folder: str | None, tags: list[str] | None,
+          params: FusionParams = DEFAULT_FUSION):
     """Core retrieval+RRF fusion shared by ``search_page`` and ``assemble_context``.
 
     Returns ``(scored, vec_info, match)`` where ``scored`` is ``[(doc_id, rrf_score)]``
@@ -105,7 +119,7 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     # vec0 KNN can't pre-filter by folder/tag, and collapsing chunk hits to docs
     # yields fewer distinct docs than chunks fetched. Over-fetch chunks so the
     # post-dedup/post-filter set still holds ~k distinct docs.
-    k_vec = min(k * 3, 600)
+    k_vec = min(k * params.vector_factor, params.vector_cap)
     vec_list = _vector(conn, embedder, query, k_vec) if mode in ("hybrid", "vector") else []
 
     bm_rank = {doc_id: i + 1 for i, (doc_id, _) in enumerate(bm_list)}
@@ -123,9 +137,9 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     for did in ids:
         s = 0.0
         if did in bm_rank:
-            s += 1.0 / (RRF_K + bm_rank[did])
+            s += 1.0 / (params.rrf_k + bm_rank[did])
         if did in vec_rank:
-            s += 1.0 / (RRF_K + vec_rank[did])
+            s += 1.0 / (params.rrf_k + vec_rank[did])
         scored.append((did, s))
     scored.sort(key=lambda x: -x[1])
     return scored, vec_info, match
@@ -149,6 +163,7 @@ def search_page(
     db, embedder: Embedder, query: str, *,
     mode: str = "hybrid", top_k: int = 10,
     folder: str | None = None, tags: list[str] | None = None,
+    params: FusionParams = DEFAULT_FUSION,
 ) -> tuple[list[SearchResult], bool]:
     """Run a search and report truncation. Returns ``(results, truncated)`` where
     ``truncated`` is True only when at least one more qualifying document existed
@@ -159,11 +174,11 @@ def search_page(
     SEARCH_QUERIES.labels(mode).inc()
     top_k = max(1, min(int(top_k), 50))
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
-    k = max(top_k * 4, 40)
+    k = max(top_k * params.candidate_factor, params.candidate_min)
 
     with db.reader() as conn:
         scored, vec_info, match = _rank(conn, embedder, query, mode=mode, k=k,
-                                        folder=folder, tags=tags)
+                                        folder=folder, tags=tags, params=params)
 
         results: list[SearchResult] = []
         for did, score in scored:
@@ -208,10 +223,11 @@ def search(
     db, embedder: Embedder, query: str, *,
     mode: str = "hybrid", top_k: int = 10,
     folder: str | None = None, tags: list[str] | None = None,
+    params: FusionParams = DEFAULT_FUSION,
 ) -> list[SearchResult]:
     """Backward-compatible list API: results only, no truncation flag."""
     return search_page(db, embedder, query, mode=mode, top_k=top_k,
-                       folder=folder, tags=tags)[0]
+                       folder=folder, tags=tags, params=params)[0]
 
 
 def related_documents(conn, source_doc_id: int, *, k: int = 8,
@@ -274,6 +290,7 @@ def assemble_context(
     db, embedder: Embedder, question: str, *,
     max_chars: int = 6000, max_sources: int = 8, mode: str = "hybrid",
     folder: str | None = None, tags: list[str] | None = None,
+    params: FusionParams = DEFAULT_FUSION,
 ) -> dict:
     """Retrieve and assemble citation-tagged context for a question — a one-call RAG
     primitive for LLM clients. Ranks documents with the same hybrid retriever as
@@ -286,7 +303,7 @@ def assemble_context(
         mode = "hybrid"
     max_chars = max(200, min(int(max_chars), 24000))
     max_sources = max(1, min(int(max_sources), 20))
-    k = max(max_sources * 4, 40)
+    k = max(max_sources * params.candidate_factor, params.candidate_min)
 
     sources: list[dict] = []
     parts: list[str] = []
@@ -294,7 +311,7 @@ def assemble_context(
     truncated = False
     with db.reader() as conn:
         scored, vec_info, _match = _rank(conn, embedder, question, mode=mode, k=k,
-                                         folder=folder, tags=tags)
+                                         folder=folder, tags=tags, params=params)
         for did, score in scored:
             if len(sources) >= max_sources:
                 truncated = True

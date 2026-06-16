@@ -36,6 +36,18 @@ class Settings(BaseSettings):
     # Embeddings (local HuggingFace sentence-transformers model)
     embedding_model: str = "intfloat/multilingual-e5-base"
 
+    # Hybrid-search fusion tuning. Defaults match the long-standing hardcoded values;
+    # tune per corpus (recall vs. latency) without a code change. rrf_k is the
+    # Reciprocal-Rank-Fusion constant (larger flattens rank influence); the candidate_*
+    # knobs set the BM25 over-fetch (k = max(top_k*factor, min)) and the vector_* knobs
+    # the KNN over-fetch (k_vec = min(k*factor, cap)) that keeps ~k distinct docs after
+    # chunk-dedup/filtering.
+    rrf_k: int = 60
+    search_candidate_factor: int = 4
+    search_candidate_min: int = 40
+    search_vector_factor: int = 3
+    search_vector_cap: int = 600
+
     # Web session signing secret (empty -> generated and persisted in DB meta)
     session_secret: str = ""
 
@@ -82,6 +94,22 @@ class Settings(BaseSettings):
         if not (v or "").strip():
             raise ValueError(f"{info.field_name} must not be empty")
         return v
+
+    @field_validator("rrf_k", "search_candidate_factor", "search_candidate_min",
+                      "search_vector_factor", "search_vector_cap")
+    @classmethod
+    def _search_tuning_in_range(cls, v: int, info) -> int:
+        bounds = {
+            "rrf_k": (1, 1000),
+            "search_candidate_factor": (1, 50),
+            "search_candidate_min": (1, 2000),
+            "search_vector_factor": (1, 50),
+            "search_vector_cap": (1, 10000),
+        }
+        lo, hi = bounds[info.field_name]
+        if not (lo <= int(v) <= hi):
+            raise ValueError(f"{info.field_name} must be between {lo} and {hi} (got {v})")
+        return int(v)
 
     @model_validator(mode="after")
     def _distinct_ports(self) -> Settings:

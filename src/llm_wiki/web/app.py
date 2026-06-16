@@ -39,7 +39,6 @@ from starlette.middleware.sessions import SessionMiddleware
 from ..markdown_render import render_markdown
 from ..metrics import BUILD_INFO, PrometheusMiddleware, collect_index_gauges, render_latest
 from ..runtime import AppContext
-from ..search import search_page as run_search_page
 from ..services import audit
 from ..services import users as users_svc
 from ..services.auth import (
@@ -332,9 +331,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         results = []
         truncated = False
         if q.strip():
-            hits, truncated = run_search_page(
-                db, embedder, q, mode=mode, top_k=top_k,
-                folder=folder or None, tags=tags)
+            hits, truncated = docs.search_page(
+                q, mode=mode, top_k=top_k, folder=folder or None, tags=tags)
             results = [r.to_dict() for r in hits]
         return render("search.html", request, q=q, mode=mode, top_k=top_k,
                       folder=folder or "", tag=tag or "", results=results,
