@@ -6,9 +6,18 @@ worker threads don't run forward passes on the same model object simultaneously.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from functools import lru_cache
+from typing import Any
 
 import sqlite_vec
+
+# Query-embedding cache size. Search is read-dominant and the same queries recur
+# (autocomplete, repeated agent lookups, popular terms); a forward pass on CPU is the
+# dominant search latency, so a small LRU pays for itself. The model is fixed for the
+# process lifetime (swapping it forces a reindex + restart), so cached vectors never
+# go stale.
+_QUERY_CACHE_MAX = 512
 
 
 class Embedder:
@@ -18,6 +27,7 @@ class Embedder:
         self._lock = threading.RLock()
         # E5-family models require "query:"/"passage:" prefixes; bge-m3 etc. do not.
         self._is_e5 = "e5" in model_name.lower()
+        self._query_cache: OrderedDict[str, Any] = OrderedDict()
 
     def _load(self):
         if self._model is None:
@@ -58,6 +68,14 @@ class Embedder:
             )
 
     def embed_query(self, text: str):
+        # Cache by exact query text (the encoder is deterministic and the model is
+        # fixed for the process). The cached vector is treated as read-only by callers
+        # (they only serialize it), so it's shared rather than copied.
+        with self._lock:
+            cached = self._query_cache.get(text)
+            if cached is not None:
+                self._query_cache.move_to_end(text)
+                return cached
         model = self._load()
         with self._lock:
             arr = model.encode(
@@ -65,7 +83,12 @@ class Embedder:
                 normalize_embeddings=True,
                 convert_to_numpy=True,
             )
-        return arr[0]
+            vec = arr[0]
+            self._query_cache[text] = vec
+            self._query_cache.move_to_end(text)
+            while len(self._query_cache) > _QUERY_CACHE_MAX:
+                self._query_cache.popitem(last=False)
+        return vec
 
     @staticmethod
     def serialize(vec) -> bytes:

@@ -276,6 +276,24 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def get_backlinks(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.backlinks(path)}, "get_backlinks")
 
+    @mcp.tool(description="Resolve wikilink/markdown targets to existing document paths BEFORE you "
+                          "write them — a dry run using the same resolver as the live graph (bare "
+                          "names resolve by basename, preferring the same folder as 'from_path'). "
+                          "Returns 'resolved' mapping each target to a document path or null "
+                          "(null = would be a broken link). Use to avoid creating dangling "
+                          "references instead of cleaning them up later.")
+    async def resolve_links(
+        ctx: Context,
+        targets: Annotated[list[str], Field(description="Link targets to resolve.")],
+        from_path: Annotated[str | None,
+                             Field(description="Source document (for same-folder preference).")] = None,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            resolved = {t: docs.resolve_link(t, from_path) for t in (targets or [])}
+            return {"ok": True, "resolved": resolved,
+                    "unresolved": [t for t, v in resolved.items() if v is None]}
+        return await _call(ctx, fn, "resolve_links")
+
     @mcp.tool(description="Documents semantically similar to this one (nearest by embedding "
                           "vectors, NOT by explicit links — complements get_backlinks/get_links "
                           "for discovery). Each result has a cosine-similarity 'score' (higher = "

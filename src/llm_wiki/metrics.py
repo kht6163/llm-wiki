@@ -10,8 +10,17 @@ from __future__ import annotations
 
 import time
 
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import (
+    CONTENT_TYPE_LATEST,
+    Counter,
+    Gauge,
+    Histogram,
+    Info,
+    generate_latest,
+)
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from .db import get_meta
 
 HTTP_REQUESTS = Counter(
     "llmwiki_http_requests_total", "HTTP requests handled by the web UI.",
@@ -35,6 +44,41 @@ SEARCH_QUERIES = Counter(
 DOC_WRITES = Counter(
     "llmwiki_doc_writes_total", "Document write operations.", ["action"],
 )
+
+# Index/health gauges — point-in-time state, refreshed from the DB at scrape time
+# (and reused by /readyz). A growing vector_dirty backlog is a silent RAG-quality
+# regression; pending_files signals an interrupted write; broken_links tracks vault
+# link hygiene.
+DOCUMENTS = Gauge("llmwiki_documents", "Non-deleted documents.")
+VECTOR_DIRTY = Gauge("llmwiki_vector_dirty_documents", "Documents awaiting (re)embedding.")
+PENDING_FILES = Gauge("llmwiki_pending_files", "Documents whose .md projection is pending.")
+BROKEN_LINKS = Gauge("llmwiki_broken_links", "Unresolved (dangling) links from live documents.")
+SCHEMA_VERSION = Gauge("llmwiki_schema_version", "Applied database schema version.")
+BUILD_INFO = Info("llmwiki_build", "Static build/runtime info (model, dimension, version).")
+
+
+def collect_index_gauges(db) -> dict:
+    """Refresh the index/health gauges from the DB and return the same counts as a
+    dict, so /metrics (scrape) and /readyz (status JSON) share one source of truth."""
+    with db.reader() as conn:
+        documents = conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0]
+        dirty = conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE vector_dirty=1 AND is_deleted=0").fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM documents WHERE file_state='pending' AND is_deleted=0").fetchone()[0]
+        broken = conn.execute(
+            "SELECT COUNT(*) FROM links l JOIN documents d ON d.id=l.src_doc_id "
+            "WHERE l.is_resolved=0 AND d.is_deleted=0").fetchone()[0]
+        sv = get_meta(conn, "schema_version")
+    DOCUMENTS.set(documents)
+    VECTOR_DIRTY.set(dirty)
+    PENDING_FILES.set(pending)
+    BROKEN_LINKS.set(broken)
+    if sv:
+        SCHEMA_VERSION.set(int(sv))
+    return {"documents": documents, "vector_dirty": dirty, "pending_files": pending,
+            "broken_links": broken, "schema_version": int(sv) if sv else None}
 
 
 def render_latest() -> tuple[bytes, str]:

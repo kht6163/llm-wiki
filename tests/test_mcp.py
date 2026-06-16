@@ -39,7 +39,7 @@ async def test_tools_registered(ctx):
     expected = {
         "search_documents", "read_document", "get_outline", "list_documents",
         "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
-        "get_backlinks", "get_revisions", "get_revision", "get_graph",
+        "get_backlinks", "resolve_links", "get_revisions", "get_revision", "get_graph",
         "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
         "append_section", "append_to_document", "patch_tags", "move_document",
@@ -121,6 +121,16 @@ async def test_restore_revision_tool(editor_mcp):
         "update_document", {"path": "rr.md", "base_version": 1, "content": "second"}))
     d = _payload(await editor_mcp.call_tool("restore_revision", {"path": "rr.md", "version": 1}))
     assert d["ok"] and d["content"] == "first" and d["version"] == 3
+
+
+async def test_resolve_links_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "exists.md", "content": "x"}))
+    d = _payload(await editor_mcp.call_tool(
+        "resolve_links", {"targets": ["exists", "ghosttarget"]}))
+    assert d["ok"]
+    assert d["resolved"]["exists"] == "exists.md"
+    assert d["resolved"]["ghosttarget"] is None
+    assert d["unresolved"] == ["ghosttarget"]
 
 
 async def test_edit_documents_batch_applies_all(editor_mcp):

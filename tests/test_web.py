@@ -194,6 +194,23 @@ def test_activity_requires_auth(client):
     assert r.status_code == 303 and r.headers["location"] == "/login"
 
 
+def test_readyz_reports_index_health(client):
+    login(client, "admin")
+    create_doc(client, "rz.md", "links to [[nope]]")
+    d = client.get("/readyz").json()
+    assert d["ready"] is True and d["model_loaded"] is True
+    assert d["embedding_model"]
+    assert d["broken_links"] >= 1 and d["pending_files"] == 0
+    assert d["schema_version"] >= 4
+
+
+def test_metrics_exposes_index_gauges(client):
+    body = client.get("/metrics").text
+    assert "llmwiki_vector_dirty_documents" in body
+    assert "llmwiki_broken_links" in body
+    assert "llmwiki_schema_version" in body
+
+
 def test_api_doc_preview_returns_title_and_excerpt(client):
     login(client, "admin")
     create_doc(client, "prev.md", "# Preview Title\n\nThe quick brown fox jumps over.", title="Preview Title")

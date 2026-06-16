@@ -37,7 +37,7 @@ from markupsafe import Markup
 from starlette.middleware.sessions import SessionMiddleware
 
 from ..markdown_render import render_markdown
-from ..metrics import PrometheusMiddleware, render_latest
+from ..metrics import BUILD_INFO, PrometheusMiddleware, collect_index_gauges, render_latest
 from ..runtime import AppContext
 from ..search import search_page as run_search_page
 from ..services import audit
@@ -141,8 +141,26 @@ def _window_since(window: str) -> str | None:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _set_build_info(embedder) -> None:
+    """Publish static runtime facts as the llmwiki_build_info metric (set once)."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            ver = version("llm-wiki")
+        except PackageNotFoundError:
+            ver = "unknown"
+        BUILD_INFO.info({
+            "version": ver,
+            "embedding_model": embedder.model_name,
+            "embedding_dim": str(embedder.dim),
+        })
+    except Exception:
+        pass  # info metric is best-effort; never block app construction
+
+
 def create_web_app(app: AppContext) -> FastAPI:
     db, embedder, docs = app.db, app.embedder, app.docs
+    _set_build_info(embedder)
     templates = Jinja2Templates(directory=str(_HERE / "templates"))
     templates.env.filters["urlpath"] = lambda s: quote(str(s))
     # Search snippets carry FTS <mark> tags around raw document text; allow only
@@ -253,21 +271,30 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.get("/readyz")
     def readyz():
         # Readiness: DB reachable AND the embedding model loaded. Orchestrators
-        # should route traffic only once this returns 200.
+        # should route traffic only once this returns 200. Also surfaces index health
+        # (embedding backlog / pending writes / broken links) for at-a-glance ops.
+        details: dict = {}
         try:
-            with db.reader() as conn:
-                conn.execute("SELECT 1").fetchone()
+            details = collect_index_gauges(db)
             ready = embedder.is_loaded
         except Exception:
             ready = False
         code = 200 if ready else 503
-        return JSONResponse({"ok": ready, "ready": ready, "model_loaded": embedder.is_loaded}, status_code=code)
+        return JSONResponse({
+            "ok": ready, "ready": ready, "model_loaded": embedder.is_loaded,
+            "embedding_model": embedder.model_name, **details,
+        }, status_code=code)
 
     @web.get("/metrics")
     def metrics():
         # Prometheus exposition over the shared process registry (web + MCP). Like
         # /healthz this is unauthenticated; restrict it at the network layer if the
-        # port is exposed beyond the scrape target.
+        # port is exposed beyond the scrape target. Refresh point-in-time gauges from
+        # the DB at scrape time.
+        try:
+            collect_index_gauges(db)
+        except Exception:
+            pass  # never let a metrics refresh failure 500 the scrape endpoint
         body, ctype = render_latest()
         return Response(content=body, media_type=ctype)
 
