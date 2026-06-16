@@ -1,0 +1,62 @@
+name: release-draft
+
+# main에 푸시될 때마다 마지막 정식 릴리즈 이후의 커밋을 모아 'next' draft
+# 릴리즈를 자동 갱신한다. 정식 발행(버전 태그)은 수동으로 둔다 — CLAUDE.md 참고.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-draft
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Accumulate changes into the rolling draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # 최근 정식 릴리즈는 실제 git 태그를 만들지만 draft는 만들지 않으므로,
+          # 가장 최근 태그 = 마지막으로 발행된 릴리즈. 태그가 없으면 최초 릴리즈 전.
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$last_tag" ]; then
+            range="${last_tag}..HEAD"
+            base_label="$last_tag"
+          else
+            range="HEAD"
+            base_label="(최초)"
+          fi
+
+          commits="$(git log --no-merges --pretty='format:- %s (%h)' "$range" || true)"
+          [ -n "$commits" ] || commits="_마지막 릴리즈 이후 변경 없음._"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          {
+            echo "이 draft는 마지막 정식 릴리즈 이후 \`main\`에 쌓인 변경을 자동 누적합니다."
+            echo "발행할 때 CLAUDE.md 「릴리즈 규칙」에 맞춰 한국어로 정리해 \`vX.Y.Z\` 태그로 내보내세요."
+            echo
+            echo "**기준**: \`${base_label}\` → \`${short_sha}\`"
+            echo
+            echo "### 누적된 커밋"
+            echo "$commits"
+          } > notes.md
+
+          title="다음 릴리즈 (draft)"
+          if gh release view next >/dev/null 2>&1; then
+            gh release edit next --draft --target main --title "$title" --notes-file notes.md
+          else
+            gh release create next --draft --target main --title "$title" --notes-file notes.md
+          fi
