@@ -1,7 +1,7 @@
 name: release-draft
 
 # main에 푸시될 때마다 마지막 정식 릴리즈 이후의 커밋을 모아 'next' draft
-# 릴리즈를 자동 갱신한다. 정식 발행(버전 태그)은 수동으로 둔다 — CLAUDE.md 참고.
+# 릴리즈를 자동 갱신한다. 정식 발행(버전 태그)은 수동으로 둔다.
 on:
   push:
     branches: [main]
@@ -46,7 +46,7 @@ jobs:
 
           {
             echo "이 draft는 마지막 정식 릴리즈 이후 \`main\`에 쌓인 변경을 자동 누적합니다."
-            echo "발행할 때 CLAUDE.md 「릴리즈 규칙」에 맞춰 한국어로 정리해 \`vX.Y.Z\` 태그로 내보내세요."
+            echo "발행할 때 릴리즈 규칙에 맞춰 한국어 카테고리 노트로 정리해 \`vX.Y.Z\` 태그로 내보내세요."
             echo
             echo "**기준**: \`${base_label}\` → \`${short_sha}\`"
             echo

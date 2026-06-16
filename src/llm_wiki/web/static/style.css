@@ -415,7 +415,11 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   color: var(--fg); border-radius: 6px; cursor: pointer; font-size: 0.86em;
 }
 .ctx-item:hover { background: var(--soft); }
-.ctx-item.danger { color: var(--danger); }
+/* danger menu item = red *text* on the normal menu surface. The global
+   `button.danger` (bg:var(--danger)) would otherwise paint a solid red block
+   over the red text and hide the label, so override the background here. */
+.ctx-item.danger { color: var(--danger); background: transparent; }
+.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
 .ctx-sep { height: 1px; background: var(--line); margin: 4px 0; }
 
 /* callouts (Obsidian [!type]) */
