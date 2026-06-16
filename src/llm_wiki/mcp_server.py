@@ -20,7 +20,7 @@ from .runtime import AppContext
 from .services import audit
 from .services.auth import Principal, principal_from_api_key
 from .services.errors import ForbiddenError, UnauthorizedError, ValidationError, WikiError
-from .util import normalize_client_ip
+from .util import clamp_int, normalize_client_ip
 
 log = logging.getLogger("llm_wiki.mcp")
 
@@ -133,7 +133,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 raise ValidationError("query must not be empty.")
             results, truncated = docs.search_page(query, mode=mode, top_k=top_k,
                                                   folder=folder, tags=tags)
-            capped = max(1, min(int(top_k), 50))
+            capped = clamp_int(top_k, 1, 50)
             return {"ok": True, "mode": mode, "top_k": capped, "count": len(results),
                     "truncated": truncated,
                     "results": [r.to_dict() for r in results]}

@@ -54,8 +54,8 @@ from ..services.auth import (
     revoke_api_key,
 )
 from ..services.documents import ATTACH_MAX_BYTES
-from ..services.errors import ConflictError, ValidationError, WikiError
-from ..util import PathError, normalize_client_ip, word_count
+from ..services.errors import ConflictError, ForbiddenError, ValidationError, WikiError
+from ..util import PathError, clamp_int, normalize_client_ip, word_count
 from .security import (
     RateLimiter,
     SecurityHeadersMiddleware,
@@ -65,6 +65,12 @@ from .security import (
 
 _HERE = Path(__file__).parent
 _UPLOAD_CHUNK = 64 * 1024
+
+
+class _AuthRequired(Exception):
+    """Raised by the ``require_*`` route dependencies when there's no valid session.
+    A registered handler turns it into a /login redirect (pages) or 401 JSON (/api),
+    so individual routes no longer repeat the unauthenticated branch."""
 
 
 async def _read_capped(file: UploadFile, limit: int) -> bytes | None:
@@ -215,6 +221,23 @@ def create_web_app(app: AppContext) -> FastAPI:
     def login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=303)
 
+    # ---- auth dependencies (centralize the per-route auth/permission gate) ----
+    def require_user(request: Request) -> Principal:
+        """Route dependency: the authenticated Principal, or raise to the handler
+        (login redirect / 401). Declaring it on a route makes auth impossible to
+        forget — there's no inline check to omit."""
+        p = user(request)
+        if p is None:
+            raise _AuthRequired()
+        return p
+
+    def require_admin(request: Request) -> Principal:
+        """Authenticated AND admin, else a 403 (logged-in) or login redirect."""
+        p = require_user(request)
+        if not p.can_admin:
+            raise ForbiddenError("Admin only.")
+        return p
+
     @web.exception_handler(PathError)
     async def _on_path_error(request: Request, exc: PathError):
         # An unsafe/malformed path is a client error, not a 500. API routes get JSON;
@@ -222,6 +245,22 @@ def create_web_app(app: AppContext) -> FastAPI:
         if request.url.path.startswith(("/api/", "/attachments/")):
             return JSONResponse({"ok": False, "error": "bad_path", "message": str(exc)}, status_code=400)
         return render("error.html", request, status=400, message=f"잘못된 경로입니다: {exc}")
+
+    @web.exception_handler(_AuthRequired)
+    async def _on_auth_required(request: Request, exc: _AuthRequired):
+        if request.url.path.startswith("/api/"):
+            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+        return RedirectResponse("/login", status_code=303)
+
+    @web.exception_handler(WikiError)
+    async def _on_wiki_error(request: Request, exc: WikiError):
+        # The default landing spot for a service error: routes that need bespoke
+        # handling (inline conflict re-render, flash-and-redirect) catch their own
+        # WikiError before it reaches here. API routes get the structured envelope;
+        # pages get the HTML error template at the error's HTTP status.
+        if request.url.path.startswith("/api/"):
+            return JSONResponse(exc.to_dict(), status_code=exc.http_status)
+        return render("error.html", request, status=exc.http_status, message=exc.message)
 
     # ---- auth -----------------------------------------------------------
     @web.get("/login", response_class=HTMLResponse)
@@ -300,9 +339,7 @@ def create_web_app(app: AppContext) -> FastAPI:
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
     def home(request: Request, folder: str | None = None, tag: str | None = None,
-             sort: str = "updated_at", page: int = 1):
-        if not user(request):
-            return login_redirect()
+             sort: str = "updated_at", page: int = 1, _p: Principal = Depends(require_user)):
         per_page = 50
         page = max(1, int(page))
         offset = (page - 1) * per_page
@@ -316,17 +353,14 @@ def create_web_app(app: AppContext) -> FastAPI:
                       has_prev=page > 1, has_next=offset + len(items) < total)
 
     @web.get("/tags", response_class=HTMLResponse)
-    def tags_page(request: Request):
-        if not user(request):
-            return login_redirect()
+    def tags_page(request: Request, _p: Principal = Depends(require_user)):
         return render("tags.html", request, tags=docs.tags())
 
     @web.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20,
-                    folder: str | None = None, tag: str | None = None):
-        if not user(request):
-            return login_redirect()
-        top_k = max(1, min(int(top_k), 50))
+                    folder: str | None = None, tag: str | None = None,
+                    _p: Principal = Depends(require_user)):
+        top_k = clamp_int(top_k, 1, 50)
         tags = [tag] if tag and tag.strip() else None
         results = []
         truncated = False
@@ -339,27 +373,22 @@ def create_web_app(app: AppContext) -> FastAPI:
                       truncated=truncated, folders=docs.folders())
 
     @web.get("/graph", response_class=HTMLResponse)
-    def graph_page(request: Request, root: str | None = None):
-        if not user(request):
-            return login_redirect()
+    def graph_page(request: Request, root: str | None = None,
+                   _p: Principal = Depends(require_user)):
         return render("graph.html", request, root=root or "")
 
     @web.get("/broken-links", response_class=HTMLResponse)
-    def broken_links_page(request: Request, limit: int = 500):
-        if not user(request):
-            return login_redirect()
-        data = docs.broken_links(limit=max(1, min(int(limit), 2000)))
+    def broken_links_page(request: Request, limit: int = 500,
+                          _p: Principal = Depends(require_user)):
+        data = docs.broken_links(limit=clamp_int(limit, 1, 2000))
         return render("broken_links.html", request, count=data["count"], links=data["links"])
 
     @web.get("/activity", response_class=HTMLResponse)
     def activity_page(request: Request, window: str = "7d", via: str | None = None,
-                      action: str | None = None):
+                      action: str | None = None, p: Principal = Depends(require_user)):
         # "Who/what changed the vault, and over which surface." Editors see document
         # activity; admins additionally see security/account events (login, keys,
         # role changes) since those are theirs to audit.
-        p = user(request)
-        if not p:
-            return login_redirect()
         if not p.can_write:
             return render("error.html", request, status=403,
                           message="활동 피드는 편집자 이상만 볼 수 있습니다.")
@@ -373,100 +402,59 @@ def create_web_app(app: AppContext) -> FastAPI:
                       is_admin=p.can_admin, doc_actions=audit.DOC_ACTIONS)
 
     @web.get("/api/graph")
-    def api_graph(request: Request, root: str | None = None, depth: int = 1, limit: int = 500):
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    def api_graph(request: Request, root: str | None = None, depth: int = 1, limit: int = 500,
+                  _p: Principal = Depends(require_user)):
         return JSONResponse(docs.graph(root=root or None, depth=depth, limit=limit))
 
     @web.get("/api/complete")
-    def api_complete(request: Request, q: str = ""):
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    def api_complete(request: Request, q: str = "", _p: Principal = Depends(require_user)):
         return JSONResponse({"ok": True, "items": docs.complete(q, limit=12)})
 
     @web.get("/api/tree")
-    def api_tree(request: Request):
+    def api_tree(request: Request, _p: Principal = Depends(require_user)):
         # Live tree payload so the sidebar can refresh after a folder/doc change
         # without a full page reload.
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
         return JSONResponse({"ok": True, "tree": docs.tree()})
 
     @web.post("/api/folders")
-    def api_folder_create(request: Request, path: str = Form(...)):
-        p = user(request)
-        if not p:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            res = docs.create_folder(p, path)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
-        return JSONResponse({"ok": True, **res})
+    def api_folder_create(request: Request, path: str = Form(...),
+                          p: Principal = Depends(require_user)):
+        return JSONResponse({"ok": True, **docs.create_folder(p, path)})
 
     @web.post("/api/folders/{path:path}/delete")
-    def api_folder_delete(path: str, request: Request):
-        p = user(request)
-        if not p:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            res = docs.delete_folder(p, path)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
-        return JSONResponse({"ok": True, **res})
+    def api_folder_delete(path: str, request: Request, p: Principal = Depends(require_user)):
+        return JSONResponse({"ok": True, **docs.delete_folder(p, path)})
 
     @web.post("/api/doc/{path:path}/move")
-    def api_doc_move(path: str, request: Request, new_path: str = Form(...)):
-        p = user(request)
-        if not p:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            # Rewrite inbound link text too, so a move in the UI doesn't silently
-            # leave dangling references behind.
-            doc = docs.move(p, path, new_path, fix_references=True)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
+    def api_doc_move(path: str, request: Request, new_path: str = Form(...),
+                     p: Principal = Depends(require_user)):
+        # Rewrite inbound link text too, so a move in the UI doesn't silently
+        # leave dangling references behind.
+        doc = docs.move(p, path, new_path, fix_references=True)
         return JSONResponse({"ok": True, "path": doc["path"],
                              "references": doc.get("references")})
 
     @web.post("/api/doc/{path:path}/toggle-task")
     def api_toggle_task(path: str, request: Request, index: int = Form(...),
-                        base_version: int = Form(None)):
-        p = user(request)
-        if not p:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            doc = docs.toggle_task(p, path, index=index, base_version=base_version)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
+                        base_version: int = Form(None), p: Principal = Depends(require_user)):
+        doc = docs.toggle_task(p, path, index=index, base_version=base_version)
         return JSONResponse({"ok": True, "version": doc["version"]})
 
     @web.post("/api/preview")
-    def api_preview(request: Request, content: str = Form(""), path: str = Form("preview.md")):
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    def api_preview(request: Request, content: str = Form(""), path: str = Form("preview.md"),
+                    _p: Principal = Depends(require_user)):
         return JSONResponse({"ok": True, "html": render_markdown(content, path or "preview.md")})
 
     @web.get("/api/doc/{path:path}/preview")
-    def api_doc_preview(path: str, request: Request):
+    def api_doc_preview(path: str, request: Request, _p: Principal = Depends(require_user)):
         # Plain-text title + excerpt for the list/search hover popover.
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            d = docs.preview(path)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
-        return JSONResponse({"ok": True, **d})
+        return JSONResponse({"ok": True, **docs.preview(path)})
 
     @web.get("/api/doc/{path:path}/rendered")
-    def api_doc_rendered(path: str, request: Request):
+    def api_doc_rendered(path: str, request: Request, _p: Principal = Depends(require_user)):
         # Live-refresh payload: the realtime client fetches this when a WebSocket
         # change event arrives and swaps the rendered body in place.
-        if not user(request):
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
-        try:
-            doc = docs.get(path)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
+        doc = docs.get(path)
         return JSONResponse({
             "ok": True, "path": doc["path"], "version": doc["version"], "title": doc["title"],
             "updated_at": doc["updated_at"], "updated_by": doc["updated_by"],
@@ -475,29 +463,18 @@ def create_web_app(app: AppContext) -> FastAPI:
         })
 
     @web.post("/api/upload")
-    async def api_upload(request: Request, file: UploadFile = File(...)):
-        p = user(request)
-        if not p:
-            return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    async def api_upload(request: Request, file: UploadFile = File(...),
+                         p: Principal = Depends(require_user)):
         data = await _read_capped(file, ATTACH_MAX_BYTES)
         if data is None:
-            err = ValidationError(f"Attachment too large (limit {ATTACH_MAX_BYTES} bytes).")
-            return JSONResponse(err.to_dict(), status_code=err.http_status)
-        try:
-            res = docs.save_attachment(p, file.filename or "file", data)
-        except WikiError as e:
-            return JSONResponse(e.to_dict(), status_code=e.http_status)
+            raise ValidationError(f"Attachment too large (limit {ATTACH_MAX_BYTES} bytes).")
+        res = docs.save_attachment(p, file.filename or "file", data)
         audit.record_tx(db, actor=p.username, via="web", action="attachment_upload", target=res["path"])
         return JSONResponse({"ok": True, **res})
 
     @web.get("/attachments/{subpath:path}")
-    def attachment(subpath: str, request: Request):
-        if not user(request):
-            return login_redirect()
-        try:
-            target = docs.attachment_file(subpath)
-        except WikiError as e:
-            return render("error.html", request, status=e.http_status, message=e.message)
+    def attachment(subpath: str, request: Request, _p: Principal = Depends(require_user)):
+        target = docs.attachment_file(subpath)
         # Hardened CSP overrides the site default (which permits inline scripts):
         # an SVG opened directly as a document must not execute scripts. The explicit
         # script-src 'none' is unambiguous, sandbox strips same-origin/JS as defense
@@ -510,9 +487,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         })
 
     @web.get("/go")
-    def go(request: Request, target: str, **_):
-        if not user(request):
-            return login_redirect()
+    def go(request: Request, target: str, _p: Principal = Depends(require_user), **_):
         frm = request.query_params.get("from", "")
         rel = docs.resolve_link(target, frm)
         if rel:
@@ -520,19 +495,14 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/new?path=" + quote(target), status_code=302)
 
     @web.get("/new", response_class=HTMLResponse)
-    def new_get(request: Request, path: str = ""):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def new_get(request: Request, path: str = "", p: Principal = Depends(require_user)):
         return render("edit.html", request, is_new=True, path=path, title="", content="",
                       base_version=0, conflict=None, error=None, can_write=p.can_write,
                       folders=docs.folders())
 
     @web.post("/new")
-    def new_post(request: Request, path: str = Form(...), content: str = Form(""), title: str = Form("")):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def new_post(request: Request, path: str = Form(...), content: str = Form(""),
+                 title: str = Form(""), p: Principal = Depends(require_user)):
         try:
             doc = docs.create(p, path, content, title=title or None)
         except WikiError as e:
@@ -542,10 +512,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}/edit", response_class=HTMLResponse)
-    def edit_get(path: str, request: Request):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def edit_get(path: str, request: Request, p: Principal = Depends(require_user)):
         try:
             doc = docs.get(path)
         except WikiError:
@@ -556,10 +523,8 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.post("/doc/{path:path}/edit")
     def edit_post(path: str, request: Request, content: str = Form(...),
-                  base_version: int = Form(...), title: str = Form("")):
-        p = user(request)
-        if not p:
-            return login_redirect()
+                  base_version: int = Form(...), title: str = Form(""),
+                  p: Principal = Depends(require_user)):
         try:
             doc = docs.update(p, path, base_version, content, title=title or None)
         except ConflictError as e:
@@ -574,10 +539,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.post("/doc/{path:path}/delete")
-    def delete_post(path: str, request: Request, base_version: int = Form(None)):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def delete_post(path: str, request: Request, base_version: int = Form(None),
+                    p: Principal = Depends(require_user)):
         try:
             docs.delete(p, path, base_version)
         except WikiError as e:
@@ -586,24 +549,14 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/", status_code=303)
 
     @web.get("/doc/{path:path}/history", response_class=HTMLResponse)
-    def history(path: str, request: Request):
-        if not user(request):
-            return login_redirect()
-        try:
-            data = docs.revisions(path)
-        except WikiError as e:
-            return render("error.html", request, status=e.http_status, message=e.message)
+    def history(path: str, request: Request, _p: Principal = Depends(require_user)):
+        data = docs.revisions(path)
         return render("history.html", request, path=data["path"],
                       current_version=data["current_version"], revisions=data["revisions"])
 
     @web.get("/doc/{path:path}/raw")
-    def raw(path: str, request: Request):
-        if not user(request):
-            return login_redirect()
-        try:
-            doc = docs.get(path)
-        except WikiError as e:
-            return render("error.html", request, status=e.http_status, message=e.message)
+    def raw(path: str, request: Request, _p: Principal = Depends(require_user)):
+        doc = docs.get(path)
         filename = doc["path"].rsplit("/", 1)[-1].replace('"', "")
         return PlainTextResponse(
             doc["content"], media_type="text/markdown; charset=utf-8",
@@ -611,20 +564,14 @@ def create_web_app(app: AppContext) -> FastAPI:
         )
 
     @web.get("/doc/{path:path}/rev/{version}", response_class=HTMLResponse)
-    def revision_view(path: str, version: int, request: Request):
-        if not user(request):
-            return login_redirect()
-        try:
-            rev = docs.revision(path, version)
-        except WikiError as e:
-            return render("error.html", request, status=e.http_status, message=e.message)
+    def revision_view(path: str, version: int, request: Request,
+                      _p: Principal = Depends(require_user)):
+        rev = docs.revision(path, version)
         html = render_markdown(rev["content"], rev["path"])
         return render("revision.html", request, rev=rev, html=html)
 
     @web.get("/doc/{path:path}/diff", response_class=HTMLResponse)
-    def diff_view(path: str, request: Request):
-        if not user(request):
-            return login_redirect()
+    def diff_view(path: str, request: Request, _p: Principal = Depends(require_user)):
         try:
             frm = int(request.query_params.get("from") or 0)
             to = int(request.query_params.get("to") or 0)
@@ -639,10 +586,8 @@ def create_web_app(app: AppContext) -> FastAPI:
                       diff=_diff_lines(a["content"], b["content"]))
 
     @web.post("/doc/{path:path}/rev/{version}/restore")
-    def restore_revision(path: str, version: int, request: Request):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def restore_revision(path: str, version: int, request: Request,
+                         p: Principal = Depends(require_user)):
         try:
             doc = docs.restore_revision(p, path, version)
         except ConflictError:
@@ -655,9 +600,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}", response_class=HTMLResponse)
-    def view(path: str, request: Request):
-        if not user(request):
-            return login_redirect()
+    def view(path: str, request: Request, _p: Principal = Depends(require_user)):
         try:
             doc = docs.get(path)
         except WikiError:
@@ -675,17 +618,12 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     # ---- settings (per-user API keys) -----------------------------------
     @web.get("/settings", response_class=HTMLResponse)
-    def settings_get(request: Request):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def settings_get(request: Request, p: Principal = Depends(require_user)):
         return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=None)
 
     @web.post("/settings/keys", response_class=HTMLResponse)
-    def settings_create_key(request: Request, name: str = Form("key")):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def settings_create_key(request: Request, name: str = Form("key"),
+                            p: Principal = Depends(require_user)):
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
         token = create_api_key(db, p.user_id, name)
@@ -693,36 +631,19 @@ def create_web_app(app: AppContext) -> FastAPI:
         return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=token)
 
     @web.post("/settings/keys/{key_id}/revoke")
-    def settings_revoke_key(key_id: int, request: Request):
-        p = user(request)
-        if not p:
-            return login_redirect()
+    def settings_revoke_key(key_id: int, request: Request, p: Principal = Depends(require_user)):
         revoke_api_key(db, p.user_id, key_id)
         audit.record_tx(db, actor=p.username, via="web", action="key_revoke", target=str(key_id))
         return RedirectResponse("/settings", status_code=303)
 
-    # ---- admin ----------------------------------------------------------
-    def _require_admin(request: Request):
-        p = user(request)
-        if not p:
-            return None, login_redirect()
-        if not p.can_admin:
-            return None, render("error.html", request, status=403, message="Admin only.")
-        return p, None
-
+    # ---- admin (require_admin dependency: 403 for non-admins, redirect if anon) ----
     @web.get("/admin/users", response_class=HTMLResponse)
-    def admin_users(request: Request):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+    def admin_users(request: Request, _p: Principal = Depends(require_admin)):
         return render("admin.html", request, users=users_svc.list_users(db))
 
     @web.post("/admin/users")
     def admin_create(request: Request, username: str = Form(...), password: str = Form(...),
-                     role: str = Form("editor")):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+                     role: str = Form("editor"), p: Principal = Depends(require_admin)):
         try:
             create_user(db, username, password, role)
             audit.record_tx(db, actor=p.username, via="web", action="user_create",
@@ -732,10 +653,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/admin/users", status_code=303)
 
     @web.post("/admin/users/{uid}/role")
-    def admin_role(uid: int, request: Request, role: str = Form(...)):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+    def admin_role(uid: int, request: Request, role: str = Form(...),
+                   p: Principal = Depends(require_admin)):
         try:
             users_svc.set_role(db, uid, role)
             audit.record_tx(db, actor=p.username, via="web", action="role_change",
@@ -745,10 +664,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/admin/users", status_code=303)
 
     @web.post("/admin/users/{uid}/active")
-    def admin_active(uid: int, request: Request, active: int = Form(...)):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+    def admin_active(uid: int, request: Request, active: int = Form(...),
+                     p: Principal = Depends(require_admin)):
         try:
             users_svc.set_active(db, uid, bool(active))
             audit.record_tx(db, actor=p.username, via="web", action="user_active",
@@ -758,10 +675,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/admin/users", status_code=303)
 
     @web.post("/admin/users/{uid}/password")
-    def admin_password(uid: int, request: Request, password: str = Form(...)):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+    def admin_password(uid: int, request: Request, password: str = Form(...),
+                       p: Principal = Depends(require_admin)):
         try:
             users_svc.set_password(db, uid, password)
             audit.record_tx(db, actor=p.username, via="web", action="password_change", target=str(uid))
@@ -770,10 +685,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/admin/users", status_code=303)
 
     @web.post("/admin/users/{uid}/delete")
-    def admin_delete(uid: int, request: Request):
-        p, resp = _require_admin(request)
-        if resp:
-            return resp
+    def admin_delete(uid: int, request: Request, p: Principal = Depends(require_admin)):
         try:
             users_svc.delete_user(db, uid)
             audit.record_tx(db, actor=p.username, via="web", action="user_delete", target=str(uid))

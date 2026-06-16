@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from .embedding import Embedder
 from .markdown_utils import heading_slug
 from .metrics import SEARCH_QUERIES
+from .util import clamp_int
 
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
 
@@ -172,7 +173,7 @@ def search_page(
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     SEARCH_QUERIES.labels(mode).inc()
-    top_k = max(1, min(int(top_k), 50))
+    top_k = clamp_int(top_k, 1, 50)
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
     k = max(top_k * params.candidate_factor, params.candidate_min)
 
@@ -239,7 +240,7 @@ def related_documents(conn, source_doc_id: int, *, k: int = 8,
     ranked by that best distance. Returns ``[{path, title, folder, score}]`` where
     ``score`` is cosine similarity (``1 - distance``), best first. Empty when the
     source has no vectors yet (e.g. not embedded)."""
-    k = max(1, min(int(k), 50))
+    k = clamp_int(k, 1, 50)
     rows = conn.execute(
         "SELECT v.embedding AS emb FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id "
         "WHERE c.doc_id=? ORDER BY c.ordinal LIMIT ?",
@@ -301,8 +302,8 @@ def assemble_context(
     and ``truncated`` (more relevant content existed beyond the budget)."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
-    max_chars = max(200, min(int(max_chars), 24000))
-    max_sources = max(1, min(int(max_sources), 20))
+    max_chars = clamp_int(max_chars, 200, 24000)
+    max_sources = clamp_int(max_sources, 1, 20)
     k = max(max_sources * params.candidate_factor, params.candidate_min)
 
     sources: list[dict] = []

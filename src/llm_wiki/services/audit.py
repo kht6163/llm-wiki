@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 
 from ..db import Database
-from ..util import now_iso
+from ..util import clamp_int, now_iso
 
 log = logging.getLogger("llm_wiki.audit")
 
@@ -63,7 +63,7 @@ def recent(db: Database, *, limit: int = 100, since: str | None = None,
         clauses.append(f"action IN ({ph})")
         params.extend(actions)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    params.append(max(1, min(int(limit), 1000)))
+    params.append(clamp_int(limit, 1, 1000))
     with db.reader() as conn:
         rows = conn.execute(
             "SELECT ts, actor, via, action, target, outcome, detail "

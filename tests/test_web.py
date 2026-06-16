@@ -66,6 +66,33 @@ def test_viewer_cannot_create_admin_can(client):
 def test_non_admin_cannot_reach_admin_page(client):
     login(client, "alice")  # editor
     assert client.get("/admin/users").status_code == 403
+
+
+def test_admin_page_anonymous_redirects_to_login(client):
+    # require_admin -> require_user raises _AuthRequired -> page redirect (not 403).
+    r = client.get("/admin/users", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+
+
+def test_api_get_unauthenticated_is_401_json(client):
+    # The centralized _AuthRequired handler returns JSON 401 for /api/* (not a redirect).
+    r = client.get("/api/tree")
+    assert r.status_code == 401 and r.json()["error"] == "unauthorized"
+
+
+def test_api_wiki_error_returns_structured_envelope(client):
+    # A service error on an /api route reaches the global WikiError handler as the
+    # structured envelope at the right HTTP status (route no longer catches it inline).
+    login(client, "alice")
+    r = client.get("/api/doc/does-not-exist.md/preview")
+    assert r.status_code == 404 and r.json()["error"]["code"] == "not_found"
+
+
+def test_page_wiki_error_renders_error_page(client):
+    # The same error on a page route renders the HTML error template at that status.
+    login(client, "alice")
+    r = client.get("/doc/does-not-exist.md/history")
+    assert r.status_code == 404 and "text/html" in r.headers["content-type"]
     client.cookies.clear()
     login(client, "admin")
     assert client.get("/admin/users").status_code == 200

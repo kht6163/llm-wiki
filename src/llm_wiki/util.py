@@ -28,6 +28,13 @@ def sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def clamp_int(value, lo: int, hi: int) -> int:
+    """Coerce ``value`` to int and clamp it into the inclusive range ``[lo, hi]``.
+    The one-liner for sanitizing caller-supplied limits/top_k/offsets at trust
+    boundaries (replaces the repeated ``max(lo, min(int(x), hi))``)."""
+    return max(lo, min(int(value), hi))
+
+
 _CJK_RE = re.compile(
     "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff]")
 

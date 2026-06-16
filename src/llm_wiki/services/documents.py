@@ -35,6 +35,7 @@ from ..metrics import DOC_WRITES
 from ..util import (
     PathError,
     basename_stem,
+    clamp_int,
     folder_of,
     normalize_folder_path,
     normalize_rel_path,
@@ -308,7 +309,7 @@ class DocumentService:
             q += " AND id IN (SELECT doc_id FROM tags WHERE tag=?)"
             params.append(tag)
         q += f" ORDER BY {sort_col} {order} LIMIT ? OFFSET ?"
-        params += [max(1, min(int(limit), 1000)), max(0, int(offset))]
+        params += [clamp_int(limit, 1, 1000), max(0, int(offset))]
         out = []
         with self.db.reader() as conn:
             rows = conn.execute(q, params).fetchall()
@@ -346,7 +347,7 @@ class DocumentService:
                 "SELECT path, title FROM documents WHERE is_deleted=0 AND "
                 "(path LIKE ? ESCAPE '\\' OR title LIKE ? ESCAPE '\\') "
                 "ORDER BY updated_at DESC LIMIT ?",
-                (like, like, max(1, min(int(limit), 25))),
+                (like, like, clamp_int(limit, 1, 25)),
             ).fetchall()
         return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
@@ -545,7 +546,7 @@ class DocumentService:
                 "SELECT r.version, r.op, r.via, r.created_at, r.title, u.username AS author "
                 "FROM revisions r LEFT JOIN users u ON u.id=r.author_id "
                 "WHERE r.doc_id=? ORDER BY r.version DESC LIMIT ?",
-                (d["id"], max(1, min(int(limit), 500))),
+                (d["id"], clamp_int(limit, 1, 500)),
             ).fetchall()
         return {"path": rel, "current_version": d["version"], "revisions": [dict(r) for r in rows]}
 
@@ -968,7 +969,7 @@ class DocumentService:
 
     def broken_links(self, limit: int = 200) -> dict:
         """Vault-wide unresolved links (dangling references) for cleanup tooling."""
-        limit = max(1, min(int(limit), 2000))
+        limit = clamp_int(limit, 1, 2000)
         with self.db.reader() as conn:
             items = graph.list_broken_links(conn, limit)
         return {"count": len(items), "links": items}
@@ -1100,7 +1101,7 @@ class DocumentService:
             q += " AND updated_at <= ?"
             params.append(until)
         q += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(max(1, min(int(limit), 200)))
+        params.append(clamp_int(limit, 1, 200))
         with self.db.reader() as conn:
             rows = conn.execute(q, params).fetchall()
             tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
