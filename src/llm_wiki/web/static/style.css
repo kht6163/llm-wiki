@@ -11,6 +11,7 @@
   --chrome: #eef1f5;      /* ribbon, sidebars, toolbars, statusbar */
   --inset: #e9edf2;       /* code, inputs, chips, wells */
   --pop: #ffffff;         /* menus, popovers, modals */
+  --field: var(--inset);  /* form-control fill — an inset well vs the surface */
   /* ink */
   --fg: #1c2128;
   --fg-muted: #586069;
@@ -18,6 +19,7 @@
   /* lines */
   --line: #d5dbe2;
   --line-strong: #c2cad4;
+  --field-border: var(--line);  /* resting form-control border (dark bumps it) */
   /* accent — bright value for links/selection, emphasis value for fills */
   --accent: #2563eb;
   --accent-hover: #1d4ed8;
@@ -34,6 +36,8 @@
   --success-soft: color-mix(in srgb, var(--success) 12%, transparent);
   /* focus ring — always visible for keyboard users */
   --focus: color-mix(in srgb, var(--accent) 60%, transparent);
+  /* select chevron (replaces the native OS arrow); stroke tracks fg-muted */
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23586069' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   /* type */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo",
     "Noto Sans KR", Roboto, sans-serif;
@@ -92,7 +96,7 @@ pre code { background: none; padding: 0; border: 0; font-size: inherit; }
 .topbar .brand { font-weight: 700; font-size: 1.1em; }
 .topbar nav { margin-left: auto; display: flex; align-items: center; gap: 14px; }
 .topbar .who { color: var(--muted); font-size: 0.85em; }
-.searchbox input { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; min-width: 220px; }
+.searchbox input { padding: 6px 10px; min-width: 220px; background-color: var(--bg); }
 
 /* Nav: inline links on wide screens; a CSS-only hamburger dropdown on narrow. */
 .nav { margin-left: auto; }
@@ -175,46 +179,105 @@ mark { background: color-mix(in srgb, var(--warn) 32%, transparent); color: var(
 textarea { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
 .form-actions { display: flex; gap: 12px; align-items: center; }
 
-/* Primary action button — one shape across the app. State vocabulary:
-   default / hover / active / focus-visible / disabled. */
+/* Buttons are ghost / outline: a hairline border over a transparent surface,
+   colour carried by text + border, filled only on hover — no solid blocks.
+   Default = neutral (ink); `.primary` = accent; `.danger` = red. State
+   vocabulary: default / hover / active / focus-visible / disabled. */
 button {
-  padding: 6px 13px; border: 1px solid transparent; background: var(--accent-emphasis);
-  color: var(--on-accent); border-radius: var(--r-sm); cursor: pointer;
-  font: inherit; font-size: 0.9em; font-weight: 500; line-height: 1.5;
+  padding: 6px 14px; border: 1px solid var(--line-strong);
+  background: transparent; color: var(--fg);
+  border-radius: var(--r-sm); cursor: pointer;
+  font: inherit; font-size: 0.88em; font-weight: 600; line-height: 1.5;
   transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
-    box-shadow var(--t-fast) var(--ease);
+    color var(--t-fast) var(--ease), transform var(--t-fast) var(--ease);
 }
-button:hover { background: var(--accent-hover); }
-button:active { transform: translateY(0.5px); }
-button.danger { background: var(--danger-emphasis); }
-button.danger:hover { background: color-mix(in srgb, var(--danger-emphasis) 88%, #000); }
-button:disabled { background: var(--inset); color: var(--fg-faint);
+button:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); border-color: var(--fg-muted); }
+button:active { transform: translateY(0.5px); background: color-mix(in srgb, var(--fg) 12%, transparent); }
+button:disabled { background: transparent; color: var(--fg-faint);
   border-color: var(--line); cursor: not-allowed; transform: none; }
-.inline { display: inline; }
-.btn { display: inline-block; padding: 7px 13px; background: var(--accent-emphasis);
-  color: var(--on-accent); border-radius: var(--r-sm); font-weight: 500;
-  transition: background-color var(--t-fast) var(--ease); }
-.btn:hover { background: var(--accent-hover); text-decoration: none; }
 
-/* Form controls — shared baseline + one focus treatment (accent border + ring).
-   Per-element rules still set their own size/padding; this only unifies color,
-   font, and the focus state so inputs match across every screen. */
-input, textarea, select { font-family: inherit; color: var(--fg); background: var(--bg);
-  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease); }
-input::placeholder, textarea::placeholder { color: var(--fg-faint); }
+/* Primary CTA — accent outline; fills a soft accent tint on hover. */
+button.primary {
+  border-color: color-mix(in srgb, var(--accent) 46%, var(--line));
+  color: var(--accent);
+}
+button.primary:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+button.primary:active { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+
+/* Destructive — red outline; fills a restrained red tint on hover. */
+button.danger {
+  border-color: color-mix(in srgb, var(--danger) 44%, var(--line));
+  color: var(--danger);
+}
+button.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+button.danger:active { background: color-mix(in srgb, var(--danger) 18%, transparent); }
+
+.inline { display: inline; }
+/* `.btn` (anchor styled as a button) mirrors the accent-outline primary. */
+.btn { display: inline-block; padding: 7px 14px; border-radius: var(--r-sm);
+  font-weight: 600; font-size: 0.9em; background: transparent; color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 46%, var(--line));
+  transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
+    color var(--t-fast) var(--ease); }
+.btn:hover { background: var(--accent-soft); border-color: var(--accent); text-decoration: none; }
+
+/* The full-width auth CTA reads as the page's one primary, so it rests with a
+   soft accent fill (still ghost-family — no saturated solid). */
+.login button.primary, .login button {
+  padding: 9px 14px; font-size: 0.95em;
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent);
+}
+.login button:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); border-color: var(--accent); }
+/* Disabled wins over the colour variants (defined last so it overrides them). */
+button:disabled, button.primary:disabled, button.danger:disabled {
+  background: transparent; color: var(--fg-faint); border-color: var(--line);
+  cursor: not-allowed; transform: none;
+}
+
+/* Form controls — one designed baseline so even class-less inputs/selects look
+   intentional: a hairline border, rounded corners, a hover edge, and a single
+   focus ring (accent border + soft ring). Kept at element specificity so the
+   per-screen rules above still win their own sizes. Checkboxes/radios opt out
+   and stay native, themed only via accent-color. */
+input, textarea, select {
+  font-family: inherit; color: var(--fg);
+  background-color: var(--field); border: 1px solid var(--field-border); border-radius: var(--r-sm);
+  transition: border-color var(--t-fast) var(--ease), box-shadow var(--t-fast) var(--ease),
+    background-color var(--t-fast) var(--ease);
+}
+input { padding: 6px 11px; font-size: 0.92em; }
+input[type=checkbox], input[type=radio] {
+  padding: 0; border: 0; border-radius: 0; background: none;
+  accent-color: var(--accent); cursor: pointer;
+}
+/* Placeholders darkened a step so thin Korean glyphs clear 4.5:1 on the well. */
+input::placeholder, textarea::placeholder { color: var(--fg-muted); }
+input:hover, textarea:hover, select:hover {
+  border-color: color-mix(in srgb, var(--field-border) 72%, var(--fg));
+}
 input:focus, textarea:focus, select:focus {
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus);
+}
+/* The native OS select arrow is the biggest "undesigned" tell — strip the
+   native chrome and paint our own themed chevron (--chevron tracks fg-muted). */
+select {
+  appearance: none; -webkit-appearance: none;
+  padding: 6px 30px 6px 11px; font-size: 0.92em; cursor: pointer;
+  background-image: var(--chevron); background-repeat: no-repeat;
+  background-position: right 9px center; background-size: 15px 15px;
 }
 
 .revtable { border-collapse: collapse; width: 100%; font-size: 0.9em; }
 .revtable th, .revtable td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; }
 .revtable th { background: var(--soft); }
-.revtable select, .revtable input { padding: 4px 6px; border: 1px solid var(--line); border-radius: 5px; }
+.revtable input { padding: 4px 8px; }
+.revtable select { padding: 4px 28px 4px 8px; background-position: right 8px center; }
 
 .login { max-width: 340px; margin: 8vh auto; }
 .login form { display: flex; flex-direction: column; gap: 12px; }
 .login label { display: flex; flex-direction: column; gap: 4px; }
-.login input { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.login input { padding: 8px 10px; }
 
 .searchform { display: flex; gap: 8px; margin-bottom: 16px; }
 .searchform input[type=search] { flex: 1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
@@ -235,7 +298,7 @@ input:focus, textarea:focus, select:focus {
 
 .list-head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
 .list-head h1 { margin-right: auto; }
-.listsort select { padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); }
+.listsort select { padding-block: 5px; }
 .taglist { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
 .taglist li { display: flex; align-items: center; gap: 6px; }
 
@@ -319,10 +382,12 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
     --bg: #0d1117; --chrome: #010409; --inset: #161b22; --pop: #161b22;
     --fg: #e6edf3; --fg-muted: #9198a1; --fg-faint: #8b939f;
     --line: #2a313b; --line-strong: #3d444d;
+    --field-border: #454d57;
     --accent: #58a6ff; --accent-hover: #79b8ff; --accent-emphasis: #1f6feb;
     --danger: #ff7b72; --danger-emphasis: #da3633;
     --warn: #d29922; --success: #3fb950;
     --focus: color-mix(in srgb, var(--accent) 65%, transparent);
+    --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   }
   .diff .d-add { background: #12261a; color: #aff5c6; }
   .diff .d-del { background: #2d1517; color: #ffc9c4; }
@@ -332,7 +397,7 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
    Obsidian-style app shell: ribbon | left sidebar | main | right panel,
    with a status bar across the bottom. Server-rendered; shell.js enhances.
    ====================================================================== */
-:root { --ribbon-w: 44px; --sb-bg: var(--chrome); }
+:root { --ribbon-w: 50px; --sb-bg: var(--chrome); }
 
 /* Explicit theme toggle (ribbon). These beat prefers-color-scheme; light just
    restores the :root defaults, dark mirrors the media block above. */
@@ -344,15 +409,17 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   --danger: #cf222e; --danger-emphasis: #cf222e;
   --warn: #9a6700; --success: #1a7f37;
   --focus: color-mix(in srgb, var(--accent) 60%, transparent);
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23586069' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 [data-theme="dark"] {
   --bg: #0d1117; --chrome: #010409; --inset: #161b22; --pop: #161b22;
   --fg: #e6edf3; --fg-muted: #9198a1; --fg-faint: #7d8590;
-  --line: #2a313b; --line-strong: #3d444d;
+  --line: #2a313b; --line-strong: #3d444d; --field-border: #454d57;
   --accent: #58a6ff; --accent-hover: #79b8ff; --accent-emphasis: #1f6feb;
   --danger: #ff7b72; --danger-emphasis: #da3633;
   --warn: #d29922; --success: #3fb950;
   --focus: color-mix(in srgb, var(--accent) 65%, transparent);
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 [data-theme="dark"] .diff .d-add { background: #12261a; color: #aff5c6; }
 [data-theme="dark"] .diff .d-del { background: #2d1517; color: #ffc9c4; }
@@ -373,19 +440,26 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* ribbon (far-left icon bar) */
 .ribbon {
   grid-row: 1; grid-column: 1; display: flex; flex-direction: column; align-items: center;
-  gap: 3px; padding: 8px 0; background: var(--chrome); border-right: 1px solid var(--line); overflow: hidden;
+  gap: 4px; padding: 9px 0; background: var(--chrome); border-right: 1px solid var(--line); overflow: hidden;
 }
 .ribbon-btn {
-  display: flex; align-items: center; justify-content: center; width: 32px; height: 32px;
-  border: 0; background: transparent; border-radius: var(--r-md); cursor: pointer;
-  color: var(--fg-muted); text-decoration: none; line-height: 1;
+  display: flex; align-items: center; justify-content: center; width: 38px; height: 38px;
+  padding: 0; border: 0; background: transparent; border-radius: var(--r-md); cursor: pointer;
+  color: var(--fg-muted); text-decoration: none; line-height: 1; box-shadow: none;
   transition: background-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease);
 }
-.ribbon-btn svg { width: 18px; height: 18px; display: block; }
-.ribbon-btn:hover { background: color-mix(in srgb, var(--fg) 9%, transparent); color: var(--fg); text-decoration: none; }
+.ribbon-btn svg { width: 21px; height: 21px; display: block; }
+.ribbon-btn:hover { background: color-mix(in srgb, var(--fg) 10%, transparent); color: var(--fg); text-decoration: none; }
 .ribbon-btn:active { transform: translateY(0.5px); }
-.ribbon-btn.brand { color: var(--accent); margin-bottom: 4px; }
-.ribbon-btn.brand svg { width: 21px; height: 21px; }
+/* Current page gets a quiet chip + an accent edge so the bar reads as oriented. */
+.ribbon-btn[aria-current="page"] {
+  color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+/* Brand/home anchor keeps a persistent soft chip (not only on hover). */
+.ribbon-btn.brand { color: var(--accent); margin-bottom: 6px; background: var(--accent-soft); }
+.ribbon-btn.brand:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.ribbon-btn.brand svg { width: 24px; height: 24px; }
 .ribbon-spacer { flex: 1; }
 
 /* left sidebar */

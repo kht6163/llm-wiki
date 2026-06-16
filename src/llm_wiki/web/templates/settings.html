@@ -12,7 +12,7 @@
 <form method="post" action="/settings/keys" class="inline">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="name" placeholder="키 이름 (예: my-agent)" required>
-  <button>새 키 발급</button>
+  <button class="primary">새 키 발급</button>
 </form>
 <table class="revtable">
   <thead><tr><th>이름</th><th>prefix</th><th>생성</th><th>마지막 사용</th><th>상태</th><th></th></tr></thead>

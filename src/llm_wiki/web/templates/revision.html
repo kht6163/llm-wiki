@@ -10,7 +10,7 @@
     · <form method="post" action="/doc/{{ rev.path|urlpath }}/rev/{{ rev.version }}/restore" class="inline"
             onsubmit="return confirm('이 버전(v{{ rev.version }})으로 되돌릴까요? (새 버전으로 기록됩니다)')">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        <button>이 버전으로 되돌리기</button>
+        <button class="primary">이 버전으로 되돌리기</button>
       </form>
   {% endif %}
 </div>

@@ -40,7 +40,7 @@
   <textarea id="editor" name="content" aria-label="마크다운 본문" hidden>{{ content }}</textarea>
   <div id="md-editor-mount"></div>
   <div class="form-actions">
-    <button type="submit" {% if not can_write %}disabled{% endif %}>저장</button>
+    <button type="submit" class="primary" {% if not can_write %}disabled{% endif %}>저장</button>
     {% if not is_new %}<a href="/doc/{{ path|urlpath }}">취소</a>{% endif %}
   </div>
   {% if not can_write %}<p class="muted">현재 역할은 읽기 전용이라 저장할 수 없습니다.</p>{% endif %}

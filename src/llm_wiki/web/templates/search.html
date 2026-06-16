@@ -16,7 +16,7 @@
   <select name="top_k" aria-label="결과 수">
     {% for n in [10, 20, 50] %}<option value="{{ n }}" {{ 'selected' if top_k==n }}>{{ n }}개</option>{% endfor %}
   </select>
-  <button>검색</button>
+  <button class="primary">검색</button>
 </form>
 {% if q %}<p class="muted" role="status">{{ results|length }}건{% if truncated %} · 상위 {{ top_k }}개까지 표시(더 보려면 결과 수를 늘리세요){% endif %}</p>{% endif %}
 <ul class="results">
