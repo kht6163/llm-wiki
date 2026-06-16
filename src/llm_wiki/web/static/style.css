@@ -130,20 +130,10 @@ pre.diff { font-size: 0.85em; line-height: 1.45; }
 .diff .d-hunk { display: block; color: var(--muted); }
 .diff .d-ctx { display: block; }
 
-/* editor: side-by-side textarea + live preview */
-.editor-pane { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
-@media (max-width: 760px) { .editor-pane { grid-template-columns: 1fr; } }
-.editor-pane textarea { min-height: 60vh; }
-.preview { border: 1px solid var(--line); border-radius: 6px; padding: 12px; min-height: 60vh; overflow: auto; background: var(--bg); }
-
-/* wikilink autocomplete */
-.autocomplete { position: absolute; z-index: 50; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.12); max-height: 240px; overflow: auto; min-width: 280px; }
-.autocomplete .ac-item { padding: 6px 10px; font-size: 0.85em; cursor: pointer; white-space: nowrap; }
-.autocomplete .ac-item.active, .autocomplete .ac-item:hover { background: var(--soft); }
-
-/* editor affordances */
-.editor-pane textarea.dropping { outline: 2px dashed var(--accent); outline-offset: -2px; }
-.edit-hint { font-size: 0.82em; }
+/* editor affordances. NOTE: the old custom editor's `.editor-pane`/`.preview`/
+   `.autocomplete` rules were removed — EasyMDE's toolbar button carries a bare
+   `preview` class, and the stale `.preview { min-height: 60vh }` rule collided
+   with it, stretching the toolbar to full height. */
 kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-width: 2px;
   border-radius: 4px; padding: 0 5px; font-size: 0.85em; font-family: ui-monospace, monospace; }
 
@@ -477,15 +467,17 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
    (offline). The preview is server-rendered, so `.rendered`-style rules also
    apply to the preview panes.
    ====================================================================== */
-.EasyMDEContainer { width: 100%; }
+.EasyMDEContainer { width: 100%; position: relative; }
 .EasyMDEContainer .CodeMirror {
   border: 1px solid var(--line); border-top: 0; border-radius: 0 0 8px 8px;
   background: var(--bg); color: var(--fg); min-height: 60vh;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em;
 }
 .editor-toolbar {
-  border: 1px solid var(--line); border-radius: 8px 8px 0 0; background: var(--soft); opacity: 1;
+  border: 1px solid var(--line); border-radius: 8px 8px 0 0; background: var(--soft);
+  opacity: 1; padding: 6px 8px;
 }
+.editor-toolbar button { height: 30px; min-width: 30px; }
 .editor-toolbar button { color: var(--fg); border: 1px solid transparent; }
 .editor-toolbar button:hover, .editor-toolbar button.active { background: var(--line); border-color: var(--line); }
 .editor-toolbar i.separator { border-left: 1px solid var(--line); border-right: 1px solid var(--bg); }
@@ -501,22 +493,37 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   border-left: 3px solid var(--line); margin: 0; padding-left: 14px; color: var(--muted);
 }
 
-/* Toolbar glyphs (no FontAwesome): map each button class to a plain glyph. */
-.editor-toolbar button::before { font-family: inherit; font-style: normal; font-weight: 400; line-height: 1; }
-.editor-toolbar .fa-bold::before { content: "B"; font-weight: 800; }
-.editor-toolbar .fa-italic::before { content: "I"; font-style: italic; }
-.editor-toolbar .fa-header::before { content: "H"; font-weight: 700; }
-.editor-toolbar .fa-quote-left::before { content: "\201D"; font-weight: 700; }
-.editor-toolbar .fa-list-ul::before { content: "\2022\2009\2261"; }
-.editor-toolbar .fa-list-ol::before { content: "1.\2009\2261"; font-size: 0.78em; }
-.editor-toolbar .fa-code::before { content: "</>"; font-size: 0.78em; }
-.editor-toolbar .fa-table::before { content: "\25A6"; }
-.editor-toolbar .fa-link::before { content: "\1F517"; }
-.editor-toolbar .fa-picture-o::before { content: "\1F5BC"; }
-.editor-toolbar .mde-wikilink::before { content: "[[ ]]"; font-size: 0.66em; font-weight: 700; }
-.editor-toolbar .fa-eye::before { content: "\1F441"; }
-.editor-toolbar .fa-columns::before { content: "\25A5"; }
-.editor-toolbar .fa-arrows-alt::before { content: "\26F6"; }
+/* Toolbar icons (offline, no FontAwesome): crisp monochrome Lucide-style
+   SVGs applied via CSS mask so they take currentColor and stay one size in
+   both light and dark themes. */
+.editor-toolbar button .fa,
+.editor-toolbar button.wikilink::before {
+  display: inline-block; width: 18px; height: 18px; vertical-align: -3px;
+  background-color: currentColor;
+  /* Longhands only — the `mask` shorthand would reset mask-image to none and,
+     being higher-specificity than the per-icon rules below, win and leave a
+     solid square. Keep mask-image untouched here. */
+  -webkit-mask-repeat: no-repeat; mask-repeat: no-repeat;
+  -webkit-mask-position: center; mask-position: center;
+  -webkit-mask-size: 18px 18px; mask-size: 18px 18px;
+}
+.editor-toolbar button.wikilink::before { content: ""; }
+.editor-toolbar button .fa::before { content: none; }  /* drop any FA codepoint */
+.editor-toolbar .fa-bold { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 4h7a4 4 0 0 1 0 8H6z'/%3E%3Cpath d='M6 12h8a4 4 0 0 1 0 8H6z'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 4h7a4 4 0 0 1 0 8H6z'/%3E%3Cpath d='M6 12h8a4 4 0 0 1 0 8H6z'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-italic { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='19' y1='4' x2='10' y2='4'/%3E%3Cline x1='14' y1='20' x2='5' y2='20'/%3E%3Cline x1='15' y1='4' x2='9' y2='20'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='19' y1='4' x2='10' y2='4'/%3E%3Cline x1='14' y1='20' x2='5' y2='20'/%3E%3Cline x1='15' y1='4' x2='9' y2='20'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-header { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 12h12'/%3E%3Cpath d='M6 20V4'/%3E%3Cpath d='M18 20V4'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 12h12'/%3E%3Cpath d='M6 20V4'/%3E%3Cpath d='M18 20V4'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-quote-left { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 11H5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8c0 1.5-1 2.5-3 3'/%3E%3Cpath d='M19 11h-5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8c0 1.5-1 2.5-3 3'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 11H5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8c0 1.5-1 2.5-3 3'/%3E%3Cpath d='M19 11h-5V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8c0 1.5-1 2.5-3 3'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-list-ul { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='8' y1='6' x2='21' y2='6'/%3E%3Cline x1='8' y1='12' x2='21' y2='12'/%3E%3Cline x1='8' y1='18' x2='21' y2='18'/%3E%3Ccircle cx='4' cy='6' r='1'/%3E%3Ccircle cx='4' cy='12' r='1'/%3E%3Ccircle cx='4' cy='18' r='1'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='8' y1='6' x2='21' y2='6'/%3E%3Cline x1='8' y1='12' x2='21' y2='12'/%3E%3Cline x1='8' y1='18' x2='21' y2='18'/%3E%3Ccircle cx='4' cy='6' r='1'/%3E%3Ccircle cx='4' cy='12' r='1'/%3E%3Ccircle cx='4' cy='18' r='1'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-list-ol { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='10' y1='6' x2='21' y2='6'/%3E%3Cline x1='10' y1='12' x2='21' y2='12'/%3E%3Cline x1='10' y1='18' x2='21' y2='18'/%3E%3Cpath d='M4 6h1v4'/%3E%3Cpath d='M4 10h2'/%3E%3Cpath d='M6 18H4c0-1 2-1.5 2-2.5S5 14 4 14.5'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cline x1='10' y1='6' x2='21' y2='6'/%3E%3Cline x1='10' y1='12' x2='21' y2='12'/%3E%3Cline x1='10' y1='18' x2='21' y2='18'/%3E%3Cpath d='M4 6h1v4'/%3E%3Cpath d='M4 10h2'/%3E%3Cpath d='M6 18H4c0-1 2-1.5 2-2.5S5 14 4 14.5'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-code { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='16 18 22 12 16 6'/%3E%3Cpolyline points='8 6 2 12 8 18'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='16 18 22 12 16 6'/%3E%3Cpolyline points='8 6 2 12 8 18'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-table { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cpath d='M3 9h18'/%3E%3Cpath d='M3 15h18'/%3E%3Cpath d='M12 3v18'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cpath d='M3 9h18'/%3E%3Cpath d='M3 15h18'/%3E%3Cpath d='M12 3v18'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-link { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1'/%3E%3Cpath d='M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M10 13a5 5 0 0 0 7 0l3-3a5 5 0 0 0-7-7l-1 1'/%3E%3Cpath d='M14 11a5 5 0 0 0-7 0l-3 3a5 5 0 0 0 7 7l1-1'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-image { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-4-4-9 9'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-4-4-9 9'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-picture-o { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-4-4-9 9'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-4-4-9 9'/%3E%3C/svg%3E"); }
+.editor-toolbar button.wikilink::before { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3'/%3E%3Cpath d='M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3'/%3E%3Cpath d='M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-eye { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z'/%3E%3Ccircle cx='12' cy='12' r='3'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-columns { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cpath d='M12 3v18'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Cpath d='M12 3v18'/%3E%3C/svg%3E"); }
+.editor-toolbar .fa-arrows-alt { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 3H5a2 2 0 0 0-2 2v3'/%3E%3Cpath d='M21 8V5a2 2 0 0 0-2-2h-3'/%3E%3Cpath d='M3 16v3a2 2 0 0 0 2 2h3'/%3E%3Cpath d='M16 21h3a2 2 0 0 0 2-2v-3'/%3E%3C/svg%3E"); mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 3H5a2 2 0 0 0-2 2v3'/%3E%3Cpath d='M21 8V5a2 2 0 0 0-2-2h-3'/%3E%3Cpath d='M3 16v3a2 2 0 0 0 2 2h3'/%3E%3Cpath d='M16 21h3a2 2 0 0 0 2-2v-3'/%3E%3C/svg%3E"); }
 
 /* dark theme for the editor */
 [data-theme="dark"] .EasyMDEContainer .CodeMirror { background: var(--bg); color: var(--fg); border-color: var(--line); }

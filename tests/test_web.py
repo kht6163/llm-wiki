@@ -214,6 +214,23 @@ def test_preview_api(client):
     assert body["ok"] and "<strong>bold</strong>" in body["html"]
 
 
+def test_preview_api_is_csrf_exempt(client):
+    # The editor renders the preview by POSTing to /api/preview on every toggle.
+    # It changes no state, so it's exempt from CSRF — must work with no token and
+    # even when the Origin doesn't match (e.g. behind a proxy / different host),
+    # otherwise the preview fails silently.
+    login(client, "admin")
+    r = client.post(
+        "/api/preview",
+        data={"content": "# Hi\n\n[[other]]", "path": "x.md"},  # no csrf_token
+        headers={"origin": "http://proxy.example"},             # cross-origin
+    )
+    assert r.status_code == 200 and r.json()["ok"]
+    # Still gated on auth: a logged-out client gets 401, not a render.
+    client.get("/logout")
+    assert client.post("/api/preview", data={"content": "x"}).status_code == 401
+
+
 def test_complete_api(client):
     login(client, "admin")
     create_doc(client, "notes/meeting.md", "# Meeting\n\nbody")

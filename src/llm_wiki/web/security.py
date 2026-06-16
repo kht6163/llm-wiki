@@ -18,6 +18,12 @@ __all__ = ["RateLimiter", "SecurityHeadersMiddleware", "enforce_csrf", "get_csrf
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
+# Read-only POST endpoints that change no state: they only render the caller's own
+# input back as sanitized HTML. Exempting them from CSRF avoids silent failures when
+# the browser's Origin doesn't match (e.g. behind a proxy or accessed via a different
+# host) — the markdown preview must work regardless of how the page was reached.
+CSRF_EXEMPT_PATHS = frozenset({"/api/preview"})
+
 # Image sources are left permissive so rendered markdown can embed remote images;
 # scripts/styles are same-origin only ('unsafe-inline' is still required by the
 # few inline handlers/blocks in the templates — tighten with nonces later).
@@ -57,6 +63,8 @@ async def enforce_csrf(request: Request) -> None:
     valid per-session synchronizer token (form field ``csrf_token`` or header
     ``X-CSRF-Token``). Safe methods pass straight through."""
     if request.method in SAFE_METHODS:
+        return
+    if request.url.path in CSRF_EXEMPT_PATHS:
         return
     if not _same_origin(request):
         raise HTTPException(status_code=403, detail="Cross-origin request rejected (CSRF).")

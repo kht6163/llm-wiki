@@ -57,6 +57,7 @@
     minHeight: "62vh",
     placeholder: "마크다운으로 작성…   ( /  슬래시 명령 ·  [[  위키링크 )",
     previewClass: ["editor-preview", "rendered"],
+    sideBySideFullscreen: false,      // keep the split preview inside the app shell, not a fixed full-screen pane
     previewRender: serverPreview,
     uploadImage: true,
     imageUploadFunction: uploadImage,
