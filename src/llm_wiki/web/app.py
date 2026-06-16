@@ -500,7 +500,12 @@ def create_web_app(app: AppContext) -> FastAPI:
         html = render_markdown(doc["content"], doc["path"])
         backlinks = docs.backlinks(doc["path"])["backlinks"]
         outgoing = docs.links(doc["path"])["links"]
-        return render("view.html", request, doc=doc, html=html, backlinks=backlinks, outgoing=outgoing)
+        try:
+            related = docs.related(doc["path"], limit=6)["related"]
+        except WikiError:
+            related = []
+        return render("view.html", request, doc=doc, html=html, backlinks=backlinks,
+                      outgoing=outgoing, related=related)
 
     # ---- settings (per-user API keys) -----------------------------------
     @web.get("/settings", response_class=HTMLResponse)

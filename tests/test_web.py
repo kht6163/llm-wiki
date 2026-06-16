@@ -71,6 +71,16 @@ def test_non_admin_cannot_reach_admin_page(client):
     assert client.get("/admin/users").status_code == 200
 
 
+def test_view_shows_related_panel(client):
+    login(client, "admin")
+    create_doc(client, "ml.md", "# ML\n\nneural networks and deep learning trained on data")
+    create_doc(client, "ai.md", "# AI\n\ndeep learning and neural networks power modern AI")
+    r = client.get("/doc/ml.md")
+    assert r.status_code == 200
+    assert "관련 문서" in r.text
+    assert "/doc/ai.md" in r.text  # the semantically similar note is linked
+
+
 def test_csrf_token_required(client):
     login(client, "admin")
     # No token at all -> rejected.

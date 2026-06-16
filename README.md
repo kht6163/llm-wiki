@@ -67,6 +67,7 @@ uv run llm-wiki serve                                     # 웹 + MCP 동시 기
 - **사용자 관리**: `admin`은 `사용자` 메뉴에서 계정 추가/역할 변경/비밀번호 변경/삭제.
 - **깨진 링크**: `깨진 링크` 메뉴(`/broken-links`)에서 존재하지 않는 문서를 가리키는 위키링크/마크다운 링크를 출처 문서와 함께 목록으로 확인·정리.
 - **호버 미리보기**: 목록·검색 결과의 문서 제목에 마우스를 올리면 제목과 본문 앞부분 발췌가 팝오버로 표시됩니다.
+- **관련 문서**: 문서 뷰어 사이드바에 임베딩 벡터로 의미가 가까운 문서가 유사도(%)와 함께 표시됩니다(명시적 링크가 없어도 발견 가능). 아직 임베딩되지 않은 문서에서는 표시되지 않습니다.
 - **실시간 반영**: 문서를 보거나 편집하는 중에 다른 사용자/에이전트(웹 또는 MCP)가 그 문서를 바꾸면 WebSocket(`/ws`)으로 즉시 감지됩니다. 뷰어는 본문을 그 자리에서 다시 렌더링하고(토스트 알림), 에디터는 "다른 곳에서 변경됨, 지금 저장하면 충돌" 경고 배너를 띄웁니다(작성 중 내용은 보존). 삭제/이동도 배너로 안내합니다.
 
 ## MCP 사용 (LLM 연동)
@@ -85,6 +86,8 @@ uv run llm-wiki create-api-key --username admin --name my-agent
 | 툴 | 권한 | 설명 |
 |---|---|---|
 | `search_documents(query, mode, top_k, folder?, tags?)` | 읽기 | 하이브리드/BM25/벡터 검색. `count`+`truncated`(top_k 초과 가능성) 반환 |
+| `assemble_context(question, max_chars?, max_sources?, mode?, folder?, tags?)` | 읽기 | RAG 1-콜 프리미티브: 하이브리드 랭킹→문서별 최적 구절을 예산 내로 조립해 인용(`[n]`) 태깅된 `context`+`sources` 반환. `search`+`read` 왕복 대체 |
+| `get_related_documents(path, limit?)` | 읽기 | 임베딩상 의미가 가까운 문서(링크가 아닌 벡터 기준). `score`=코사인 유사도 |
 | `read_document(path, section?, max_chars?)` | 읽기 | 본문 + 현재 `version`. `section`은 헤딩 단위, `max_chars`는 길이 제한 |
 | `get_outline(path)` | 읽기 | 헤딩 목록 `{level, text, line}`(섹션 편집 대상 탐색) |
 | `list_documents(folder?, tag?, …)` | 읽기 | 문서 목록. `count`/`total`/`has_more`/`sort`로 페이징 |

@@ -137,6 +137,33 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                     "results": [r.to_dict() for r in results]}
         return await _call(ctx, fn, "search_documents")
 
+    @mcp.tool(description="Retrieve and assemble citation-tagged context for a question — a "
+                          "one-call RAG primitive. Ranks documents with the same hybrid "
+                          "retriever as search, then concatenates each top document's most "
+                          "relevant passage (in rank order) up to 'max_chars'/'max_sources'. "
+                          "Returns 'context' (assembled text with [n] markers), 'sources' (what "
+                          "each [n] cites: path, heading, version, score), and 'truncated' (more "
+                          "relevant content existed beyond the budget). Prefer this over "
+                          "search+read round-trips when you just need grounded context to answer. "
+                          "Rejects an empty question with code 'validation'.")
+    async def assemble_context(
+        ctx: Context,
+        question: str,
+        max_chars: Annotated[int, Field(ge=200, le=24000,
+                             description="Context character budget (200..24000).")] = 6000,
+        max_sources: Annotated[int, Field(ge=1, le=20,
+                              description="Max documents cited (1..20).")] = 8,
+        mode: Annotated[Literal["hybrid", "bm25", "vector"],
+                        Field(description="Ranking mode.")] = "hybrid",
+        folder: Annotated[str | None, Field(description="Restrict to this folder subtree.")] = None,
+        tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            return {"ok": True, **docs.assemble_context(
+                question, max_chars=max_chars, max_sources=max_sources,
+                mode=mode, folder=folder, tags=tags)}
+        return await _call(ctx, fn, "assemble_context")
+
     @mcp.tool(description="Read a document. The returned 'version' is the base_version you "
                           "echo back to update_document/patch_document. Pass 'section' to read "
                           "just one heading's subtree, or 'max_chars' to cap a long body "
@@ -216,6 +243,17 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     @mcp.tool(description="Documents that link TO this document (backlinks).")
     async def get_backlinks(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.backlinks(path)}, "get_backlinks")
+
+    @mcp.tool(description="Documents semantically similar to this one (nearest by embedding "
+                          "vectors, NOT by explicit links — complements get_backlinks/get_links "
+                          "for discovery). Each result has a cosine-similarity 'score' (higher = "
+                          "closer). Empty if the document has not been embedded yet.")
+    async def get_related_documents(
+        ctx: Context, path: str,
+        limit: Annotated[int, Field(ge=1, le=50, description="Max related docs (1..50).")] = 8,
+    ) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, **docs.related(path, limit=limit)},
+                           "get_related_documents")
 
     @mcp.tool(description="Revision history (versions, authors, timestamps) for a document, "
                           "newest first.")

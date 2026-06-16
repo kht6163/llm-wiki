@@ -64,6 +64,8 @@ mark { background: #fde68a; }
 .sidebar h3 { font-size: 0.9em; margin: 16px 0 6px; }
 .sidebar ul { list-style: none; padding: 0; margin: 0; }
 .sidebar li { padding: 2px 0; }
+.sidebar ul.related li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.sidebar .sim { color: var(--muted); font-size: 0.78em; font-variant-numeric: tabular-nums; flex: none; }
 
 .editform { display: flex; flex-direction: column; gap: 10px; }
 .editform label { display: flex; flex-direction: column; gap: 4px; font-size: 0.9em; }

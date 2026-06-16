@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import quote
 
-from .. import graph, indexing
+from .. import graph, indexing, search
 from ..db import Database
 from ..embedding import Embedder
 from ..markdown_utils import (
@@ -357,6 +357,30 @@ class DocumentService:
     def graph(self, root=None, depth=1, limit=500, include_unresolved=True) -> dict:
         with self.db.reader() as conn:
             return graph.build_graph(conn, root, depth, limit, include_unresolved)
+
+    def related(self, path: str, limit: int = 8) -> dict:
+        """Documents semantically similar to this one (via the shared chunk-vector
+        index). Empty list when the document has no embeddings yet."""
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.reader() as conn:
+            d = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
+            if not d:
+                raise NotFoundError("No document at this path.", path=rel)
+            items = search.related_documents(conn, d["id"], k=limit)
+        return {"path": rel, "related": items}
+
+    def assemble_context(self, question: str, *, max_chars: int = 6000,
+                         max_sources: int = 8, mode: str = "hybrid",
+                         folder: str | None = None, tags: list[str] | None = None) -> dict:
+        """Retrieve + assemble citation-tagged context for a question (RAG primitive)."""
+        if not question or not question.strip():
+            raise ValidationError("question must not be empty.")
+        return search.assemble_context(
+            self.db, self.embedder, question, max_chars=max_chars,
+            max_sources=max_sources, mode=mode, folder=folder, tags=tags)
 
     def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
         """Resolve a wikilink/markdown target to an existing document path, or None."""

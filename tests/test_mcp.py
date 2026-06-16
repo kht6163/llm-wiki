@@ -40,6 +40,7 @@ async def test_tools_registered(ctx):
         "search_documents", "read_document", "get_outline", "list_documents",
         "list_recent_changes", "list_broken_links", "get_tags", "get_links",
         "get_backlinks", "get_revisions", "get_revision", "get_graph",
+        "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
         "append_section", "patch_tags", "move_document", "delete_document",
     }
@@ -142,6 +143,37 @@ async def test_read_tools_e2e(editor_mcp):
     assert rv["ok"] and rv["revisions"]
     one = _payload(await mcp.call_tool("get_revision", {"path": "notes/a.md", "version": 1}))
     assert one["ok"] and "content" in one
+
+
+async def test_get_related_documents_tool(editor_mcp):
+    mcp = editor_mcp
+    _payload(await mcp.call_tool("create_document", {
+        "path": "ml.md", "content": "# ML\n\nneural networks and deep learning on data"}))
+    _payload(await mcp.call_tool("create_document", {
+        "path": "ai.md", "content": "# AI\n\ndeep learning and neural networks power AI"}))
+    _payload(await mcp.call_tool("create_document", {
+        "path": "cook.md", "content": "# Cook\n\nbake sourdough bread in a home oven"}))
+    rel = _payload(await mcp.call_tool("get_related_documents", {"path": "ml.md", "limit": 5}))
+    assert rel["ok"] and rel["path"] == "ml.md"
+    paths = [r["path"] for r in rel["related"]]
+    assert "ml.md" not in paths and "ai.md" in paths  # self excluded, neighbor surfaced
+
+
+async def test_assemble_context_tool(editor_mcp):
+    mcp = editor_mcp
+    _payload(await mcp.call_tool("create_document", {
+        "path": "geo.md", "content": "# Geo\n\nRivers carry water from mountains to the sea."}))
+    res = _payload(await mcp.call_tool(
+        "assemble_context", {"question": "where does river water go", "max_sources": 3}))
+    assert res["ok"] and res["count"] >= 1
+    assert res["sources"][0]["path"] == "geo.md"
+    assert res["context"].startswith("[1] geo.md")
+    assert "truncated" in res and "char_count" in res
+
+
+async def test_assemble_context_rejects_empty_question(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("assemble_context", {"question": "  "}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
 async def test_internal_error_returns_structured_envelope(ctx, principals, monkeypatch):
