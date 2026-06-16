@@ -186,6 +186,32 @@ def test_edit_page_uses_vendored_md_editor(client):
     assert client.get("/static/vendor/md-editor.bundle.css").status_code == 200
 
 
+def test_nested_path_edit_form_action_is_not_doubled(client):
+    # Regression: base.html highlights the active nav route. It must NOT bind that
+    # to a template variable named `path`, because child templates (edit/history/
+    # diff) receive a document `path` in their context and build URLs from it. A
+    # name collision shadowed it with request.url.path, producing a doubled action
+    # like `/doc//doc/foo/bar.md/edit/edit` -> 404 / "No document at this path."
+    login(client, "admin")
+    create_doc(client, "folder/sub/note.md", "# T\n\nbody")
+    html = client.get("/doc/folder/sub/note.md/edit").text
+    assert 'action="/doc/folder/sub/note.md/edit"' in html
+    assert 'data-path="folder/sub/note.md"' in html
+    assert "/doc//doc/" not in html  # no path doubling anywhere on the page
+
+    # And the round-trip actually saves (the symptom the user hit).
+    csrf = _token(client, "/doc/folder/sub/note.md/edit")
+    r = client.post(
+        "/doc/folder/sub/note.md/edit",
+        data={"content": "# T\n\n**bold** edit\n", "base_version": "1", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303 and r.headers["location"] == "/doc/folder/sub/note.md"
+    # history links for a nested path must not double either
+    hist = client.get("/doc/folder/sub/note.md/history").text
+    assert "/doc//doc/" not in hist
+
+
 def test_view_page_loads_code_highlighter(client):
     # The reading view colours code with the same vendored highlight.js as the
     # editor, so the bundle + scoped theme must be referenced and actually serve.
