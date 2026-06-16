@@ -36,7 +36,7 @@
         <a class="title" href="/doc/{{ d.path|urlpath }}">{{ d.title }}</a>
         <span class="path">{{ d.path }}</span>
         {% for t in d.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
-        <span class="meta">v{{ d.version }} · {{ d.updated_at }}</span>
+        <span class="meta">v{{ d.version }} · {{ d.updated_at|dt }}</span>
       </li>
       {% endfor %}
     </ul>

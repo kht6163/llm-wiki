@@ -34,7 +34,7 @@
           <button>{{ '활성' if u.is_active else '비활성' }}</button>
         </form>
       </td>
-      <td>{{ u.created_at }}</td>
+      <td>{{ u.created_at|dt }}</td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/password" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

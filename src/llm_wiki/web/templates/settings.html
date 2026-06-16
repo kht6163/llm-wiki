@@ -21,8 +21,8 @@
     <tr>
       <td>{{ k.name }}</td>
       <td><code>{{ k.key_prefix }}…</code></td>
-      <td>{{ k.created_at }}</td>
-      <td>{{ k.last_used_at or '—' }}</td>
+      <td>{{ k.created_at|dt }}</td>
+      <td>{% if k.last_used_at %}{{ k.last_used_at|dt }}{% else %}—{% endif %}</td>
       <td>{% if k.revoked_at %}<span class="muted">폐기됨</span>{% else %}활성{% endif %}</td>
       <td>{% if not k.revoked_at %}
         <form method="post" action="/settings/keys/{{ k.id }}/revoke" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">폐기</button></form>

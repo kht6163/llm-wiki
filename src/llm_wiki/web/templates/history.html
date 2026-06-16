@@ -11,7 +11,7 @@
       <td>v{{ r.version }}</td>
       <td>{{ r.op }}</td>
       <td>{{ r.author or '—' }}</td>
-      <td>{{ r.created_at }}</td>
+      <td>{{ r.created_at|dt }}</td>
       <td>
         <a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a>
         {% if r.version > 1 %}

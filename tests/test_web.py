@@ -198,6 +198,27 @@ def test_view_page_loads_code_highlighter(client):
     assert client.get("/static/vendor/hljs-theme.css").status_code == 200
 
 
+def test_timestamps_render_as_localizable_time_elements(client):
+    # Stored timestamps are UTC ISO ("…Z"); the `dt` filter wraps them in a
+    # <time> element (datetime=ISO, text=cleaned UTC fallback) that datetime.js
+    # localizes client-side. Verify the markup + that the localizer is loaded.
+    import re
+
+    login(client, "admin")
+    create_doc(client, "ts.md", "# T\n\nbody")
+    html = client.get("/doc/ts.md").text
+    m = re.search(
+        r'<time class="dt" datetime="(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)">'
+        r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})</time>",
+        html,
+    )
+    assert m, "view page should render updated_at as a localizable <time> element"
+    # the fallback text is the same instant with T/Z stripped (no timezone shift server-side)
+    assert m.group(2) == m.group(1)[:10] + " " + m.group(1)[11:19]
+    assert "/static/datetime.js" in html
+    assert client.get("/static/datetime.js").status_code == 200
+
+
 def test_security_headers_present(client):
     login(client, "admin")
     h = client.get("/").headers

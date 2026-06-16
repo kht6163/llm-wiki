@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import re
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -31,6 +32,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup
 from starlette.middleware.sessions import SessionMiddleware
 
 from ..markdown_render import render_markdown
@@ -100,6 +102,24 @@ def _diff_lines(a_text: str, b_text: str) -> list[dict]:
     return out
 
 
+_ISO_UTC_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z$")
+
+
+def _human_dt(value: object) -> object:
+    """Render a stored UTC ISO timestamp (``2026-06-16T00:44:33Z``) as a
+    ``<time>`` element that static/datetime.js localizes to the viewer's
+    timezone as ``YYYY-MM-DD HH:MM:SS``. Without JS it still shows the cleaned
+    UTC value; anything that isn't our exact ISO format passes through."""
+    if not value:
+        return value
+    s = str(value)
+    m = _ISO_UTC_RE.match(s)
+    if not m:
+        return value
+    utc_text = f"{m.group(1)} {m.group(2)}"
+    return Markup('<time class="dt" datetime="{}">{}</time>').format(s, utc_text)
+
+
 def create_web_app(app: AppContext) -> FastAPI:
     db, embedder, docs = app.db, app.embedder, app.docs
     templates = Jinja2Templates(directory=str(_HERE / "templates"))
@@ -107,6 +127,7 @@ def create_web_app(app: AppContext) -> FastAPI:
     # Search snippets carry FTS <mark> tags around raw document text; allow only
     # <mark> through so stored content can't inject HTML into the results page.
     templates.env.filters["snippet"] = lambda s: bleach.clean(s or "", tags=["mark"], strip=True)
+    templates.env.filters["dt"] = _human_dt
 
     # Cache-busting for static assets: append the file's mtime as ?v=… so a changed
     # CSS/JS file gets a fresh URL and the browser can't serve a stale copy (no more

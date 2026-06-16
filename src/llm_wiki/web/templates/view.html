@@ -22,7 +22,7 @@
     </div>
   </div>
   <div class="doc-meta">
-    <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at }}
+    <span class="path">{{ doc.path }}</span> · v{{ doc.version }} · 수정 {{ doc.updated_at|dt }}
     {% if doc.updated_by %} · {{ doc.updated_by }}{% endif %}
     {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
   </div>
