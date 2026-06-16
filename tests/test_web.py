@@ -186,6 +186,18 @@ def test_edit_page_uses_vendored_md_editor(client):
     assert client.get("/static/vendor/md-editor.bundle.css").status_code == 200
 
 
+def test_view_page_loads_code_highlighter(client):
+    # The reading view colours code with the same vendored highlight.js as the
+    # editor, so the bundle + scoped theme must be referenced and actually serve.
+    login(client, "admin")
+    create_doc(client, "hl.md", "# T\n\n```python\nx = 1\n```\n")
+    html = client.get("/doc/hl.md").text
+    assert "/static/vendor/hljs.bundle.js" in html
+    assert "/static/vendor/hljs-theme.css" in html
+    assert client.get("/static/vendor/hljs.bundle.js").status_code == 200
+    assert client.get("/static/vendor/hljs-theme.css").status_code == 200
+
+
 def test_security_headers_present(client):
     login(client, "admin")
     h = client.get("/").headers

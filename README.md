@@ -13,7 +13,7 @@
 - 🧭 **옵시디언풍 탐색** — 모든 페이지에 상시 좌측 **파일 트리**(폴더 접기/펼치기 + 현재 문서 auto-reveal), **빈 폴더 생성**(구조 먼저, 내용 나중), 트리 우클릭 컨텍스트 메뉴(새 문서/하위 폴더/이름변경·이동/삭제), 좌측 검색·태그 탭, 사이드바 접기·폭조절(localStorage 저장)
 - ⌨️ **키보드 워크플로** — **명령 팔레트**(Ctrl/⌘+P)·**퀵 스위처**(Ctrl/⌘+O, 없으면 새 문서 생성)·사이드바 토글(Ctrl/⌘+\\), 에디터 **Ctrl/⌘+S 저장**
 - ✍️ **에디터** — [md-editor-rt](https://github.com/imzbf/md-editor-rt)(React + CodeMirror 6) 기반 **좌우 분할 라이브 미리보기**·툴바·소스 문법강조·전체화면. **코드 블록 구문 강조**(highlight.js)와 **위키링크·콜아웃·`==하이라이트==`** 를 미리보기에 더해 실제 보기와 일치, 체크박스·이미지 드래그&드롭/붙여넣기 업로드, 라이트/다크 테마 동기화, 실시간 단어/문자 수(CJK 글자당 집계). 에디터는 단일 번들로 vendoring되어 **오프라인 동작**(외부 CDN 요청 0).
-- 📄 **마크다운 확장** — 옵시디언 **콜아웃**(`> [!info]` 등 타입별 색/아이콘), **체크박스 클릭 토글**(읽기 뷰에서 바로), `==하이라이트==`, 문서 **목차(아웃라인)** 우측 패널·헤딩 클릭 스크롤
+- 📄 **마크다운 확장** — 옵시디언 **콜아웃**(`> [!info]` 등 타입별 색/아이콘), **체크박스 클릭 토글**(읽기 뷰에서 바로), `==하이라이트==`, **코드 블록 구문 강조**(읽기 뷰도 에디터와 동일한 highlight.js·라이트/다크), 문서 **목차(아웃라인)** 우측 패널·헤딩 클릭 스크롤
 - 🎨 **편의 기능** — 라이트/다크 **테마 토글**(+OS 자동), 리비전 1‑클릭 롤백·diff 비교, 호버 미리보기, 관련 문서, 태그 색인, 검색 필터(폴더/태그/개수), 모바일 반응형(사이드바 오버레이), 원문(.md) 다운로드, 목록 정렬
 - 🔄 **실시간 반영** — WebSocket(`/ws`)으로 문서 변경을 즉시 감지. 뷰어는 본문 라이브 재렌더링, 에디터는 동시 편집 경고. 웹·MCP 어느 쪽 편집이든 반영(단일 프로세스 공유 이벤트 버스)
 - 🩺 **운영** — 스키마 마이그레이션(버전 가드), 구조화 로깅(+로테이션 파일) + 감사 로그(`audit_log`), `/healthz`·`/readyz` 헬스체크, Prometheus `/metrics`, 설정 검증(기동 전), 기동 시 모델 워밍
@@ -179,7 +179,7 @@ uv run mypy src/llm_wiki      # 타입 체크
 - **CJK 검색 참고**: FTS5는 `unicode61` 토크나이저라 공백으로 띄어쓴 한국어 산문은 정상 색인되지만, 공백 없는 합성어 내부 substring(또는 띄어쓰기 없는 CJK 언어)은 BM25 단독으로 못 찾을 수 있습니다. 이 경우 기본 **하이브리드** 모드의 의미(벡터) 검색이 보완합니다.
 - **구조**: `db.py`(스키마/연결) · `services/`(auth·documents·users·audit) · `search.py` · `graph.py` · `indexing.py` · `mcp_server.py` · `web/`(FastAPI+Jinja2, `/ws` 실시간) · `events.py`(인프로세스 변경 이벤트 버스) · `metrics.py`·`ratelimit.py`·`logconf.py`·`config.py` · `_cli_impl.py`.
 
-> 프런트엔드 서드파티 라이브러리는 모두 프로젝트에 포함(`src/llm_wiki/web/static/vendor/`)해 자체 서버(`/static/vendor/`)에서 제공하므로 **인터넷 없이 동작**합니다 — 그래프 시각화 Cytoscape.js(`cytoscape.min.js`)와 마크다운 에디터 번들(`md-editor.bundle.js`·`md-editor.bundle.css`). 에디터 번들은 `frontend/`(React + md-editor-rt + highlight.js)를 esbuild로 빌드한 결과물이며, 빌드 산출물을 커밋하므로 **런타임에는 Node가 필요 없습니다**. 에디터를 수정할 때만 빌드하세요:
+> 프런트엔드 서드파티 라이브러리는 모두 프로젝트에 포함(`src/llm_wiki/web/static/vendor/`)해 자체 서버(`/static/vendor/`)에서 제공하므로 **인터넷 없이 동작**합니다 — 그래프 시각화 Cytoscape.js(`cytoscape.min.js`), 마크다운 에디터 번들(`md-editor.bundle.js`·`md-editor.bundle.css`), 읽기 뷰 코드 강조(`hljs.bundle.js`·`hljs-theme.css`). 이들은 `frontend/`(React + md-editor-rt + highlight.js)를 esbuild로 빌드한 결과물이며, 빌드 산출물을 커밋하므로 **런타임에는 Node가 필요 없습니다**. 프런트엔드를 수정할 때만 빌드하세요:
 >
 > ```bash
 > cd frontend && npm install && npm run build   # -> web/static/vendor/md-editor.bundle.{js,css}
