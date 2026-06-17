@@ -420,7 +420,8 @@ class DocumentService:
             ).fetchone()
         return r is not None
 
-    def list_docs(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at") -> list[dict]:
+    def list_docs(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at",
+                  tags=None) -> list[dict]:
         sort_col = {"updated_at": "updated_at", "title": "title", "path": "path"}.get(sort, "updated_at")
         order = "DESC" if sort_col == "updated_at" else "ASC"
         # The correlated subquery resolves each row's latest-revision surface (the
@@ -435,9 +436,9 @@ class DocumentService:
             f = folder.strip("/")
             q += " AND (folder=? OR folder LIKE ?)"
             params += [f, f + "/%"]
-        if tag:
+        for t in self._tag_filter(tag, tags):
             q += " AND id IN (SELECT doc_id FROM tags WHERE tag=?)"
-            params.append(tag)
+            params.append(t)
         q += f" ORDER BY {sort_col} {order} LIMIT ? OFFSET ?"
         params += [clamp_int(limit, 1, 1000), max(0, int(offset))]
         out = []
@@ -452,7 +453,17 @@ class DocumentService:
                 })
         return out
 
-    def count(self, folder=None, tag=None) -> int:
+    @staticmethod
+    def _tag_filter(tag=None, tags=None) -> list[str]:
+        """Normalize the single ``tag`` and the multi ``tags`` arguments into one
+        de-duplicated, order-stable list of tags that must ALL be present (AND)."""
+        out: list[str] = []
+        for t in ([tag] if tag else []) + list(tags or []):
+            if t and t not in out:
+                out.append(t)
+        return out
+
+    def count(self, folder=None, tag=None, tags=None) -> int:
         """Total non-deleted documents matching the same folder/tag filters as list()."""
         q = "SELECT COUNT(*) FROM documents WHERE is_deleted=0"
         params: list = []
@@ -460,9 +471,9 @@ class DocumentService:
             f = folder.strip("/")
             q += " AND (folder=? OR folder LIKE ?)"
             params += [f, f + "/%"]
-        if tag:
+        for t in self._tag_filter(tag, tags):
             q += " AND id IN (SELECT doc_id FROM tags WHERE tag=?)"
-            params.append(tag)
+            params.append(t)
         with self.db.reader() as conn:
             return conn.execute(q, params).fetchone()[0]
 

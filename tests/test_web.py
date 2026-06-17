@@ -176,6 +176,31 @@ def test_optimistic_conflict_page(client):
         data={"content": "mine", "base_version": "0", "csrf_token": _token(client, "/doc/conf.md/edit")},
     )
     assert r.status_code == 409 and "충돌" in r.text
+    # C3: the conflict page offers a one-click "load current version" recovery affordance.
+    assert 'id="load-current"' in r.text and 'id="server-current"' in r.text
+
+
+def test_new_post_invalid_path_stays_on_form(client):
+    # C2: an invalid path is a field error -> re-render the editor with content preserved,
+    # not a bounce to the generic error page (which would lose the draft).
+    login(client, "admin")
+    r = client.post(
+        "/new",
+        data={"path": "../escape.md", "content": "my draft content", "title": "",
+              "csrf_token": _token(client, "/new")},
+    )
+    assert r.status_code == 400
+    assert "잘못된 경로" in r.text                 # inline field error
+    assert 'id="md-editor-mount"' in r.text       # still the editor form, not error.html
+    assert "my draft content" in r.text           # the draft is preserved
+
+
+def test_editor_has_unsaved_changes_guard(client):
+    # C1: editor.js guards Cancel / navigation when there are unsaved edits.
+    js = client.get("/static/editor.js").text
+    assert "beforeunload" in js
+    assert "cancel-edit" in js
+    assert "load-current" in js                   # C3 recovery wiring present too
 
 
 def test_restore_revision_route(client):

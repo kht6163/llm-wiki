@@ -11,7 +11,14 @@ and a full queue drops the event rather than blocking a write.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
+import time
+
+from .metrics import WS_EVENTS_DROPPED, WS_SUBSCRIBERS
+
+log = logging.getLogger("llm_wiki.events")
+_last_drop_log = 0.0  # monotonic time of the last throttled "queue full" warning
 
 
 class EventHub:
@@ -31,11 +38,13 @@ class EventHub:
         q: asyncio.Queue = asyncio.Queue(maxsize=self._max_queue)
         with self._lock:
             self._subs.add(q)
+            WS_SUBSCRIBERS.set(len(self._subs))
         return q
 
     def unsubscribe(self, q: asyncio.Queue) -> None:
         with self._lock:
             self._subs.discard(q)
+            WS_SUBSCRIBERS.set(len(self._subs))
 
     def subscriber_count(self) -> int:
         with self._lock:
@@ -61,5 +70,12 @@ class EventHub:
         try:
             q.put_nowait(event)
         except asyncio.QueueFull:
-            # A slow/stuck client must not stall the loop; drop the event for it.
-            pass
+            # A slow/stuck client must not stall the loop; drop the event for it. Count
+            # every drop (the rate is the real signal) and warn at most once per 5s so a
+            # wedged client can't flood the log.
+            global _last_drop_log
+            WS_EVENTS_DROPPED.inc()
+            now = time.monotonic()
+            if now - _last_drop_log > 5.0:
+                _last_drop_log = now
+                log.warning("realtime event dropped: a subscriber queue is full (slow client)")

@@ -57,8 +57,52 @@
   });
   count(textarea.value);
 
+  // ---- unsaved-changes guard ------------------------------------------
+  // Compare against the value the editor opened with, so leaving with edits in flight
+  // (Cancel link or browser navigation) warns instead of silently discarding them.
+  var initialValue = textarea.value;
+  var saving = false;
+  function isDirty() { return !saving && api.getValue() !== initialValue; }
+
   // Make sure the latest value reaches the form even if submit is triggered elsewhere.
-  form.addEventListener("submit", function () { textarea.value = api.getValue(); });
+  form.addEventListener("submit", function () {
+    saving = true;                       // a real save is not an accidental navigation
+    textarea.value = api.getValue();
+  });
+
+  window.addEventListener("beforeunload", function (e) {
+    if (isDirty()) { e.preventDefault(); e.returnValue = ""; }
+  });
+
+  var cancelLink = document.getElementById("cancel-edit");
+  if (cancelLink) {
+    cancelLink.addEventListener("click", function (e) {
+      if (isDirty() && !window.confirm("저장하지 않은 변경이 있습니다. 정말 나가시겠습니까?")) {
+        e.preventDefault();
+      }
+    });
+  }
+
+  // ---- conflict recovery: load the server's current content into the editor ----
+  // On a 409 the server renders its current body in #server-current; this lets the
+  // user pull it into the editor in one click (then reapply their change) instead of
+  // hand-copying out of a <pre>. Drive md-editor-rt's own CodeMirror view directly
+  // (a full-document replace) so its onChange mirrors back into the textarea/count.
+  var loadBtn = document.getElementById("load-current");
+  var serverPre = document.getElementById("server-current");
+  if (loadBtn && serverPre) {
+    loadBtn.addEventListener("click", function () {
+      var text = serverPre.textContent || "";
+      var view = api.getView();
+      if (view) {
+        view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+      }
+      textarea.value = text;
+      count(text);
+      initialValue = text;               // loading the server copy is the new baseline
+      toast("서버의 현재 내용을 불러왔습니다. 변경을 다시 적용하고 저장하세요.");
+    });
+  }
 
   // Mirror the app's light/dark toggle into the editor.
   new MutationObserver(function () {

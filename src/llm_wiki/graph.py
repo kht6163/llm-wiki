@@ -29,7 +29,12 @@ def _resolve(
         return row["id"] if row else None
     rows = conn.execute(
         "SELECT id, folder FROM documents WHERE is_deleted=0 AND "
-        "(path_norm = ? OR path_norm LIKE ? ESCAPE '\\')",
+        "(path_norm = ? OR path_norm LIKE ? ESCAPE '\\') "
+        # Deterministic tiebreaker when several folders hold the same basename and no
+        # same-folder match applies: shallowest folder first (root wins), then by path.
+        # Without ORDER BY, rows[0] is whatever order SQLite returns, which a VACUUM or
+        # a restore can change — making bare-name links resolve differently across runs.
+        "ORDER BY folder, path_norm",
         (dst_name + ".md", "%/" + _like_escape(dst_name) + ".md"),
     ).fetchall()
     if not rows:
@@ -85,12 +90,38 @@ def resolve_path(conn: sqlite3.Connection, target: str, src_folder: str = "") ->
 
 def backfill_links_for(conn: sqlite3.Connection, doc_id: int, doc_path_norm: str, doc_stem: str) -> None:
     """When a document is (re)created, resolve previously-dangling links that point
-    at it (by explicit path or by bare name)."""
+    at it. Explicit-path links match unambiguously. Bare-name links are re-resolved
+    against each link's OWN source folder so the same-folder-first rule still holds:
+    a blanket update would point a folder-local ``[[A]]`` at a new ``A.md`` in a
+    different folder, disagreeing with how ``store_links`` (via ``_resolve``) would
+    have resolved it live."""
+    # Explicit-path links: the path is unambiguous, so a direct match is safe.
     conn.execute(
-        "UPDATE links SET dst_doc_id=?, is_resolved=1 WHERE is_resolved=0 AND "
-        "((dst_is_path=1 AND dst_path_norm=?) OR (dst_is_path=0 AND dst_name=?))",
-        (doc_id, doc_path_norm, doc_stem),
+        "UPDATE links SET dst_doc_id=?, is_resolved=1 "
+        "WHERE is_resolved=0 AND dst_is_path=1 AND dst_path_norm=?",
+        (doc_id, doc_path_norm),
     )
+    # Bare-name links: re-resolve each through _resolve with its source folder, which
+    # applies same-folder-first + the deterministic tiebreaker over all current matches
+    # — so a backfilled target is identical to the live-resolved one. We re-resolve two
+    # sets: (a) still-dangling links, and (b) links whose source is in THIS doc's folder
+    # — a new same-folder note shadows whatever a folder-local ``[[name]]`` resolved to
+    # before, so those must repoint to it.
+    fr = conn.execute("SELECT folder FROM documents WHERE id=?", (doc_id,)).fetchone()
+    new_folder = fr["folder"] if fr else ""
+    rows = conn.execute(
+        "SELECT l.id AS link_id, d.folder AS src_folder FROM links l "
+        "JOIN documents d ON d.id=l.src_doc_id "
+        "WHERE l.dst_is_path=0 AND l.dst_name=? AND d.is_deleted=0 "
+        "AND (l.is_resolved=0 OR d.folder=?)",
+        (doc_stem, new_folder),
+    ).fetchall()
+    for r in rows:
+        rid = _resolve(conn, doc_stem + ".md", doc_stem, False, r["src_folder"])
+        conn.execute(
+            "UPDATE links SET dst_doc_id=?, is_resolved=? WHERE id=?",
+            (rid, 1 if rid is not None else 0, r["link_id"]),
+        )
 
 
 def unresolve_incoming(conn: sqlite3.Connection, doc_id: int) -> None:

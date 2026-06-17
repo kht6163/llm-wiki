@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import logging
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -71,6 +72,7 @@ from .security import (
 
 _HERE = Path(__file__).parent
 _UPLOAD_CHUNK = 64 * 1024
+log = logging.getLogger("llm_wiki.web")
 
 
 class _AuthRequired(Exception):
@@ -521,6 +523,12 @@ def create_web_app(app: AppContext) -> FastAPI:
                  title: str = Form(""), p: Principal = Depends(require_user)):
         try:
             doc = docs.create(p, path, content, title=title or None)
+        except PathError as e:
+            # Stay on the form with the typed content preserved (an invalid path is a
+            # field error, not a dead end) instead of bouncing to the global error page.
+            return render("edit.html", request, status=400, is_new=True, path=path,
+                          title=title, content=content, base_version=0, conflict=None,
+                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.folders())
         except WikiError as e:
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
@@ -548,6 +556,10 @@ def create_web_app(app: AppContext) -> FastAPI:
                           content=content, base_version=e.extra.get("current_version"),
                           conflict=e.extra, error=None, can_write=p.can_write,
                           conflict_diff=_diff_lines(content, e.extra.get("current_content") or ""))
+        except PathError as e:
+            return render("edit.html", request, status=400, is_new=False, path=path,
+                          title=title, content=content, base_version=base_version, conflict=None,
+                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write)
         except WikiError as e:
             return render("edit.html", request, status=e.http_status, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
@@ -740,6 +752,13 @@ def create_web_app(app: AppContext) -> FastAPI:
                 done, _ = await asyncio.wait({recv, getev}, return_when=asyncio.FIRST_COMPLETED)
                 if recv in done:
                     getev.cancel()
+                    # Retrieve the result so an unexpected receive failure (a network
+                    # error, not a clean disconnect) is logged rather than vanishing —
+                    # recv.cancel() in finally is a no-op on an already-done task and
+                    # would otherwise swallow it silently.
+                    exc = recv.exception()
+                    if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                        log.warning("websocket receive failed: %s", exc, exc_info=exc)
                     break  # any inbound frame/disconnect ends this read-only channel
                 await websocket.send_json(getev.result())
         except WebSocketDisconnect:

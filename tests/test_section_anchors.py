@@ -38,3 +38,28 @@ def test_search_result_carries_section_anchor(ctx, principals):
     assert hit.heading == "Networking"
     assert hit.heading_path == "Guide > Networking"
     assert hit.anchor == "networking"
+
+
+def test_bm25_mode_result_also_carries_section_anchor(ctx, principals):
+    # #7: a BM25-only hit used to lose its heading/anchor (the vector leg supplies it).
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "guide.md",
+                "# Guide\n\nintro\n\n## Networking\n\nconfigure the proxy and firewall settings\n")
+    results, _ = search_page(ctx.db, ctx.embedder, "proxy firewall", mode="bm25", top_k=5)
+    hit = next((r for r in results if r.path == "guide.md"), None)
+    assert hit is not None
+    assert hit.heading == "Networking"
+    assert hit.heading_path == "Guide > Networking"
+    assert hit.anchor == "networking"
+
+
+def test_search_result_carries_folder_and_tags(ctx, principals):
+    # B1: results expose folder + tags so an agent can group/filter without a follow-up read.
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "proj/spec.md", "# Spec\n\nproxy firewall details", tags=["release", "todo"])
+    results, _ = search_page(ctx.db, ctx.embedder, "proxy firewall", mode="hybrid", top_k=5)
+    hit = next((r for r in results if r.path == "proj/spec.md"), None)
+    assert hit is not None
+    assert hit.folder == "proj"
+    assert set(hit.tags or []) == {"release", "todo"}
+    assert "folder" in hit.to_dict() and "tags" in hit.to_dict()

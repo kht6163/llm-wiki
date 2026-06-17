@@ -19,8 +19,12 @@
   {% endif %}
   <details>
     <summary>서버의 현재 내용 보기</summary>
-    <pre>{{ conflict.current_content }}</pre>
+    <pre id="server-current">{{ conflict.current_content }}</pre>
   </details>
+  <p class="conflict-actions">
+    <button type="button" id="load-current">서버의 현재 내용을 편집기로 불러오기</button>
+    <span class="muted">불러온 뒤 내 변경을 다시 적용하고 저장하세요.</span>
+  </p>
 </div>
 {% endif %}
 <form method="post" action="{% if is_new %}/new{% else %}/doc/{{ path|urlpath }}/edit{% endif %}" class="editform"
@@ -42,7 +46,7 @@
   <div id="md-editor-mount"></div>
   <div class="form-actions">
     <button type="submit" class="primary" {% if not can_write %}disabled{% endif %}>저장</button>
-    {% if not is_new %}<a href="/doc/{{ path|urlpath }}">취소</a>{% endif %}
+    {% if not is_new %}<a href="/doc/{{ path|urlpath }}" id="cancel-edit">취소</a>{% endif %}
   </div>
   {% if not can_write %}<p class="muted">현재 역할은 읽기 전용이라 저장할 수 없습니다.</p>{% endif %}
 </form>

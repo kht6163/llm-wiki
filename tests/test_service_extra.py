@@ -49,6 +49,20 @@ def test_deleted_docs_excluded_from_count_and_tags(ctx, principals):
     assert all(t["tag"] != "z" for t in docs.tags())
 
 
+def test_list_and_count_require_all_tags(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "both.md", "body", tags=["release", "todo"])
+    docs.create(p, "one.md", "body", tags=["release"])
+    docs.create(p, "other.md", "body", tags=["todo"])
+    # Multi-tag is AND: only the doc carrying BOTH tags matches.
+    assert docs.count(tags=["release", "todo"]) == 1
+    paths = {d["path"] for d in docs.list_docs(tags=["release", "todo"])}
+    assert paths == {"both.md"}
+    # Single tag still works, and 'tag' + 'tags' combine (AND, de-duplicated).
+    assert docs.count(tag="release") == 2
+    assert docs.count(tag="release", tags=["todo"]) == 1
+
+
 # -- revision restore (the mechanism the web rollback route uses) ----------
 def test_restore_revision_writes_new_version(ctx, principals):
     docs, p = ctx.docs, principals["editor"]

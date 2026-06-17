@@ -47,6 +47,8 @@ class SearchResult:
     anchor: str | None = None         # heading slug for a #fragment deep-link
     chunk_ordinal: int | None = None  # ordinal of the matched chunk (None for BM25-only)
     chunk_id: int | None = None       # stable chunk id; feed to read_chunk for full passage
+    folder: str = ""                  # the document's folder, so callers can group/filter
+    tags: list[str] | None = None     # the document's tags, to avoid a follow-up read
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -196,6 +198,23 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     return scored, vec_info, match
 
 
+def _chunk_heading_for_tokens(conn, doc_id: int, q_tokens: list[str]) -> tuple[str | None, str | None]:
+    """(heading, heading_path) of the chunk where the query tokens most land — used to
+    give a BM25-only hit a section anchor (the vector leg, which normally supplies it,
+    didn't run for this doc). Mirrors RAG's passage selection."""
+    rows = conn.execute(
+        "SELECT ordinal, heading, heading_path, text FROM chunks WHERE doc_id=? ORDER BY ordinal",
+        (doc_id,),
+    ).fetchall()
+    if not rows:
+        return None, None
+    center = _best_token_chunk(rows, q_tokens)
+    for r in rows:
+        if r["ordinal"] == center:
+            return r["heading"], r["heading_path"]
+    return None, None
+
+
 def _passes_filters(d, folder: str | None, tags: list[str] | None, conn) -> bool:
     """Re-apply folder/tag filters to a vector-matched doc (the BM25 leg already
     filtered in SQL; the vec leg returns whatever the corpus held)."""
@@ -227,12 +246,14 @@ def search_page(
     top_k = clamp_int(top_k, 1, 50)
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
     k = max(top_k * params.candidate_factor, params.candidate_min)
+    q_tokens = [t.lower() for t in _TOKEN_RE.findall(query or "")]
 
     with db.reader() as conn:
         scored, vec_info, match = _rank(conn, embedder, query, mode=mode, k=k,
                                         folder=folder, tags=tags, params=params)
 
         results: list[SearchResult] = []
+        result_ids: list[int] = []
         for did, score in scored:
             d = conn.execute(
                 "SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id=?",
@@ -260,6 +281,11 @@ def search_page(
                 heading_path = vi["heading_path"]
                 if not snippet:
                     snippet = vi["text"][:240]
+            elif match:
+                # BM25-only hit (vector leg skipped, or this doc is unembedded): the
+                # section anchor would otherwise be None. Derive it from the chunk the
+                # query tokens land in, so deep-linking works in every search mode.
+                heading, heading_path = _chunk_heading_for_tokens(conn, did, q_tokens)
 
             results.append(SearchResult(
                 path=d["path"], title=d["title"] or d["path"],
@@ -268,9 +294,24 @@ def search_page(
                 anchor=heading_slug(heading) if heading else None,
                 chunk_ordinal=vi["ordinal"] if vi is not None else None,
                 chunk_id=vi["chunk_id"] if vi is not None else None,
+                folder=d["folder"] or "",
             ))
+            result_ids.append(did)
             if len(results) >= want:
                 break
+
+        # Batch-load tags for the page in one query (no per-result round-trip), so an
+        # agent can group/filter results without a follow-up read per hit.
+        if result_ids:
+            qmarks = ",".join("?" * len(result_ids))
+            tagmap: dict[int, list[str]] = {}
+            for trow in conn.execute(
+                f"SELECT doc_id, tag FROM tags WHERE doc_id IN ({qmarks}) ORDER BY tag",
+                result_ids,
+            ):
+                tagmap.setdefault(trow["doc_id"], []).append(trow["tag"])
+            for r, did in zip(results, result_ids, strict=True):
+                r.tags = tagmap.get(did, [])
     SEARCH_LATENCY.labels(mode).observe(time.perf_counter() - t0)
     return results[:top_k], len(results) > top_k
 

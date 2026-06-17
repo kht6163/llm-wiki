@@ -66,6 +66,33 @@ def test_snapshot_refuses_overwrite_without_force(tmp_path, monkeypatch):
     assert _cli_impl._snapshot(SimpleNamespace(out=str(tar), force=True)) == 0
 
 
+def test_backup_creates_valid_db_copy(tmp_path, monkeypatch):
+    import sqlite3
+    from types import SimpleNamespace as NS
+    src = _seed(_settings(tmp_path, "bkp"))
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: src)
+    out = tmp_path / "backup.db"
+    assert _cli_impl._backup(NS(out=str(out))) == 0
+    assert out.exists()
+    # The copy is a real, queryable SQLite database carrying the seeded doc.
+    conn = sqlite3.connect(str(out))
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0]
+    finally:
+        conn.close()
+    assert n == 1
+
+
+def test_backup_refuses_overwrite(tmp_path, monkeypatch):
+    from types import SimpleNamespace as NS
+    src = _seed(_settings(tmp_path, "bkp2"))
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: src)
+    out = tmp_path / "exists.db"
+    out.write_text("preexisting")
+    assert _cli_impl._backup(NS(out=str(out))) == 1   # won't clobber an existing file
+    assert out.read_text() == "preexisting"
+
+
 def test_restore_rejects_future_schema(tmp_path, monkeypatch):
     bad = tmp_path / "future.tar"
     with tarfile.open(bad, "w") as tar:

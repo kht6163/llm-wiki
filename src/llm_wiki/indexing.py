@@ -213,6 +213,12 @@ class EmbeddingWorker:
         self._wake.set()
         if self._thread.is_alive():
             self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                # An in-flight sweep outran the grace period; it's a daemon thread so
+                # the process can still exit, and anything left vector_dirty is embedded
+                # by the next startup sweep — but surface it so it isn't a silent stall.
+                log.warning("embedding worker still running after %.0fs; "
+                            "pending vectors will be re-embedded on next start", timeout)
 
     def _run(self) -> None:
         failures = 0

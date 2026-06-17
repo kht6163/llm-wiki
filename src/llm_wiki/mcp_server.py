@@ -269,21 +269,25 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda _p: {"ok": True, **docs.read_chunk(
             path, ordinal, before=before, after=after)}, "read_chunk")
 
-    @mcp.tool(description="List documents, optionally filtered by folder/tag. Returns 'count' "
+    @mcp.tool(description="List documents, optionally filtered by folder and tags. Returns 'count' "
                           "(this page), 'total' (all matches), 'has_more' for paging, and echoes "
-                          "'sort'/'offset'.")
+                          "'sort'/'offset'. Each item carries its folder and tags, so a tag/folder "
+                          "sweep needs no follow-up read. 'tags' requires ALL listed tags (AND).")
     async def list_documents(
         ctx: Context,
         folder: str | None = None,
-        tag: str | None = None,
+        tag: Annotated[str | None, Field(description="Single-tag filter (kept for convenience).")] = None,
+        tags: Annotated[list[str] | None,
+                        Field(description="Require ALL of these tags (AND); combine with 'tag'.")] = None,
         limit: Annotated[int, Field(ge=1, le=1000, description="Page size (1..1000).")] = 100,
         offset: Annotated[int, Field(ge=0, description="Paging offset.")] = 0,
         sort: Annotated[Literal["updated_at", "title", "path"],
                         Field(description="Sort order.")] = "updated_at",
     ) -> dict:
         def fn(_p: Principal) -> dict:
-            items = docs.list_docs(folder=folder, tag=tag, limit=limit, offset=offset, sort=sort)
-            total = docs.count(folder=folder, tag=tag)
+            items = docs.list_docs(folder=folder, tag=tag, tags=tags, limit=limit,
+                                   offset=offset, sort=sort)
+            total = docs.count(folder=folder, tag=tag, tags=tags)
             return {"ok": True, "count": len(items), "total": total, "offset": offset,
                     "sort": sort, "has_more": offset + len(items) < total, "documents": items}
         return await _call(ctx, fn, "list_documents")

@@ -8,6 +8,7 @@ import getpass
 import io
 import json
 import signal
+import sqlite3
 import tarfile
 import tempfile
 from pathlib import Path
@@ -343,8 +344,16 @@ def _backup(args) -> int:
         return 1
     # VACUUM INTO produces a transactionally-consistent snapshot even while WAL is
     # active — unlike a naive file copy, which can capture a torn .db + .db-wal.
-    with ctx.db.reader() as conn:
-        conn.execute("VACUUM INTO ?", (str(out),))
+    try:
+        with ctx.db.reader() as conn:
+            conn.execute("VACUUM INTO ?", (str(out),))
+    except sqlite3.OperationalError as e:
+        # Disk full / permission denied / I/O error: report it cleanly (not a raw
+        # traceback) and remove any partial file so a failed backup can't masquerade
+        # as a usable one.
+        out.unlink(missing_ok=True)
+        print(f"backup failed: {e}")
+        return 1
     print(f"Database backed up to {out}")
     print(f"NOTE: also back up the vault directory for a complete snapshot: {ctx.settings.vault_path}")
     print("      (or use 'llm-wiki snapshot' to capture DB + vault together)")
@@ -540,9 +549,11 @@ def _serve(args) -> int:
         asyncio.run(_serve_both(settings, web_app, mcp_app))
     finally:
         # Stop the embedder thread; anything still vector_dirty is embedded by the next
-        # startup sweep, so a bounded join can't lose vectors.
+        # startup sweep, so a bounded join can't lose vectors. Give it the operator's
+        # configured shutdown grace (not a hardcoded 10s) so a large in-flight sweep on
+        # a big vault has the same room as the rest of shutdown.
         if ctx.embed_worker is not None:
-            ctx.embed_worker.stop()
+            ctx.embed_worker.stop(timeout=settings.shutdown_grace_s)
     return 0
 
 

@@ -66,6 +66,16 @@ EMBED_WORKER_LAST_SUCCESS = Gauge(
     "llmwiki_embed_worker_last_success_timestamp_seconds",
     "Unix time of the last successful background embedding sweep.",
 )
+# Realtime stream health: a slow/stuck WebSocket client whose queue fills has its
+# events dropped (so it can't stall the loop). Silent drops mean a browser quietly
+# out-of-sync with the live document; these make that visible.
+WS_SUBSCRIBERS = Gauge(
+    "llmwiki_ws_subscribers", "Currently-connected realtime WebSocket subscribers.",
+)
+WS_EVENTS_DROPPED = Counter(
+    "llmwiki_ws_events_dropped_total",
+    "Realtime events dropped because a subscriber's queue was full.",
+)
 
 # Index/health gauges — point-in-time state, refreshed from the DB at scrape time
 # (and reused by /readyz). A growing vector_dirty backlog is a silent RAG-quality
