@@ -349,6 +349,25 @@ class Database:
                 )
         self.ensure_vector_table(embedding_dim)
 
+    def rebind_model(self, embedding_model: str, embedding_dim: int) -> None:
+        """Re-point the DB at a (possibly new) embedding model: drop and recreate the
+        vector table at the new dimension and update the ``meta`` binding. ``initialize``
+        deliberately *refuses* a model change (the vector dim is fixed once chosen); this
+        is the supported migration path, driven by ``reindex --reembed``. It only resets
+        the binding + (empty) vector storage — the caller MUST re-embed every document
+        afterwards (``reindex_all(reembed=True)``)."""
+        if embedding_dim <= 0:
+            raise ValueError("embedding dimension must be positive")
+        self.ensure_schema()
+        with self.writer() as conn:
+            conn.execute("DROP TABLE IF EXISTS chunk_vectors")
+            conn.execute(
+                f"CREATE VIRTUAL TABLE chunk_vectors USING vec0("
+                f"chunk_id INTEGER PRIMARY KEY, embedding float[{int(embedding_dim)}] distance_metric=cosine)"
+            )
+            set_meta(conn, "embedding_model", embedding_model)
+            set_meta(conn, "embedding_dim", str(embedding_dim))
+
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
     row = conn.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()

@@ -34,6 +34,7 @@
 <script src="{{ static('realtime.js') }}"></script>
 <script src="{{ static('outline.js') }}"></script>
 <script src="{{ static('tasks.js') }}"></script>
+<script src="{{ static('related.js') }}"></script>
 {% endblock %}
 
 {% block right %}
@@ -58,15 +59,7 @@
         {% else %}<span class="broken">{{ l.dst_name }} (없음)</span>{% endif %}
       </li>{% else %}<li class="muted">없음</li>{% endfor %}
     </ul>
-    {% if related %}
-    <h3>관련 문서</h3>
-    <ul class="rp-list related">
-      {% for r in related %}<li>
-        <a href="/doc/{{ r.path|urlpath }}">{{ r.title }}</a>
-        <span class="sim" title="유사도">{{ '%.0f'|format(r.score * 100) }}%</span>
-      </li>{% endfor %}
-    </ul>
-    {% endif %}
+    <div id="rp-related" class="rp-related" data-path="{{ doc.path }}"></div>
   </div>
 </div>
 {% endblock %}

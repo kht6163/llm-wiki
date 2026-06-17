@@ -621,13 +621,19 @@ def create_web_app(app: AppContext) -> FastAPI:
         html = render_markdown(doc["content"], doc["path"])
         backlinks = docs.backlinks(doc["path"])["backlinks"]
         outgoing = docs.links(doc["path"])["links"]
-        try:
-            related = docs.related(doc["path"], limit=6)["related"]
-        except WikiError:
-            related = []
         stats = word_count(doc["content"])
         return render("view.html", request, doc=doc, html=html, backlinks=backlinks,
-                      outgoing=outgoing, related=related, stats=stats)
+                      outgoing=outgoing, stats=stats)
+
+    @web.get("/api/doc/{path:path}/related")
+    def api_related(path: str, request: Request, _p: Principal = Depends(require_user)):
+        # "관련 문서" runs several KNN scans; serve it lazily (fetched after page load by
+        # related.js) so it stays off the synchronous critical path of the document view.
+        try:
+            related = docs.related(path, limit=6)["related"]
+        except WikiError:
+            related = []
+        return JSONResponse({"ok": True, "related": related})
 
     # ---- settings (per-user API keys) -----------------------------------
     @web.get("/settings", response_class=HTMLResponse)

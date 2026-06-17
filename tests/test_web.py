@@ -128,14 +128,22 @@ def test_page_wiki_error_renders_error_page(client):
     assert client.get("/admin/users").status_code == 200
 
 
-def test_view_shows_related_panel(client):
+def test_view_lazy_loads_related_panel(client):
     login(client, "admin")
     create_doc(client, "ml.md", "# ML\n\nneural networks and deep learning trained on data")
     create_doc(client, "ai.md", "# AI\n\ndeep learning and neural networks power modern AI")
+    # The view ships only the lazy-load placeholder + script — the "관련 문서" list is no
+    # longer server-rendered (it ran several KNN scans on the synchronous view path).
     r = client.get("/doc/ml.md")
     assert r.status_code == 200
-    assert "관련 문서" in r.text
-    assert "/doc/ai.md" in r.text  # the semantically similar note is linked
+    assert 'id="rp-related"' in r.text and "related.js" in r.text
+    assert "관련 문서" not in r.text  # heading is injected client-side now
+    # Related docs come from the dedicated endpoint instead.
+    rel = client.get("/api/doc/ml.md/related")
+    assert rel.status_code == 200
+    body = rel.json()
+    assert body["ok"] is True
+    assert "ai.md" in [x["path"] for x in body["related"]]  # the similar note surfaces
 
 
 def test_csrf_token_required(client):

@@ -151,6 +151,62 @@ def test_embed_pending_reembeds_crash_dirtied_docs(ctx, principals):
     assert dirty == 0 and nvec == len(cids)
 
 
+def test_rebind_model_recreates_vector_table_at_new_dim(ctx):
+    # rebind_model is the supported EMBEDDING_MODEL migration: it drops + recreates the
+    # vector table at the new dimension and updates the meta binding (initialize() refuses
+    # a model change to protect the fixed dim).
+    from llm_wiki.db import get_meta
+    from llm_wiki.embedding import Embedder
+
+    ctx.db.rebind_model("fake/other-model", 16)
+    with ctx.db.reader() as conn:
+        assert get_meta(conn, "embedding_model") == "fake/other-model"
+        assert get_meta(conn, "embedding_dim") == "16"
+    # Proof the table was recreated at dim 16: a 16-float vector inserts cleanly (on the
+    # original 384-dim table this would fail, so success means the rebind took effect).
+    with ctx.db.writer() as conn:
+        conn.execute("INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(1, ?)",
+                     (Embedder.serialize([0.1] * 16),))
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 1
+
+
+def test_reindex_reembed_after_rebind_repopulates_vectors(ctx, principals):
+    # The `reindex --reembed` flow rebinds the model (drops + recreates the vector table)
+    # then re-embeds every document. Simulate it here with the SAME model (no dim change):
+    # the re-embed must not crash and must repopulate chunk_vectors.
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "v.md", "# Vec\n\nsearchable 문서 본문 내용 here")
+    ctx.db.rebind_model(ctx.settings.embedding_model, ctx.embedder.dim)
+    with ctx.db.reader() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 0  # dropped
+    res = docs.reindex_all(reembed=True)
+    assert res["embedded"] >= 1
+    with ctx.db.reader() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] >= 1  # repopulated
+
+
+def test_initialize_refuses_model_change_but_rebind_recovers(ctx, principals):
+    # Regression: changing EMBEDDING_MODEL must have a WORKING recovery. The serve/init
+    # path (initialize) refuses a model change to protect the fixed vector dim — that's
+    # the crash an operator hit when following the docs before the rebind path existed.
+    # `reindex --reembed`'s rebind is the fix.
+    from llm_wiki.db import get_meta
+
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "doc.md", "# D\n\nbody content 본문")
+    # Simulate the DB having been bound to a DIFFERENT model previously.
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE meta SET v=? WHERE k='embedding_model'", ("prev/model",))
+    with pytest.raises(RuntimeError):
+        ctx.db.initialize(ctx.settings.embedding_model, ctx.embedder.dim)
+    # rebind + reembed recovers: the binding flips to the configured model and vectors rebuild.
+    ctx.db.rebind_model(ctx.settings.embedding_model, ctx.embedder.dim)
+    res = docs.reindex_all(reembed=True)
+    assert res["embedded"] >= 1
+    with ctx.db.reader() as conn:
+        assert get_meta(conn, "embedding_model") == ctx.settings.embedding_model
+
+
 @pytest.mark.parametrize("reembed", [False, True])
 def test_reindex_reembed_flag_runs(ctx, reembed):
     docs = ctx.docs

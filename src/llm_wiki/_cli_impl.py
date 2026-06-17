@@ -192,8 +192,25 @@ def _create_api_key(args) -> int:
 
 
 def _reindex(args) -> int:
-    ctx = build_context(full=True)
-    print("Reindexing vault…")
+    if args.reembed:
+        # --reembed is also the supported way to CHANGE the embedding model. The normal
+        # build (full=True) calls db.initialize(), which refuses a model change to protect
+        # the fixed vector dimension — so it would crash before we could re-embed. Build
+        # with full=False to skip that guard, then rebind: recreate the vector table at the
+        # current model's dimension and update the binding, before re-embedding every doc.
+        ctx = build_context(full=False)
+        with ctx.db.reader() as conn:
+            prev_model = get_meta(conn, "embedding_model")
+            prev_dim = get_meta(conn, "embedding_dim")
+        new_dim = ctx.embedder.dim  # loads the (possibly new) model
+        if prev_model and prev_model != ctx.settings.embedding_model:
+            print(f"Rebinding embedding model: {prev_model} (dim {prev_dim}) -> "
+                  f"{ctx.settings.embedding_model} (dim {new_dim})")
+        ctx.db.rebind_model(ctx.settings.embedding_model, new_dim)
+        print("Reindexing vault (re-embedding all documents)…")
+    else:
+        ctx = build_context(full=True)
+        print("Reindexing vault…")
     res = ctx.docs.reindex_all(reembed=args.reembed)
     print(f"created={res['created']} updated={res['updated']} renamed={res['renamed']} "
           f"unchanged={res['unchanged']} embedded={res['embedded']}")

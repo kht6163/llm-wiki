@@ -45,11 +45,12 @@ uv sync          # 의존성 설치 (torch는 CPU 전용 휠로 설치됨)
 | `EMBEDDING_MODEL` | 로컬 임베딩 모델 | `intfloat/multilingual-e5-base` |
 | `SESSION_SECRET` | 세션 쿠키 서명 키(비우면 자동 생성·DB 저장) | (자동) |
 | `COOKIE_SECURE` | 세션 쿠키 Secure(HTTPS 전용) 플래그. TLS 뒤에서는 `true` | `false` |
+| `FORWARDED_ALLOW_IPS` | 신뢰할 리버스 프록시 IP(쉼표 구분 또는 `*`). 프록시 뒤에서 실제 클라이언트 IP를 복원해 스로틀·감사가 정확해짐 | `127.0.0.1` |
 | `LOG_LEVEL` | 로그 레벨(DEBUG/INFO/WARNING/ERROR/CRITICAL) | `INFO` |
 | `LOG_FILE` | (선택) 크기 로테이션 로그 파일 경로. 비우면 stderr만 | (없음) |
 | `SHUTDOWN_GRACE_S` | 종료 시 진행 중 요청을 기다리는 최대 시간(초, 1–300). 오케스트레이터 kill grace 안에서 정상 종료 | `25` |
 
-> 임베딩 모델을 바꾸면 벡터 차원이 달라져 기동 시 거부됩니다. `uv run llm-wiki reindex --reembed`로 재임베딩하세요.
+> 임베딩 모델을 바꾸면 벡터 차원이 달라져 기동 시 거부됩니다. `uv run llm-wiki reindex --reembed`로 새 모델에 맞춰 벡터 인덱스를 재구성(rebind)하고 전체 재임베딩하세요 — 모델 교체의 지원 경로입니다.
 
 ## 초기화 & 실행
 
@@ -133,20 +134,46 @@ vault의 `.md` 파일을 외부 에디터로 직접 고쳤다면:
 
 ```bash
 uv run llm-wiki reindex            # mtime/해시 비교로 변경 화해(external-reconcile 리비전 기록)
-uv run llm-wiki reindex --reembed  # 임베딩 전체 재생성(모델 교체 시)
+uv run llm-wiki reindex --reembed  # 임베딩 전체 재생성(모델 교체 시 새 모델로 rebind 후 재임베딩)
 ```
+
+## 가져오기(import)
+
+기존 옵시디언 볼트나 마크다운 디렉터리를 한 번에 가져옵니다. 첨부 복사·링크 재작성·충돌 정책·드라이런을 지원합니다.
+
+```bash
+uv run llm-wiki import --from ~/Obsidian/MyVault --into notes --dry-run    # 계획만 출력(쓰기 없음)
+uv run llm-wiki import --from ~/Obsidian/MyVault --into notes \
+  --import-attachments --on-conflict rename                               # 실제 가져오기
+```
+
+`--on-conflict`(skip|overwrite|rename) · `--import-attachments`(이미지/첨부 복사 + 링크 재작성) · `--no-recurse` · `--no-embed`(나중에 `reindex --reembed`)를 지원합니다. `--on-conflict overwrite`는 파괴적이라 `--force`가 필요합니다.
 
 ## 백업 / 복원
 
-WAL이 켜진 상태에서 `.db` 파일을 단순 복사하면 손상된(torn) 스냅샷이 나올 수 있습니다.
-`backup` 명령은 `VACUUM INTO`로 트랜잭션 일관성이 보장된 온라인 스냅샷을 만듭니다.
+전체 백업은 **DB + vault + manifest**를 한 파일(`.tar`)로 묶는 `snapshot`을 권장합니다. `restore`는 manifest 검증(스키마 버전 확인)·경로 안전 검사·pending 문서 재투영을 자동으로 처리합니다.
 
 ```bash
-uv run llm-wiki backup --out backups/wiki-$(date +%F).db   # DB 일관 스냅샷
+uv run llm-wiki snapshot --out backups/wiki-$(date +%F).tar   # DB + vault + manifest 한 파일
+uv run llm-wiki restore  --in  backups/wiki-2026-06-17.tar    # 복원(대상이 비어있지 않으면 --force)
 ```
 
-완전한 백업은 **DB 스냅샷 + vault 디렉터리**를 함께 보관해야 합니다(본문은 vault의 `.md`에도 투영됨).
-복원은 스냅샷을 `DB_PATH`로, vault 백업을 `VAULT_PATH`로 되돌린 뒤 필요 시 `reindex`를 실행합니다.
+DB만 빠르게 백업하려면 `backup`을 씁니다(WAL 안전: `VACUUM INTO`로 트랜잭션 일관 스냅샷). 단 DB만으로는 불완전하니 vault도 함께 보관하세요.
+
+```bash
+uv run llm-wiki backup --out backups/wiki-$(date +%F).db      # DB만(빠른 일관 스냅샷)
+```
+
+### 정리(prune)
+
+리비전마다 전체 본문 스냅샷을 보관하고 감사 로그도 계속 쌓이므로 활성 볼트의 DB는 무한히 커집니다. `prune`으로 오래된 리비전·감사 로그를 정리하고 공간을 회수합니다(기본 드라이런, `--force`로 실제 실행).
+
+```bash
+uv run llm-wiki prune                                          # 드라이런(무엇이 지워질지 미리보기)
+uv run llm-wiki prune --keep 20 --older-than-days 90 --force   # 문서당 최신 20개 유지 + 90일↑ 감사 삭제 + VACUUM
+```
+
+> 리비전 정리는 되돌릴 수 없습니다(정리된 버전의 이력·diff·복원이 사라집니다). `--no-vacuum`으로 VACUUM을 건너뛸 수 있습니다.
 
 ## 도커로 실행
 
