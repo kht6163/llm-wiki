@@ -219,8 +219,10 @@ def create_web_app(app: AppContext) -> FastAPI:
         # page, so the navigation tree is a common context entry. Anonymous pages
         # (login/error before auth) skip the DB work.
         if p is not None:
-            ctx.setdefault("nav_tree", docs.tree())
-            ctx.setdefault("nav_tags", docs.tags()[:40])
+            # Cached (generation-invalidated on structural writes) — paid once per write,
+            # not per page. /tags and /api/tree still read canonical DB via tree()/tags().
+            ctx.setdefault("nav_tree", docs.nav_tree())
+            ctx.setdefault("nav_tags", docs.nav_tags())
         ctx.update(kw)
         return templates.TemplateResponse(request, name, ctx, status_code=status)
 
@@ -426,8 +428,9 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.get("/api/tree")
     def api_tree(request: Request, _p: Principal = Depends(require_user)):
         # Live tree payload so the sidebar can refresh after a folder/doc change
-        # without a full page reload.
-        return JSONResponse({"ok": True, "tree": docs.tree()})
+        # without a full page reload. Cached (invalidated on the same structural writes
+        # that triggered this refresh), so repeated refreshes don't re-scan the vault.
+        return JSONResponse({"ok": True, "tree": docs.nav_tree()})
 
     @web.post("/api/folders")
     def api_folder_create(request: Request, path: str = Form(...),

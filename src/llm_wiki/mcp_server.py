@@ -67,6 +67,26 @@ def _shape_write(result: dict, return_content: str) -> dict:
     return out
 
 
+def _shape_conflict(err: dict, return_content: str) -> dict:
+    """Trim the full ``current_content`` body from a 409 conflict envelope unless the
+    caller asked to keep it. On a lost CAS race an agent usually re-reads a section or
+    backs off (current_via tells it which) rather than diffing the whole note, so the
+    default ('metadata') drops the body and adds ``current_chars`` + ``content_omitted``
+    — token-cheap, especially across edit_documents sweeps. The decision-relevant fields
+    (current_version/current_title/current_via/updated_by/updated_at) are kept. Pass
+    return_content='full' to get current_content verbatim."""
+    if return_content == "full" or not isinstance(err, dict):
+        return err
+    e = err.get("error")
+    if not isinstance(e, dict) or e.get("code") != "conflict" or "current_content" not in e:
+        return err
+    body = e.get("current_content") or ""
+    trimmed = {k: v for k, v in e.items() if k != "current_content"}
+    trimmed["current_chars"] = len(body)
+    trimmed["content_omitted"] = True
+    return {**err, "error": trimmed}
+
+
 def create_mcp_server(app: AppContext) -> FastMCP:
     db, docs = app.db, app.docs
     mcp = FastMCP(name="llm-wiki", stateless_http=True, json_response=True)
@@ -82,7 +102,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             )
         return p
 
-    async def _call(ctx: Context, fn: Callable[[Principal], Any], tool: str = "?") -> dict:
+    async def _call(ctx: Context, fn: Callable[[Principal], Any], tool: str = "?",
+                    shape: Callable[[dict], dict] | None = None) -> dict:
         token = _bearer_token(ctx)
         ip_key = f"ip:{_client_ip(ctx)}"
 
@@ -116,10 +137,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 res = fn(principal)
                 if isinstance(res, dict) and res.get("ok") is False:
                     outcome = res.get("error", {}).get("code", "error")
+                    return shape(res) if shape else res
                 return res
             except WikiError as e:
                 outcome = e.code
-                return e.to_dict()
+                d = e.to_dict()
+                return shape(d) if shape else d
             except Exception:
                 # An unexpected error must still reach the agent as the structured
                 # envelope (not a raw protocol error), and the metric must reflect it.
@@ -398,10 +421,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         ctx: Context, path: str, content: str,
         title: str | None = None, tags: list[str] | None = None,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(
-            docs.create(p, path, content, title, tags), return_content)}, "create_document")
+            docs.create(p, path, content, title, tags), return_content)}, "create_document",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Replace a document's full body (editor/admin only; viewer gets "
                           "'forbidden'). base_version is REQUIRED; if it does not match the "
@@ -413,10 +438,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         ctx: Context, path: str, base_version: int, content: str,
         title: str | None = None, tags: list[str] | None = None,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.update(
-            p, path, base_version, content, title, tags), return_content)}, "update_document")
+            p, path, base_version, content, title, tags), return_content)}, "update_document",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Find-and-replace in a document (token-cheap edit; editor/admin only). "
                           "mode='literal' (default) matches a substring; mode='regex' matches a "
@@ -436,11 +463,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         occurrence: Annotated[int | None, Field(ge=1,
                               description="Replace only this 1-based match.")] = None,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.patch(
             p, path, find, replace, base_version=base_version, count=count,
-            mode=mode, occurrence=occurrence), return_content)}, "patch_document")
+            mode=mode, occurrence=occurrence), return_content)}, "patch_document",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Append a text block to a document (editor/admin only) — the natural "
                           "journaling primitive for logs/daily notes. With 'ensure_heading' the "
@@ -454,11 +483,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                   Field(description="Append under this heading (created if absent).")] = None,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_to_document(
             p, path, text, ensure_heading=ensure_heading, base_version=base_version),
-            return_content)}, "append_to_document")
+            return_content)}, "append_to_document",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Restore a past revision's content as a new edit (editor/admin only) — a "
                           "one-call server-side undo. The old body is loaded server-side (it never "
@@ -469,10 +500,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         ctx: Context, path: str, version: int,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.restore_revision(
-            p, path, version, base_version=base_version), return_content)}, "restore_revision")
+            p, path, version, base_version=base_version), return_content)}, "restore_revision",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Replace the body under a heading (the heading line is kept; "
                           "editor/admin only). Token-cheap; reads latest server-side. When several "
@@ -485,11 +518,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
         occurrence: Annotated[int, Field(ge=1, description="Target the Nth same-named heading.")] = 1,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.replace_section(
             p, path, heading, text, base_version=base_version, occurrence=occurrence),
-            return_content)}, "replace_section")
+            return_content)}, "replace_section",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Append text to the end of a heading's section (before the next "
                           "same/higher heading; editor/admin only). Token-cheap. When several "
@@ -501,11 +536,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
         occurrence: Annotated[int, Field(ge=1, description="Target the Nth same-named heading.")] = 1,
         return_content: Annotated[Literal["full", "metadata"],
-                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_section(
             p, path, heading, text, base_version=base_version, occurrence=occurrence),
-            return_content)}, "append_section")
+            return_content)}, "append_section",
+            shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Add and/or remove tags on a document without rewriting its body "
                           "(editor/admin only). Adjusts the frontmatter 'tags' list; returns the "
@@ -615,6 +652,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                               Field(description="Edit operations, applied in order.")],
         stop_on_error: Annotated[bool, Field(
             description="Stop at the first failing op (already-applied ops are kept).")] = True,
+        return_content: Annotated[Literal["full", "metadata"], Field(
+            description="On a per-op conflict, 'metadata' (default) omits the competing "
+                        "document's current_content (current_chars given) to keep sweep "
+                        "responses small; 'full' includes the body for each conflict.")] = "metadata",
     ) -> dict:
         def fn(principal: Principal) -> dict:
             if not principal.can_write:
@@ -637,7 +678,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                     results.append({"op": op, "path": res.get("path", path), "ok": True,
                                     "version": res.get("version")})
                 except WikiError as e:
-                    results.append({"op": op, "path": path, "ok": False, "error": e.to_dict()["error"]})
+                    shaped = _shape_conflict(e.to_dict(), return_content)
+                    results.append({"op": op, "path": path, "ok": False, "error": shaped["error"]})
                     if stop_on_error:
                         break
                 except Exception as e:  # bad op shape (missing field, unsafe path, …)

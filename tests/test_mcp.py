@@ -179,6 +179,10 @@ async def test_edit_documents_stop_on_error(editor_mcp):
     d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops}))
     assert d["applied"] == 1 and d["failed"] == 1 and d["stopped_early"] is True
     assert d["results"][1]["error"]["code"] == "conflict"
+    # Batch sweeps trim each conflict's body by default (headline token win); the op's
+    # decision fields remain, current_content is dropped for current_chars.
+    assert "current_content" not in d["results"][1]["error"]
+    assert d["results"][1]["error"]["content_omitted"] is True
 
 
 async def test_edit_documents_best_effort(editor_mcp):
@@ -241,6 +245,20 @@ async def test_update_conflict_envelope(editor_mcp):
     # The envelope names the COMPETING edit's surface so an agent can choose to back
     # off (human/web) vs rebase (agent/mcp). The create above came over mcp.
     assert d["error"]["current_via"] == "mcp"
+    # Default (metadata) omits the competing body to save agent tokens; current_chars +
+    # content_omitted replace current_content, while the decision fields stay.
+    assert "current_content" not in d["error"]
+    assert d["error"]["content_omitted"] is True
+    assert isinstance(d["error"]["current_chars"], int)
+
+
+async def test_update_conflict_full_includes_body(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "cf.md", "content": "v1 body"}))
+    d = _payload(await editor_mcp.call_tool(
+        "update_document",
+        {"path": "cf.md", "base_version": 0, "content": "v2", "return_content": "full"}))
+    assert d["ok"] is False and d["error"]["code"] == "conflict"
+    assert "current_content" in d["error"] and "content_omitted" not in d["error"]
 
 
 async def test_section_base_version_conflict_via_tool(editor_mcp):

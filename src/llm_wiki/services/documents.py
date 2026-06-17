@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -189,6 +190,13 @@ class DocumentService:
         # slow embedding forward pass runs off the request path. None (tests/CLI) -> embed
         # inline so a write is immediately visible to vector search.
         self.embed_worker = embed_worker
+        # Sidebar nav cache (file tree + top tags), invalidated via a generation counter
+        # bumped on every structural write. See nav_tree()/nav_tags()/_bump_nav().
+        self._nav_lock = threading.Lock()
+        self._nav_gen = 0
+        self._nav_cache_gen = -1
+        self._nav_tree: dict | None = None
+        self._nav_tags: list[dict] | None = None
 
     # ---- helpers --------------------------------------------------------
     def _emit(self, op: str, path: str, version: int, **extra) -> None:
@@ -581,6 +589,7 @@ class DocumentService:
             audit.record(conn, actor=principal.username, via=principal.via,
                          action="folder_create", target=rel)
         safe_join(self.vault, rel).mkdir(parents=True, exist_ok=True)
+        self._bump_nav()
         return {"ok": True, "path": rel}
 
     def delete_folder(self, principal: Principal, path: str) -> dict:
@@ -615,6 +624,7 @@ class DocumentService:
                         os.rmdir(root_)
                     except OSError:
                         pass
+        self._bump_nav()
         return {"ok": True, "path": rel, "deleted": True}
 
     def attachment_file(self, subpath: str) -> Path:
@@ -634,6 +644,45 @@ class DocumentService:
                 "GROUP BY t.tag ORDER BY count DESC, t.tag ASC"
             ).fetchall()
         return [{"tag": r["tag"], "count": r["count"]} for r in rows]
+
+    # ---- sidebar nav cache ----------------------------------------------
+    # render() builds the file tree + top-tag list on EVERY authenticated page; both are
+    # full scans. Cache a snapshot keyed to a generation counter bumped on each structural
+    # write, so the scan is paid once per write instead of once per page (also speeds the
+    # /api/tree live-refresh shell.js fires after every mutation). The public tree()/tags()
+    # stay uncached so /tags and /api/tree always read canonical DB. Thread-safe: web + MCP
+    # share one DocumentService across threads.
+    def _bump_nav(self) -> None:
+        with self._nav_lock:
+            self._nav_gen += 1
+
+    def _top_tags(self, n: int) -> list[dict]:
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT t.tag AS tag, COUNT(*) AS count FROM tags t "
+                "JOIN documents d ON d.id=t.doc_id WHERE d.is_deleted=0 "
+                "GROUP BY t.tag ORDER BY count DESC, t.tag ASC LIMIT ?", (n,)
+            ).fetchall()
+        return [{"tag": r["tag"], "count": r["count"]} for r in rows]
+
+    def _ensure_nav(self) -> None:
+        with self._nav_lock:
+            if self._nav_cache_gen != self._nav_gen or self._nav_tree is None:
+                self._nav_tree = self.tree()
+                self._nav_tags = self._top_tags(40)
+                self._nav_cache_gen = self._nav_gen
+
+    def nav_tree(self) -> dict:
+        """Cached sidebar file tree (rebuilt lazily after a structural write)."""
+        self._ensure_nav()
+        assert self._nav_tree is not None
+        return self._nav_tree
+
+    def nav_tags(self) -> list[dict]:
+        """Cached sidebar top-40 tag list (rebuilt lazily after a structural write)."""
+        self._ensure_nav()
+        assert self._nav_tags is not None
+        return self._nav_tags
 
     def revisions(self, path: str, limit: int = 100) -> dict:
         rel = normalize_rel_path(path)
@@ -794,6 +843,7 @@ class DocumentService:
         DOC_WRITES.labels("create").inc()
         self._emit("create", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via)
+        self._bump_nav()
         return self.get(rel)
 
     def update(self, principal: Principal, path: str, base_version: int | None, content: str,
@@ -855,6 +905,7 @@ class DocumentService:
         self._emit("update", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via,
                    content_changed=content_changed)
+        self._bump_nav()
         return self.get(rel)
 
     # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
@@ -1116,6 +1167,7 @@ class DocumentService:
             # Re-resolution above fixed the GRAPH, but bodies still contain the old
             # link text; rewrite those so the references don't show up broken.
             result = {**result, "references": self.rename_references(principal, rel, new_rel)}
+        self._bump_nav()
         return result
 
     def rename_references(self, principal: Principal, old_path: str, new_path: str) -> dict:
@@ -1239,6 +1291,7 @@ class DocumentService:
         DOC_WRITES.labels("delete").inc()
         self._emit("delete", rel, new_version,
                    updated_by=principal.username, via=principal.via)
+        self._bump_nav()
         return {"ok": True, "path": rel, "deleted": True}
 
     def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
@@ -1458,6 +1511,7 @@ class DocumentService:
         log.info("reindex: created=%d updated=%d renamed=%d unchanged=%d skipped_deleted=%d "
                  "missing_files=%d embedded=%d", created, updated, renamed, unchanged,
                  len(skipped_deleted), len(missing), embedded)
+        self._bump_nav()
         return {"created": created, "updated": updated, "renamed": renamed,
                 "renames": renames, "unchanged": unchanged,
                 "missing_files": missing, "skipped_deleted": skipped_deleted,
