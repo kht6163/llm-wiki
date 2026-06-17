@@ -289,9 +289,16 @@ def create_web_app(app: AppContext) -> FastAPI:
                           error="Too many attempts. Please wait a few minutes and try again.")
         p = authenticate(db, username, password)
         if not p:
-            login_limiter.record_failure(ip_key)
+            just_blocked = login_limiter.record_failure(ip_key)
             audit.record_tx(db, actor=uname or "-", via="web", action="login_failed",
                             target=None, outcome="error", detail=f"ip={ip}")
+            if just_blocked:
+                # The failure that just crossed the throttle threshold — record one
+                # block event (subsequent attempts short-circuit at the allowed() gate
+                # above without re-auditing) so a brute-force surfaces in the admin feed
+                # instead of leaving only a wall of identical login_failed rows.
+                audit.record_tx(db, actor=uname or "-", via="web", action="login_blocked",
+                                target=None, outcome="blocked", detail=f"ip={ip}")
             return render("login.html", request, status=401, error="Invalid username or password.")
         login_limiter.reset(ip_key)
         audit.record_tx(db, actor=p.username, via="web", action="login", detail=f"ip={ip}")

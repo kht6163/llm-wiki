@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     search_candidate_min: int = 40
     search_vector_factor: int = 3
     search_vector_cap: int = 600
+    # Lightweight reranking layered on RRF (in RRF-score units, ≈1/rrf_k). Title boosts
+    # lift a doc whose title exactly/prefix-matches the query; proximity rewards a close
+    # vector hit (0 = off). Defaults nudge exact-title matches without scrambling results.
+    search_title_exact_boost: float = 0.05
+    search_title_prefix_boost: float = 0.015
+    search_proximity_weight: float = 0.0
 
     # Web session signing secret (empty -> generated and persisted in DB meta)
     session_secret: str = ""
@@ -54,6 +60,15 @@ class Settings(BaseSettings):
     # Mark the session cookie Secure (HTTPS-only). Keep False for local http;
     # set COOKIE_SECURE=true when serving behind TLS / a reverse proxy.
     cookie_secure: bool = False
+
+    # Reverse-proxy trust for X-Forwarded-For/-Proto (uvicorn `forwarded_allow_ips`).
+    # Behind a proxy this MUST name the proxy's address so per-client login/MCP
+    # throttling and audit logs see the real client IP — otherwise every client
+    # collapses to the proxy's IP (one shared rate-limit bucket = self-inflicted
+    # lockout, and an untraceable trail). "*" trusts every immediate peer (only safe
+    # when nothing untrusted can reach the port directly); "" disables the headers.
+    # Default "127.0.0.1" matches a same-host proxy.
+    forwarded_allow_ips: str = "127.0.0.1"
 
     # Application log level (DEBUG/INFO/WARNING/ERROR/CRITICAL).
     log_level: str = "INFO"
@@ -110,6 +125,14 @@ class Settings(BaseSettings):
         if not (lo <= int(v) <= hi):
             raise ValueError(f"{info.field_name} must be between {lo} and {hi} (got {v})")
         return int(v)
+
+    @field_validator("search_title_exact_boost", "search_title_prefix_boost",
+                     "search_proximity_weight")
+    @classmethod
+    def _rerank_weight_in_range(cls, v: float, info) -> float:
+        if not (0.0 <= float(v) <= 10.0):
+            raise ValueError(f"{info.field_name} must be between 0.0 and 10.0 (got {v})")
+        return float(v)
 
     @model_validator(mode="after")
     def _distinct_ports(self) -> Settings:

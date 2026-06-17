@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_icons.html" import icon %}
 {% block title %}검색{% endblock %}
 {% block content %}
 <h1>검색</h1>
@@ -19,6 +20,7 @@
   <button class="primary">검색</button>
 </form>
 {% if q %}<p class="muted" role="status">{{ results|length }}건{% if truncated %} · 상위 {{ top_k }}개까지 표시(더 보려면 결과 수를 늘리세요){% endif %}</p>{% endif %}
+{% if results %}
 <ul class="results">
   {% for r in results %}
     <li>
@@ -31,9 +33,14 @@
         <div class="muted">↳ <a href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.heading_path or r.heading }}</a></div>
       {% endif %}
     </li>
-  {% else %}
-    {% if q %}<li class="muted">결과 없음</li>{% endif %}
   {% endfor %}
 </ul>
+{% elif q %}
+<div class="empty-state">
+  <span class="empty-icon">{{ icon("search-x") }}</span>
+  <p class="empty-title">검색 결과가 없습니다</p>
+  <p class="empty-text">‘{{ q }}’에 맞는 문서를 찾지 못했습니다. 다른 검색어를 쓰거나 검색 방식(하이브리드·BM25·벡터)을 바꿔 보세요.</p>
+</div>
+{% endif %}
 <script src="{{ static('preview.js') }}"></script>
 {% endblock %}

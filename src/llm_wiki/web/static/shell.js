@@ -356,18 +356,24 @@
     inp.addEventListener("input", function () {
       clearTimeout(t);
       var q = inp.value.trim();
-      if (!q) { out.innerHTML = ""; return; }
+      if (!q) { out.innerHTML = ""; out.removeAttribute("aria-busy"); return; }
+      out.innerHTML = '<p class="muted is-loading">검색 중…</p>';   // immediate feedback
+      out.setAttribute("aria-busy", "true");
       t = setTimeout(function () {
         fetch("/api/complete?q=" + encodeURIComponent(q), { credentials: "same-origin" })
           .then(function (r) { return r.json(); })
           .then(function (d) {
-            if (!d || !d.ok) return;
+            if (inp.value.trim() !== q) return;          // a newer keystroke owns the panel
+            out.removeAttribute("aria-busy");
+            if (!d || !d.ok) { out.innerHTML = '<p class="muted">결과 없음</p>'; return; }
             out.innerHTML = d.items.map(function (it) {
               return '<a class="sb-result" href="/doc/' + enc(it.path) + '">' +
                 '<span class="sr-title">' + esc(it.title) + '</span>' +
                 '<span class="sr-path muted">' + esc(it.path) + '</span></a>';
             }).join("") || '<p class="muted">결과 없음</p>';
-          }).catch(function () {});
+          }).catch(function () {
+            if (inp.value.trim() === q) { out.removeAttribute("aria-busy"); out.innerHTML = '<p class="muted">검색 실패</p>'; }
+          });
       }, 150);
     });
   }

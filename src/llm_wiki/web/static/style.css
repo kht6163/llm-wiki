@@ -382,6 +382,25 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
 .doc-popover .dp-title { font-weight: 600; margin-bottom: 4px; }
 .doc-popover .dp-excerpt { color: var(--muted); line-height: 1.5; }
 
+/* Empty states — a quiet, centered block (line icon + heading + one line of
+   guidance + optional CTA). No emoji; the icon comes from the same monochrome
+   system as the rest of the chrome, kept faint so it orients without shouting. */
+.empty-state {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  gap: 8px; padding: 52px 20px; color: var(--fg-muted);
+}
+.empty-state .empty-icon { color: var(--fg-faint); line-height: 0; }
+.empty-state .empty-icon svg { width: 30px; height: 30px; }
+.empty-state .empty-title { font-weight: 600; color: var(--fg); font-size: 1.02em; }
+.empty-state .empty-text { font-size: 0.9em; max-width: 44ch; line-height: 1.55; }
+.empty-state .empty-actions { margin-top: 6px; }
+
+/* In-flight feedback. A calm opacity pulse (no spinner glyph) signals a pending
+   fetch — for the palette/sidebar "검색 중…" line and the hover-preview placeholder.
+   reduced-motion holds it steady (the global rule collapses the animation). */
+@keyframes wiki-pulse { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+.is-loading { animation: wiki-pulse 1.2s var(--ease) infinite; }
+
 /* Broken-links report table. */
 .broken { width: 100%; border-collapse: collapse; font-size: 0.9em; }
 .broken th, .broken td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
@@ -568,7 +587,12 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .main-topbar .searchbox { flex: 0 1 420px; }
 .main-topbar .searchbox input { width: 100%; min-width: 0; }
 .topbar-spacer { flex: 1; }
-.main-col main { max-width: none; margin: 0; padding: 22px 28px 48px; overflow: auto; flex: 1; }
+/* Utility pages (list/search/history/settings/admin…) get a comfortable measure
+   cap so they don't stretch edge-to-edge on ultrawide displays; the reading view
+   self-caps at 74ch (.rendered). Full-bleed surfaces — the graph canvas and the
+   markdown editor — opt out via :has() and reclaim the whole column. */
+.main-col main { max-width: 1120px; margin: 0; padding: 22px 28px 48px; overflow: auto; flex: 1; }
+.main-col main:has(#cy), .main-col main:has(#md-editor-mount) { max-width: none; }
 .main-col .flash { max-width: none; margin: 10px 16px 0; }
 
 /* right panel */

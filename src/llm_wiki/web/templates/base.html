@@ -121,8 +121,10 @@
 
 <div class="cmd-overlay" id="cmd-overlay" hidden>
   <div class="cmd-modal" role="dialog" aria-modal="true" aria-label="명령 팔레트">
-    <input type="text" class="cmd-input" id="cmd-input" autocomplete="off" spellcheck="false" aria-label="명령 또는 문서 검색">
-    <ul class="cmd-list" id="cmd-list" role="listbox"></ul>
+    <input type="text" class="cmd-input" id="cmd-input" autocomplete="off" spellcheck="false"
+           role="combobox" aria-expanded="false" aria-controls="cmd-list" aria-autocomplete="list"
+           aria-label="명령 또는 문서 검색">
+    <ul class="cmd-list" id="cmd-list" role="listbox" aria-label="결과"></ul>
     <div class="cmd-hint muted">↑↓ 이동 · Enter 실행 · Esc 닫기</div>
   </div>
 </div>

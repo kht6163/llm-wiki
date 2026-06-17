@@ -525,10 +525,16 @@ async def _serve_both(settings, web_app, mcp_app) -> None:
     # would escalate to SIGKILL and risk a torn WAL. A second signal forces an
     # immediate exit.
     grace = settings.shutdown_grace_s
+    # Honor X-Forwarded-For/-Proto only from the configured proxy addresses, so the
+    # app sees the real client IP (rate-limit keys + audit) and correct scheme behind
+    # a reverse proxy. forwarded_allow_ips defaults to the same-host proxy ("127.0.0.1").
+    fwd = settings.forwarded_allow_ips
     web_cfg = uvicorn.Config(web_app, host=settings.host, port=settings.gui_port,
-                             log_level="info", timeout_graceful_shutdown=grace)
+                             log_level="info", timeout_graceful_shutdown=grace,
+                             proxy_headers=True, forwarded_allow_ips=fwd)
     mcp_cfg = uvicorn.Config(mcp_app, host=settings.host, port=settings.mcp_port,
-                             log_level="info", timeout_graceful_shutdown=grace)
+                             log_level="info", timeout_graceful_shutdown=grace,
+                             proxy_headers=True, forwarded_allow_ips=fwd)
     servers = [uvicorn.Server(web_cfg), uvicorn.Server(mcp_cfg)]
     for s in servers:
         s.install_signal_handlers = lambda: None  # type: ignore[attr-defined]  # we manage signals for both at once

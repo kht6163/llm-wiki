@@ -9,7 +9,7 @@ import pytest
 
 from llm_wiki.config import Settings
 from llm_wiki.runtime import build_context
-from llm_wiki.search import DEFAULT_FUSION, FusionParams, search_page
+from llm_wiki.search import DEFAULT_FUSION, FusionParams, _rerank_boost, search_page
 
 TEST_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -66,3 +66,60 @@ def test_module_search_page_accepts_custom_fusion_params(ctx, principals):
     fp = FusionParams(rrf_k=5, candidate_factor=2, candidate_min=10, vector_factor=2, vector_cap=50)
     res, _ = search_page(ctx.db, ctx.embedder, "apple", mode="hybrid", top_k=3, params=fp)
     assert any(r.path == "a.md" for r in res)
+
+
+# -- lightweight reranking ------------------------------------------------------
+
+def test_fusion_rerank_defaults():
+    # Title boosts are on by default (exact > prefix); proximity is opt-in (0).
+    assert DEFAULT_FUSION.title_exact_boost == 0.05
+    assert DEFAULT_FUSION.title_prefix_boost == 0.015
+    assert DEFAULT_FUSION.proximity_weight == 0.0
+
+
+def test_rerank_boost_rewards_exact_then_prefix_then_nothing():
+    p = DEFAULT_FUSION
+    assert _rerank_boost("Rate Limiter", None, "rate limiter", p) == p.title_exact_boost
+    assert _rerank_boost("Rate Limiter Design", None, "rate limiter", p) == p.title_prefix_boost
+    assert _rerank_boost("Unrelated Note", None, "rate limiter", p) == 0.0
+    assert _rerank_boost("Anything", None, "", p) == 0.0          # empty query never boosts
+    # Proximity is off by default even with a close vector hit...
+    assert _rerank_boost("x", {"distance": 0.1}, "q", p) == 0.0
+    # ...and when enabled adds weight * cosine-similarity (1 - distance).
+    pp = FusionParams(title_exact_boost=0.0, title_prefix_boost=0.0, proximity_weight=0.2)
+    assert _rerank_boost(None, {"distance": 0.25}, "q", pp) == pytest.approx(0.2 * 0.75)
+
+
+def test_exact_title_match_is_reranked_to_the_top(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    # guide.md matches the query only via its title; notes.md matches heavily in the body
+    # and so out-ranks guide on pure BM25/RRF.
+    docs.create(p, "guide.md", "# Apple\n\nA short fruit guide with no other terms.")
+    docs.create(p, "notes.md", "# Notes\n\napple apple apple apple apple apple orchard")
+    off = FusionParams(title_exact_boost=0.0, title_prefix_boost=0.0)  # pure rank-only RRF
+    off_res, _ = search_page(ctx.db, ctx.embedder, "apple", mode="bm25", top_k=5, params=off)
+    on_res, _ = search_page(ctx.db, ctx.embedder, "apple", mode="bm25", top_k=5, params=DEFAULT_FUSION)
+    off_score = {r.path: r.score for r in off_res}
+    on_score = {r.path: r.score for r in on_res}
+    # The exact-title doc gains exactly the boost; the body-only doc is unchanged...
+    assert on_score["guide.md"] == pytest.approx(off_score["guide.md"] + DEFAULT_FUSION.title_exact_boost)
+    assert on_score["notes.md"] == pytest.approx(off_score["notes.md"])
+    # ...which lifts it to the top under the default reranking.
+    assert on_res[0].path == "guide.md"
+
+
+def test_settings_rejects_out_of_range_rerank_weights():
+    for field, bad in (("search_title_exact_boost", -0.1), ("search_title_exact_boost", 11.0),
+                       ("search_proximity_weight", -1.0)):
+        with pytest.raises(pydantic.ValidationError):
+            Settings(_env_file=None, session_secret="x", **{field: bad})
+
+
+def test_build_context_threads_rerank_knobs(tmp_path):
+    s = Settings(
+        _env_file=None, vault_path=tmp_path / "v", db_path=tmp_path / "d" / "wiki.db",
+        embedding_model=TEST_MODEL, gui_port=8092, mcp_port=8093, session_secret="x",
+        search_title_exact_boost=0.2, search_title_prefix_boost=0.1, search_proximity_weight=0.3)
+    ctx = build_context(s, full=True)
+    fp = ctx.docs.search_params
+    assert (fp.title_exact_boost, fp.title_prefix_boost, fp.proximity_weight) == (0.2, 0.1, 0.3)

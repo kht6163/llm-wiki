@@ -54,6 +54,23 @@ def test_raw_download_unicode_content_disposition(client):
     assert "\r" not in cd and "\n" not in cd
 
 
+def test_home_empty_state_for_fresh_vault(client):
+    # A fresh vault (principals make users, no docs) renders the empty state with a
+    # create CTA for a writer — not a bare "문서가 없습니다" line.
+    login(client, "admin")
+    body = client.get("/").text
+    assert "empty-state" in body
+    assert "아직 문서가 없습니다" in body
+    assert "새 문서 만들기" in body
+
+
+def test_search_no_results_shows_empty_state(client):
+    login(client, "admin")
+    body = client.get("/search?q=절대없는검색어zzqx").text
+    assert "empty-state" in body
+    assert "검색 결과가 없습니다" in body
+
+
 def test_login_success_and_logout(client):
     r = login(client, "admin")
     assert r.status_code == 200 and "llm-wiki" in r.text
@@ -344,7 +361,11 @@ def test_security_headers_present(client):
     h = client.get("/").headers
     assert h.get("x-frame-options") == "DENY"
     assert h.get("x-content-type-options") == "nosniff"
+    csp = h.get("content-security-policy", "")
     assert "content-security-policy" in h
+    # Images allowed over HTTPS / data: URIs only — no plain http: (mixed content).
+    assert "img-src 'self' data: https:" in csp
+    assert "http:" not in csp
 
 
 def test_diff_route(client):
@@ -601,3 +622,19 @@ def test_login_lockout_collapses_ipv4_mapped_ipv6(ctx, principals):
         follow_redirects=False,
     )
     assert r.status_code == 429
+
+
+def test_login_throttle_block_is_audited_once(ctx, principals):
+    # When a brute-force first crosses the throttle threshold, exactly one login_blocked
+    # audit row is written (subsequent attempts short-circuit at the rate gate without
+    # re-auditing), so the block surfaces in the admin feed without write-amplifying.
+    from llm_wiki.services import audit
+    app = create_web_app(ctx)
+    attacker = TestClient(app, client=("7.7.7.7", 1))
+    for _ in range(15):  # well past the limiter threshold
+        attacker.post("/login", data={"username": "admin", "password": "wrong",
+                                      "csrf_token": _token(attacker, "/login")})
+    blocks = audit.recent(ctx.db, action="login_blocked")
+    assert len(blocks) == 1
+    assert blocks[0]["via"] == "web" and blocks[0]["outcome"] == "blocked"
+    assert "7.7.7.7" in (blocks[0]["detail"] or "")

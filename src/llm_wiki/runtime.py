@@ -44,6 +44,9 @@ def build_context(settings: Settings | None = None, *, full: bool = True,
         candidate_min=settings.search_candidate_min,
         vector_factor=settings.search_vector_factor,
         vector_cap=settings.search_vector_cap,
+        title_exact_boost=settings.search_title_exact_boost,
+        title_prefix_boost=settings.search_title_prefix_boost,
+        proximity_weight=settings.search_proximity_weight,
     )
     # The worker is constructed here but started by the caller (after the startup
     # embed sweep) so writes during boot don't race an unstarted thread.

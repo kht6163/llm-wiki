@@ -24,12 +24,13 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 # host) — the markdown preview must work regardless of how the page was reached.
 CSRF_EXEMPT_PATHS = frozenset({"/api/preview"})
 
-# Image sources are left permissive so rendered markdown can embed remote images;
-# scripts/styles are same-origin only ('unsafe-inline' is still required by the
-# few inline handlers/blocks in the templates — tighten with nonces later).
+# Images may be embedded by rendered markdown over HTTPS (or inline data: URIs);
+# plain http: is excluded so a document can't pull insecure/mixed-content images.
+# Scripts/styles are same-origin only ('unsafe-inline' is still required by the few
+# inline handlers/blocks in the templates — tighten with nonces later).
 CSP = (
     "default-src 'self'; "
-    "img-src 'self' data: https: http:; "
+    "img-src 'self' data: https:; "
     "script-src 'self' 'unsafe-inline'; "
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self'; "  # same-origin fetch + WebSocket (live change stream)

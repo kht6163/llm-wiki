@@ -18,13 +18,18 @@ _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
 
 @dataclass(frozen=True)
 class FusionParams:
-    """Tunable knobs for hybrid retrieval + RRF fusion. Defaults match the values that
-    were hardcoded before they were promoted to config (see Settings.rrf_k etc.)."""
+    """Tunable knobs for hybrid retrieval + RRF fusion. The over-fetch/rrf defaults match
+    the values that were hardcoded before they were promoted to config (see Settings.rrf_k
+    etc.). The ``*_boost``/``proximity_weight`` knobs add a light rerank layer on top of the
+    rank-only RRF (see ``_rerank_boost``); they're expressed in RRF-score units (≈1/rrf_k)."""
     rrf_k: int = 60            # RRF constant: larger flattens per-leg rank influence
     candidate_factor: int = 4  # BM25/candidate over-fetch: k = max(top_k*factor, min)
     candidate_min: int = 40
     vector_factor: int = 3     # vector over-fetch: k_vec = min(k*factor, cap)
     vector_cap: int = 600
+    title_exact_boost: float = 0.05    # added when the query equals the document title
+    title_prefix_boost: float = 0.015  # added when the title starts with the query
+    proximity_weight: float = 0.0      # added: weight * cosine-sim of matched chunk (0 = off)
 
 
 DEFAULT_FUSION = FusionParams()
@@ -116,6 +121,28 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
     return sorted(best.items(), key=lambda kv: kv[1]["distance"])
 
 
+def _rerank_boost(title: str | None, vi: dict | None, q_norm: str,
+                  params: FusionParams) -> float:
+    """Small additive signals layered on top of pure RRF so the fusion can see what
+    rank-only fusion can't: an exact (or prefix) title match, and how close the matched
+    vector chunk actually is. Returns a boost in RRF-score units (≈1/rrf_k). With the
+    defaults only the title boosts fire (proximity_weight=0), and only for the rare doc
+    whose title matches the query — so ordinary results keep their RRF order."""
+    boost = 0.0
+    if q_norm and (params.title_exact_boost or params.title_prefix_boost):
+        tn = " ".join((title or "").lower().split())
+        if tn:
+            if tn == q_norm:
+                boost += params.title_exact_boost
+            elif tn.startswith(q_norm):
+                boost += params.title_prefix_boost
+    if params.proximity_weight and vi is not None:
+        sim = 1.0 - float(vi["distance"])  # cosine distance -> similarity
+        if sim > 0:
+            boost += params.proximity_weight * sim
+    return boost
+
+
 def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
           folder: str | None, tags: list[str] | None,
           params: FusionParams = DEFAULT_FUSION):
@@ -146,6 +173,16 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     else:
         ids = list(set(bm_rank) | set(vec_rank))
 
+    # Title-match reranking needs each candidate's title; fetch them in one query
+    # (only when a title boost is actually enabled).
+    q_norm = " ".join((query or "").lower().split())
+    titles: dict[int, str] = {}
+    if ids and (params.title_exact_boost or params.title_prefix_boost):
+        idlist = list(ids)
+        ph = ",".join("?" * len(idlist))
+        titles = {r["id"]: (r["title"] or "") for r in conn.execute(
+            f"SELECT id, title FROM documents WHERE id IN ({ph})", idlist)}
+
     scored = []
     for did in ids:
         s = 0.0
@@ -153,6 +190,7 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
             s += 1.0 / (params.rrf_k + bm_rank[did])
         if did in vec_rank:
             s += 1.0 / (params.rrf_k + vec_rank[did])
+        s += _rerank_boost(titles.get(did), vec_info.get(did), q_norm, params)
         scored.append((did, s))
     scored.sort(key=lambda x: -x[1])
     return scored, vec_info, match

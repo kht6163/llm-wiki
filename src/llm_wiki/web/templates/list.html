@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_badges.html" import via_badge %}
+{% from "_icons.html" import icon %}
 {% block title %}문서 목록{% endblock %}
 {% block content %}
 <div id="rt-meta" data-mode="list" hidden></div>
@@ -29,7 +30,15 @@
   </aside>
   <div class="list-main">
     {% if not items %}
-      <p class="muted">문서가 없습니다. {% if user.can_write %}<a href="/new">새 문서 만들기</a>{% endif %}</p>
+    <div class="empty-state">
+      <span class="empty-icon">{{ icon("inbox") }}</span>
+      <p class="empty-title">{% if folder or tag %}조건에 맞는 문서가 없습니다{% else %}아직 문서가 없습니다{% endif %}</p>
+      <p class="empty-text">
+        {%- if folder or tag %}필터를 바꾸거나 <a href="/">전체 문서</a>를 살펴보세요.
+        {%- else %}첫 노트를 만들어 지식베이스를 시작하세요.{% endif -%}
+      </p>
+      {% if user.can_write %}<div class="empty-actions"><a class="btn" href="/new">새 문서 만들기</a></div>{% endif %}
+    </div>
     {% endif %}
     <ul class="doclist">
       {% for d in items %}

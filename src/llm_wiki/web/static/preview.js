@@ -7,6 +7,7 @@
   var pop = null;
   var showTimer = null;
   var hideTimer = null;
+  var activePath = null;   // the link currently hovered; guards late fetch results
 
   function ensurePop() {
     if (!pop) {
@@ -24,6 +25,12 @@
     return "/api/doc/" + enc + "/preview";
   }
 
+  function positionAt(a, p) {
+    var r = a.getBoundingClientRect();
+    p.style.left = (window.scrollX + r.left) + "px";
+    p.style.top = (window.scrollY + r.bottom + 6) + "px";
+  }
+
   function place(a, data) {
     var p = ensurePop();
     p.innerHTML = "";
@@ -35,9 +42,20 @@
     x.textContent = data.excerpt || "(내용 없음)";
     p.appendChild(t);
     p.appendChild(x);
-    var r = a.getBoundingClientRect();
-    p.style.left = (window.scrollX + r.left) + "px";
-    p.style.top = (window.scrollY + r.bottom + 6) + "px";
+    positionAt(a, p);
+    p.hidden = false;
+  }
+
+  // Placeholder popover shown the instant a fetch starts, so a slow request still
+  // gives immediate feedback instead of a blank pause before the excerpt appears.
+  function placeLoading(a) {
+    var p = ensurePop();
+    p.innerHTML = "";
+    var x = document.createElement("div");
+    x.className = "dp-excerpt is-loading";
+    x.textContent = "불러오는 중…";
+    p.appendChild(x);
+    positionAt(a, p);
     p.hidden = false;
   }
 
@@ -46,14 +64,18 @@
     var m = href.match(/^\/doc\/(.+)$/);
     if (!m) return;
     var path = decodeURIComponent(m[1]);
+    activePath = path;
     if (cache[path]) { place(a, cache[path]); return; }
+    placeLoading(a);
     fetch(apiUrl(path))
       .then(function (r) { return r.json(); })
-      .then(function (d) { if (d && d.ok) { cache[path] = d; place(a, d); } })
+      .then(function (d) {
+        if (d && d.ok) { cache[path] = d; if (activePath === path) place(a, d); }
+      })
       .catch(function () {});
   }
 
-  function hide() { if (pop) pop.hidden = true; }
+  function hide() { activePath = null; if (pop) pop.hidden = true; }
 
   function linkUnder(target) {
     return target && target.closest ? target.closest('a.title[href^="/doc/"]') : null;

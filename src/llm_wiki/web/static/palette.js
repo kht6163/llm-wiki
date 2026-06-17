@@ -38,10 +38,15 @@
     overlay.hidden = false;
     input.value = "";
     input.placeholder = m === "switcher" ? "문서 이름/경로로 이동…" : "명령 입력…";
+    input.setAttribute("aria-expanded", "true");
     render("");
     setTimeout(function () { input.focus(); }, 0);
   }
-  function close() { overlay.hidden = true; items = []; index = 0; }
+  function close() {
+    overlay.hidden = true; items = []; index = 0;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant");
+  }
 
   // subsequence fuzzy: every char of q appears in order within s.
   function fuzzy(q, s) {
@@ -62,10 +67,12 @@
       clearTimeout(searchTimer);
       var query = q.trim();
       if (!query) { items = []; paint(); return; }
+      paintLoading();   // immediate feedback over the debounce + network round-trip
       searchTimer = setTimeout(function () {
         fetch("/api/complete?q=" + encodeURIComponent(query), { credentials: "same-origin" })
           .then(function (r) { return r.json(); })
           .then(function (d) {
+            if (input.value.trim() !== query) return;   // a newer keystroke owns the list
             var found = (d && d.ok ? d.items : []).map(function (it) {
               return { label: it.title, sub: it.path, run: function () { location.href = "/doc/" + enc(it.path); } };
             });
@@ -73,15 +80,31 @@
               found.push({ label: "새 문서: " + query, sub: "생성", run: function () { location.href = "/new?path=" + encodeURIComponent(query); } });
             }
             items = found; paint();
-          }).catch(function () { items = []; paint(); });
+          }).catch(function () {
+            if (input.value.trim() === query) { items = []; paint(); }
+          });
       }, 130);
     }
+  }
+
+  // Transient "searching…" row shown while a switcher fetch is in flight. It's not
+  // selectable (index = -1, aria-hidden) and is replaced when results arrive.
+  function paintLoading() {
+    items = []; index = -1;
+    list.innerHTML = "";
+    input.removeAttribute("aria-activedescendant");
+    var li = document.createElement("li");
+    li.className = "cmd-empty muted is-loading";
+    li.setAttribute("aria-hidden", "true");
+    li.textContent = "검색 중…";
+    list.appendChild(li);
   }
 
   function paint() {
     index = 0;
     list.innerHTML = "";
     if (!items.length) {
+      input.removeAttribute("aria-activedescendant");
       var li = document.createElement("li");
       li.className = "cmd-empty muted"; li.textContent = "결과 없음";
       list.appendChild(li);
@@ -89,8 +112,10 @@
     }
     items.forEach(function (it, i) {
       var li = document.createElement("li");
+      li.id = "cmd-opt-" + i;
       li.className = "cmd-item" + (i === 0 ? " active" : "");
       li.setAttribute("role", "option");
+      li.setAttribute("aria-selected", i === 0 ? "true" : "false");
       li.innerHTML = '<span class="cmd-label"></span>' + (it.sub ? '<span class="cmd-sub muted"></span>' : "");
       li.querySelector(".cmd-label").textContent = it.label;
       if (it.sub) li.querySelector(".cmd-sub").textContent = it.sub;
@@ -98,10 +123,17 @@
       li.addEventListener("mousemove", function () { setIndex(i); });
       list.appendChild(li);
     });
+    input.setAttribute("aria-activedescendant", "cmd-opt-0");
   }
   function setIndex(i) {
     index = i;
-    Array.prototype.forEach.call(list.children, function (c, j) { c.classList.toggle("active", j === i); });
+    Array.prototype.forEach.call(list.children, function (c, j) {
+      var on = j === i;
+      c.classList.toggle("active", on);
+      if (c.classList.contains("cmd-item")) c.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    var active = list.children[i];
+    if (active && active.id) input.setAttribute("aria-activedescendant", active.id);
   }
   function run(i) {
     var it = items[i];
@@ -115,6 +147,9 @@
     else if (e.key === "ArrowUp") { e.preventDefault(); setIndex(Math.max(index - 1, 0)); scrollActive(); }
     else if (e.key === "Enter") { e.preventDefault(); run(index); }
     else if (e.key === "Escape") { e.preventDefault(); close(); }
+    // Only the input is focusable inside the modal; trap Tab so focus can't leak
+    // to the page behind the overlay.
+    else if (e.key === "Tab") { e.preventDefault(); }
   });
   function scrollActive() { var a = list.children[index]; if (a) a.scrollIntoView({ block: "nearest" }); }
 
