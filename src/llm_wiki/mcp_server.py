@@ -52,6 +52,21 @@ def _client_ip(ctx: Context) -> str:
     return normalize_client_ip(getattr(client, "host", None))
 
 
+def _shape_write(result: dict, return_content: str) -> dict:
+    """Trim a write tool's echoed body unless the caller asked to keep it. Write results
+    funnel through DocumentService.get() and carry the full ``content``; an agent that
+    just made the edit rarely needs it back, so the default ('metadata') drops the body
+    and adds a ``chars`` count + ``content_omitted`` flag, keeping responses token-cheap.
+    Pass return_content='full' to get the body verbatim (e.g. to verify the result)."""
+    if return_content == "full" or not isinstance(result, dict) or "content" not in result:
+        return result
+    body = result.get("content") or ""
+    out = {k: v for k, v in result.items() if k != "content"}
+    out["chars"] = len(body)
+    out["content_omitted"] = True
+    return out
+
+
 def create_mcp_server(app: AppContext) -> FastMCP:
     db, docs = app.db, app.docs
     mcp = FastMCP(name="llm-wiki", stateless_http=True, json_response=True)
@@ -376,25 +391,32 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     # ---- write tools (editor/admin) -------------------------------------
     @mcp.tool(description="Create a new document. Fails with code 'conflict' if the path "
-                          "already exists, 'forbidden' for viewer role.")
+                          "already exists, 'forbidden' for viewer role. By default the response "
+                          "omits the document body (you already have it) — pass "
+                          "return_content='full' to echo it back.")
     async def create_document(
         ctx: Context, path: str, content: str,
         title: str | None = None, tags: list[str] | None = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.create(p, path, content, title, tags)},
-                           "create_document")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(
+            docs.create(p, path, content, title, tags), return_content)}, "create_document")
 
     @mcp.tool(description="Replace a document's full body (editor/admin only; viewer gets "
                           "'forbidden'). base_version is REQUIRED; if it does not match the "
                           "current version the update is rejected with code 'conflict' + current "
                           "content, so you can re-read, reapply, and retry. For small edits prefer "
-                          "patch_document / replace_section (cheaper).")
+                          "patch_document / replace_section (cheaper). Response omits the body by "
+                          "default; pass return_content='full' to echo it.")
     async def update_document(
         ctx: Context, path: str, base_version: int, content: str,
         title: str | None = None, tags: list[str] | None = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.update(
-            p, path, base_version, content, title, tags)}, "update_document")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.update(
+            p, path, base_version, content, title, tags), return_content)}, "update_document")
 
     @mcp.tool(description="Find-and-replace in a document (token-cheap edit; editor/admin only). "
                           "mode='literal' (default) matches a substring; mode='regex' matches a "
@@ -413,10 +435,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                         Field(description="Match 'find' literally or as a regex.")] = "literal",
         occurrence: Annotated[int | None, Field(ge=1,
                               description="Replace only this 1-based match.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.patch(
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.patch(
             p, path, find, replace, base_version=base_version, count=count,
-            mode=mode, occurrence=occurrence)}, "patch_document")
+            mode=mode, occurrence=occurrence), return_content)}, "patch_document")
 
     @mcp.tool(description="Append a text block to a document (editor/admin only) — the natural "
                           "journaling primitive for logs/daily notes. With 'ensure_heading' the "
@@ -429,10 +453,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         ensure_heading: Annotated[str | None,
                                   Field(description="Append under this heading (created if absent).")] = None,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.append_to_document(
-            p, path, text, ensure_heading=ensure_heading, base_version=base_version)},
-            "append_to_document")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_to_document(
+            p, path, text, ensure_heading=ensure_heading, base_version=base_version),
+            return_content)}, "append_to_document")
 
     @mcp.tool(description="Restore a past revision's content as a new edit (editor/admin only) — a "
                           "one-call server-side undo. The old body is loaded server-side (it never "
@@ -442,30 +468,44 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def restore_revision(
         ctx: Context, path: str, version: int,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.restore_revision(
-            p, path, version, base_version=base_version)}, "restore_revision")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.restore_revision(
+            p, path, version, base_version=base_version), return_content)}, "restore_revision")
 
     @mcp.tool(description="Replace the body under a heading (the heading line is kept; "
-                          "editor/admin only). Token-cheap; reads latest server-side. Pass "
-                          "base_version to reject the edit with 'conflict' if the document changed "
-                          "since you read it; omit to apply on top of the current version.")
+                          "editor/admin only). Token-cheap; reads latest server-side. When several "
+                          "headings share the text, set 'occurrence' (1-based; from get_outline "
+                          "order) to target the Nth — out-of-range fails 'validation' rather than "
+                          "editing the wrong one. Pass base_version to reject with 'conflict' if "
+                          "the document changed since you read it; omit to apply on top of current.")
     async def replace_section(
         ctx: Context, path: str, heading: str, text: str,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        occurrence: Annotated[int, Field(ge=1, description="Target the Nth same-named heading.")] = 1,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.replace_section(
-            p, path, heading, text, base_version=base_version)}, "replace_section")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.replace_section(
+            p, path, heading, text, base_version=base_version, occurrence=occurrence),
+            return_content)}, "replace_section")
 
     @mcp.tool(description="Append text to the end of a heading's section (before the next "
-                          "same/higher heading; editor/admin only). Token-cheap. Pass base_version "
-                          "to reject with 'conflict' if the document changed since you read it.")
+                          "same/higher heading; editor/admin only). Token-cheap. When several "
+                          "headings share the text, set 'occurrence' (1-based) to target the Nth — "
+                          "out-of-range fails 'validation'. Pass base_version to reject with "
+                          "'conflict' if the document changed since you read it.")
     async def append_section(
         ctx: Context, path: str, heading: str, text: str,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        occurrence: Annotated[int, Field(ge=1, description="Target the Nth same-named heading.")] = 1,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="Echo the body ('full') or just metadata.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.append_section(
-            p, path, heading, text, base_version=base_version)}, "append_section")
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_section(
+            p, path, heading, text, base_version=base_version, occurrence=occurrence),
+            return_content)}, "append_section")
 
     @mcp.tool(description="Add and/or remove tags on a document without rewriting its body "
                           "(editor/admin only). Adjusts the frontmatter 'tags' list; returns the "
@@ -533,10 +573,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                               mode=raw.get("mode", "literal"), occurrence=raw.get("occurrence"))
         if op == "replace_section":
             return docs.replace_section(principal, path, raw.get("heading", ""), raw.get("text", ""),
-                                        base_version=raw.get("base_version"))
+                                        base_version=raw.get("base_version"),
+                                        occurrence=raw.get("occurrence", 1))
         if op == "append_section":
             return docs.append_section(principal, path, raw.get("heading", ""), raw.get("text", ""),
-                                       base_version=raw.get("base_version"))
+                                       base_version=raw.get("base_version"),
+                                       occurrence=raw.get("occurrence", 1))
         if op == "append":
             return docs.append_to_document(principal, path, raw.get("text", ""),
                                            ensure_heading=raw.get("ensure_heading"),

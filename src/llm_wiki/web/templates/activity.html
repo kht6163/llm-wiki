@@ -45,16 +45,16 @@
   <tbody>
   {% for e in events %}
     <tr>
-      <td>{{ e.ts|dt }}</td>
-      <td>{{ via_badge(e.via) }}</td>
-      <td>{{ action_labels.get(e.action, e.action) }}{% if e.detail %} <span class="muted">{{ e.detail }}</span>{% endif %}</td>
-      <td>{{ e.actor or '—' }}</td>
-      <td>
+      <td data-label="시각">{{ e.ts|dt }}</td>
+      <td data-label="출처">{{ via_badge(e.via) }}</td>
+      <td data-label="동작">{{ action_labels.get(e.action, e.action) }}{% if e.detail %} <span class="muted">{{ e.detail }}</span>{% endif %}</td>
+      <td data-label="행위자">{{ e.actor or '—' }}</td>
+      <td data-label="대상">
         {% if e.target and e.action in linkable %}
           <a href="/doc/{{ e.target|urlpath }}">{{ e.target }}</a>
         {% elif e.target %}{{ e.target }}{% else %}—{% endif %}
       </td>
-      <td>{% if e.outcome == 'ok' %}<span class="muted">정상</span>{% else %}<span class="outcome-bad">{{ e.outcome }}</span>{% endif %}</td>
+      <td data-label="결과">{% if e.outcome == 'ok' %}<span class="muted">정상</span>{% else %}<span class="outcome-bad">{{ e.outcome }}</span>{% endif %}</td>
     </tr>
   {% endfor %}
   </tbody>

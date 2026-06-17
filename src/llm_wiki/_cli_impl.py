@@ -114,6 +114,16 @@ def run(argv: list[str] | None = None) -> int:
 
 
 def _dispatch(args) -> int:
+    # Configure the llm_wiki logger tree for EVERY command, not just serve, so the
+    # INFO logs of maintenance commands (reindex/import/prune/restore…) reach stderr and
+    # the optional LOG_FILE instead of being dropped by Python's last-resort handler.
+    from .config import get_settings
+    from .logconf import configure_logging
+    try:
+        s = get_settings()
+        configure_logging(s.log_level, s.log_file)
+    except ConfigError:
+        pass  # bad config surfaces with a clear message when the command builds context
     if args.cmd == "serve":
         return _serve(args)
     if args.cmd == "init-db":
@@ -185,8 +195,10 @@ def _reindex(args) -> int:
     ctx = build_context(full=True)
     print("Reindexing vault…")
     res = ctx.docs.reindex_all(reembed=args.reembed)
-    print(f"created={res['created']} updated={res['updated']} unchanged={res['unchanged']} "
-          f"embedded={res['embedded']}")
+    print(f"created={res['created']} updated={res['updated']} renamed={res['renamed']} "
+          f"unchanged={res['unchanged']} embedded={res['embedded']}")
+    for mv in res.get("renames", []):
+        print(f"  renamed: {mv}")
     if res["missing_files"]:
         print(f"WARNING: {len(res['missing_files'])} document(s) have no file on disk:")
         for m in res["missing_files"]:
@@ -464,9 +476,7 @@ def _serve(args) -> int:
     if args.mcp_port:
         settings.mcp_port = args.mcp_port
 
-    from .logconf import configure_logging
-    configure_logging(settings.log_level, settings.log_file)
-
+    # Logging is already configured for all commands in _dispatch().
     print("Loading embedding model… (first run downloads it from HuggingFace)")
     ctx = build_context(settings, full=True, start_embed_worker=True)
     ctx.embedder.warm()  # load weights now so the first request isn't slow / failing readiness

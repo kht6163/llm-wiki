@@ -20,13 +20,14 @@ services:
     security_opt:
       - no-new-privileges:true
     # The image (Dockerfile HEALTHCHECK) also reports health; this surfaces it to
-    # compose with sane startup grace for the embedding-model load.
+    # compose. /readyz is true only once the model is loaded AND the DB is reachable,
+    # so startup grace must cover the first-boot model download.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3).status==200 else 1)"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz',timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 90s
+      start_period: 300s
     # Cap memory so an embedding spike can't take down the host. Raise for large
     # models (bge-m3 etc.). On non-Swarm `docker compose`, mem_limit applies.
     mem_limit: 2g

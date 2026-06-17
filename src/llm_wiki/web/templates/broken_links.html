@@ -11,10 +11,10 @@
   <tbody>
   {% for l in links %}
     <tr>
-      <td><a href="/doc/{{ l.src_path|urlpath }}">{{ l.src_path }}</a></td>
-      <td>{{ l.target }}{% if l.anchor %}<span class="muted">#{{ l.anchor }}</span>{% endif %}</td>
-      <td class="muted">{{ l.link_type }}</td>
-      <td><code>{{ l.raw }}</code></td>
+      <td data-label="출처"><a href="/doc/{{ l.src_path|urlpath }}">{{ l.src_path }}</a></td>
+      <td data-label="대상">{{ l.target }}{% if l.anchor %}<span class="muted">#{{ l.anchor }}</span>{% endif %}</td>
+      <td data-label="형식" class="muted">{{ l.link_type }}</td>
+      <td data-label="원본"><code>{{ l.raw }}</code></td>
     </tr>
   {% endfor %}
   </tbody>

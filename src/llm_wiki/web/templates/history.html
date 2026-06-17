@@ -9,12 +9,12 @@
   <tbody>
   {% for r in revisions %}
     <tr>
-      <td>v{{ r.version }}</td>
-      <td>{{ r.op }}</td>
-      <td>{{ via_badge(r.via) }}</td>
-      <td>{{ r.author or '—' }}</td>
-      <td>{{ r.created_at|dt }}</td>
-      <td>
+      <td data-label="버전">v{{ r.version }}</td>
+      <td data-label="작업">{{ r.op }}</td>
+      <td data-label="출처">{{ via_badge(r.via) }}</td>
+      <td data-label="작성자">{{ r.author or '—' }}</td>
+      <td data-label="시각">{{ r.created_at|dt }}</td>
+      <td data-label="동작">
         <a href="/doc/{{ path|urlpath }}/rev/{{ r.version }}">보기</a>
         {% if r.version > 1 %}
           · <a href="/doc/{{ path|urlpath }}/diff?from={{ r.version - 1 }}&to={{ r.version }}">변경점</a>

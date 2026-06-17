@@ -35,6 +35,38 @@ def test_reindex_create_update_unchanged_missing(ctx, principals):
     assert "db_only.md" in res["missing_files"]
 
 
+def test_reindex_treats_external_rename_as_move(ctx, principals):
+    import os
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "old.md", "# Note\n\nunique body content here")
+    v = ctx.settings.vault_path
+    os.replace(v / "old.md", v / "new.md")  # external `mv old.md new.md`
+    res = docs.reindex_all()
+    assert res["renamed"] == 1 and res["created"] == 0
+    assert "old.md" not in res["missing_files"]      # it moved, it didn't vanish
+    assert docs.exists("new.md") and not docs.exists("old.md")
+    moved = docs.get("new.md")
+    assert "unique body content here" in moved["content"]
+    # Same document continued (create + rename revisions), not a fresh duplicate.
+    ops = [r["op"] for r in docs.revisions("new.md")["revisions"]]
+    assert "create" in ops and "rename" in ops
+
+
+def test_reindex_ambiguous_rename_falls_back_to_create(ctx, principals):
+    import os
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "a.md", "duplicate body")
+    docs.create(p, "b.md", "duplicate body")  # identical content -> identical hash
+    v = ctx.settings.vault_path
+    os.replace(v / "a.md", v / "c.md")  # a's exact file reappears as c.md
+    os.remove(v / "b.md")
+    res = docs.reindex_all()
+    # Two DB docs share that content hash, so the move target is ambiguous; rather than
+    # relocate the wrong one, c.md is created fresh and both originals report missing.
+    assert res["renamed"] == 0 and res["created"] == 1
+    assert set(res["missing_files"]) >= {"a.md", "b.md"}
+
+
 def test_reindex_does_not_revive_soft_deleted(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "gone.md", "body one")

@@ -354,11 +354,25 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
     box-shadow: 0 6px 24px rgba(0,0,0,.18); min-width: 160px; z-index: 20; }
   .navmenu[open] > .navlinks { display: flex; }
   .searchform { flex-wrap: wrap; }
-  /* Revision history table -> stacked cards. */
-  .revtable, .revtable tbody, .revtable tr, .revtable td { display: block; width: 100%; }
-  .revtable thead { display: none; }
-  .revtable tr { border: 1px solid var(--line); border-radius: 6px; margin-bottom: 10px; padding: 6px 10px; }
-  .revtable td { border: none; padding: 2px 0; }
+}
+
+/* Wide data tables (revisions, activity, broken links) restack as labelled cards on
+   narrow screens — aligned with the app-shell's 860px overlay breakpoint — so 4–6
+   column tables stop overflowing the content column. Each cell shows its column name
+   from `data-label`, so meaning survives the loss of the header row. */
+@media (max-width: 860px) {
+  .revtable, .revtable tbody, .revtable tr, .revtable td,
+  .broken, .broken tbody, .broken tr, .broken td { display: block; width: 100%; }
+  .revtable thead, .broken thead { display: none; }
+  .revtable tr, .broken tr {
+    border: 1px solid var(--line); border-radius: var(--r-md);
+    margin-bottom: 10px; padding: 8px 12px;
+  }
+  .revtable td, .broken td { border: none; padding: 3px 0; display: flex; gap: 10px; }
+  .revtable td::before, .broken td::before {
+    content: attr(data-label); flex: 0 0 5.5em; color: var(--fg-muted);
+    font-size: 0.82em; font-weight: 600;
+  }
 }
 
 .pager { display: flex; gap: 16px; align-items: center; justify-content: center;
@@ -619,6 +633,11 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .outline-list a { display: block; padding: 2px 6px; border-radius: 5px; color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .outline-list a:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
+/* Scroll-spy current section — same selection vocabulary as the active file-tree row. */
+.outline-list a.active {
+  background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .ol-h1 { padding-left: 0; } .ol-h2 { padding-left: 10px; } .ol-h3 { padding-left: 20px; }
 .ol-h4 { padding-left: 30px; } .ol-h5 { padding-left: 40px; } .ol-h6 { padding-left: 50px; }
 .ol-h1 > a { font-weight: 600; }

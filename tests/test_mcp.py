@@ -124,7 +124,8 @@ async def test_list_activity_rejects_non_document_action(editor_mcp):
 
 async def test_append_to_document_tool(editor_mcp):
     _payload(await editor_mcp.call_tool("create_document", {"path": "log.md", "content": "# Log\n\na\n"}))
-    d = _payload(await editor_mcp.call_tool("append_to_document", {"path": "log.md", "text": "b"}))
+    d = _payload(await editor_mcp.call_tool(
+        "append_to_document", {"path": "log.md", "text": "b", "return_content": "full"}))
     assert d["ok"] and d["content"].rstrip().endswith("b")
 
 
@@ -133,7 +134,8 @@ async def test_patch_regex_occurrence_tool(editor_mcp):
         "create_document", {"path": "r.md", "content": "- [ ] a\n- [ ] b\n"}))
     d = _payload(await editor_mcp.call_tool(
         "patch_document",
-        {"path": "r.md", "find": r"^- \[ \]", "replace": "- [x]", "mode": "regex", "occurrence": 2}))
+        {"path": "r.md", "find": r"^- \[ \]", "replace": "- [x]", "mode": "regex",
+         "occurrence": 2, "return_content": "full"}))
     assert d["ok"] and d["content"] == "- [ ] a\n- [x] b\n"
 
 
@@ -141,7 +143,8 @@ async def test_restore_revision_tool(editor_mcp):
     _payload(await editor_mcp.call_tool("create_document", {"path": "rr.md", "content": "first"}))
     _payload(await editor_mcp.call_tool(
         "update_document", {"path": "rr.md", "base_version": 1, "content": "second"}))
-    d = _payload(await editor_mcp.call_tool("restore_revision", {"path": "rr.md", "version": 1}))
+    d = _payload(await editor_mcp.call_tool(
+        "restore_revision", {"path": "rr.md", "version": 1, "return_content": "full"}))
     assert d["ok"] and d["content"] == "first" and d["version"] == 3
 
 
@@ -252,9 +255,11 @@ async def test_write_tools_e2e(editor_mcp):
     # The write tools an agent uses most — none had behavioral coverage before.
     mcp = editor_mcp
     _payload(await mcp.call_tool("create_document", {"path": "w.md", "content": "# W\n\n## A\nalpha\n"}))
-    pd = _payload(await mcp.call_tool("patch_document", {"path": "w.md", "find": "alpha", "replace": "beta"}))
+    pd = _payload(await mcp.call_tool(
+        "patch_document", {"path": "w.md", "find": "alpha", "replace": "beta", "return_content": "full"}))
     assert pd["ok"] and "beta" in pd["content"]
-    ap = _payload(await mcp.call_tool("append_section", {"path": "w.md", "heading": "A", "text": "gamma"}))
+    ap = _payload(await mcp.call_tool(
+        "append_section", {"path": "w.md", "heading": "A", "text": "gamma", "return_content": "full"}))
     assert ap["ok"] and "gamma" in ap["content"]
     pt = _payload(await mcp.call_tool("patch_tags", {"path": "w.md", "add": ["t1", "t2"]}))
     assert pt["ok"] and {"t1", "t2"} <= set(pt["tags"])
@@ -262,6 +267,38 @@ async def test_write_tools_e2e(editor_mcp):
     assert mv["ok"] and mv["path"] == "moved/w.md"
     dl = _payload(await mcp.call_tool("delete_document", {"path": "moved/w.md"}))
     assert dl["ok"] and dl["deleted"] is True
+
+
+async def test_write_tools_omit_body_by_default(editor_mcp):
+    # Write tools return metadata only by default (token-cheap for agents); the body is
+    # echoed only when return_content='full'.
+    _payload(await editor_mcp.call_tool("create_document", {"path": "rc.md", "content": "# RC\n\nbody here"}))
+    upd = _payload(await editor_mcp.call_tool(
+        "update_document", {"path": "rc.md", "base_version": 1, "content": "# RC\n\nnew body"}))
+    assert upd["ok"] and "content" not in upd
+    assert upd["content_omitted"] is True and upd["chars"] == len("# RC\n\nnew body")
+    full = _payload(await editor_mcp.call_tool(
+        "update_document", {"path": "rc.md", "base_version": 2, "content": "# RC\n\nfinal",
+                            "return_content": "full"}))
+    assert full["ok"] and full["content"] == "# RC\n\nfinal"
+
+
+async def test_replace_section_occurrence_targets_nth(editor_mcp):
+    # Repeated headings are disambiguated by 'occurrence' instead of silently hitting #1.
+    body = "# Doc\n\n## 예시\nfirst\n\n## 예시\nsecond\n"
+    _payload(await editor_mcp.call_tool("create_document", {"path": "dup.md", "content": body}))
+    _payload(await editor_mcp.call_tool(
+        "replace_section", {"path": "dup.md", "heading": "예시", "text": "SECOND", "occurrence": 2}))
+    read = _payload(await editor_mcp.call_tool("read_document", {"path": "dup.md"}))
+    # First "예시" untouched; only the second was replaced.
+    assert "first" in read["content"] and "SECOND" in read["content"] and "second" not in read["content"]
+
+
+async def test_section_occurrence_out_of_range_is_validation(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "one.md", "content": "# D\n\n## A\nx\n"}))
+    d = _payload(await editor_mcp.call_tool(
+        "replace_section", {"path": "one.md", "heading": "A", "text": "y", "occurrence": 3}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
 async def test_read_tools_e2e(editor_mcp):

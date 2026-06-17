@@ -110,21 +110,40 @@ def _replace_outside_code(pattern: re.Pattern, repl: Callable[[re.Match], str], 
     return "".join(out)
 
 
-def _locate_section(body: str, heading: str):
-    """Find a markdown section by heading text. Returns (lines, start, end, level)
-    where start is the heading line index and end is the exclusive index of the
-    next heading at the same-or-higher level (the section's subtree), or None."""
+def _heading_matches(body: str):
+    """All headings whose text equals nothing in particular — returns (lines, matches)
+    where matches is [(line_index, level, text)] for every heading line, in order.
+    The basis for section location and occurrence disambiguation."""
     lines = body.splitlines(keepends=True)
-    target = heading.strip().lower()
-    start: int | None = None
-    level = 0
+    matches: list[tuple[int, int, str]] = []
     for i, line in enumerate(lines):
         m = _HEADING_RE.match(line.rstrip("\n"))
-        if m and m.group(2).strip().lower() == target:
-            start, level = i, len(m.group(1))
-            break
-    if start is None:
+        if m:
+            matches.append((i, len(m.group(1)), m.group(2).strip()))
+    return lines, matches
+
+
+def _count_sections(body: str, heading: str) -> int:
+    """How many headings carry this exact text — used to report occurrence range."""
+    target = heading.strip().lower()
+    _lines, matches = _heading_matches(body)
+    return sum(1 for _i, _lvl, text in matches if text.lower() == target)
+
+
+def _locate_section(body: str, heading: str, occurrence: int = 1):
+    """Find a markdown section by heading text. ``occurrence`` (1-based) selects the
+    Nth heading with that text, so repeated headings (e.g. several "예시"/"Notes") can
+    be edited unambiguously instead of always hitting the first. Returns
+    (lines, start, end, level) where start is the heading line index and end is the
+    exclusive index of the next heading at the same-or-higher level (the section's
+    subtree), or None when there's no such heading / the occurrence is out of range."""
+    target = heading.strip().lower()
+    occ = max(1, int(occurrence))
+    lines, matches = _heading_matches(body)
+    hits = [(i, lvl) for i, lvl, text in matches if text.lower() == target]
+    if occ > len(hits):
         return None
+    start, level = hits[occ - 1]
     end = len(lines)
     for j in range(start + 1, len(lines)):
         m = _HEADING_RE.match(lines[j].rstrip("\n"))
@@ -132,6 +151,21 @@ def _locate_section(body: str, heading: str):
             end = j
             break
     return lines, start, end, level
+
+
+def _locate_or_raise(doc: dict, heading: str, occurrence: int):
+    """Locate a section or raise a precise error: ValidationError when the heading
+    exists but the requested occurrence is out of range (so an agent learns the actual
+    count instead of silently editing the wrong one), NotFoundError when nothing matches."""
+    loc = _locate_section(doc["content"], heading, occurrence)
+    if loc:
+        return loc
+    n = _count_sections(doc["content"], heading)
+    if n and occurrence > n:
+        raise ValidationError(
+            f"occurrence {occurrence} is out of range: the document has {n} "
+            f"section(s) titled {heading!r}.", path=doc["path"])
+    raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
 
 
 def _as_block(text: str) -> str:
@@ -824,14 +858,12 @@ class DocumentService:
         return self.get(rel)
 
     # ---- targeted edits (token-cheap; funnel through the CAS update path) ----
-    def get_section(self, path: str, heading: str) -> dict:
+    def get_section(self, path: str, heading: str, occurrence: int = 1) -> dict:
         doc = self.get(path)
-        loc = _locate_section(doc["content"], heading)
-        if not loc:
-            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
-        lines, start, end, _ = loc
-        return {"path": doc["path"], "heading": heading, "version": doc["version"],
-                "tags": doc["tags"], "content": "".join(lines[start:end])}
+        lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
+        return {"path": doc["path"], "heading": heading, "occurrence": occurrence,
+                "version": doc["version"], "tags": doc["tags"],
+                "content": "".join(lines[start:end])}
 
     def outline(self, path: str) -> dict:
         """Flat heading outline of a document: [{level, text, line}] (1-based lines).
@@ -845,28 +877,22 @@ class DocumentService:
         return {"path": doc["path"], "version": doc["version"], "headings": headings}
 
     def replace_section(self, principal: Principal, path: str, heading: str, text: str,
-                        base_version: int | None = None) -> dict:
+                        base_version: int | None = None, occurrence: int = 1) -> dict:
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         doc = self.get(path)
-        loc = _locate_section(doc["content"], heading)
-        if not loc:
-            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
-        lines, start, end, _ = loc
+        lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
         # Keep the heading line; replace its body up to the next same/higher heading.
         body = "".join(lines[:start + 1]) + _as_block(text) + "".join(lines[end:])
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, body)
 
     def append_section(self, principal: Principal, path: str, heading: str, text: str,
-                       base_version: int | None = None) -> dict:
+                       base_version: int | None = None, occurrence: int = 1) -> dict:
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         doc = self.get(path)
-        loc = _locate_section(doc["content"], heading)
-        if not loc:
-            raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
-        lines, start, end, _ = loc
+        lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
         head = "".join(lines[:end])
         # Guarantee a line boundary: a final section whose last line has no trailing
         # newline would otherwise glue the appended block onto that line.
@@ -1294,31 +1320,59 @@ class DocumentService:
         return {"keep": keep, "deletable_revisions": deletable, "applied": bool(apply)}
 
     def reindex_all(self, reembed: bool = False) -> dict:
-        """Reconcile the DB with the on-disk vault (handles external edits / new
-        files). New files are created; changed files get an 'external-reconcile'
-        revision; vanished files are reported (not auto-deleted)."""
+        """Reconcile the DB with the on-disk vault (handles external edits / new files /
+        renames). New files are created; changed files get an 'external-reconcile'
+        revision. A new file whose content UNIQUELY matches a document whose own file
+        vanished is treated as that document RENAMED — relocated in place, preserving its
+        id / history / backlinks — instead of forking into a duplicate plus an orphan.
+        Vanished files with no content match are reported (not auto-deleted)."""
         vault = self.vault.resolve()
         log.info("reindex: scanning vault %s (reembed=%s)", vault, reembed)
-        seen: set[str] = set()
-        created = updated = unchanged = 0
-        skipped_deleted: list[str] = []
-        now = now_iso()
-        for p in sorted(vault.rglob("*.md")):
+
+        def _rel_of(p) -> str | None:
             try:
                 relp = p.resolve().relative_to(vault)
             except ValueError:
-                continue
+                return None
             if relp.parts and relp.parts[0] in (".trash", ".tmp"):
+                return None
+            return "/".join(relp.parts)
+
+        paths = sorted(vault.rglob("*.md"))
+        # Pre-pass (path-only, no content reads): document norms present on disk. Used
+        # as `seen` for the missing-file report and to find DB docs whose file vanished.
+        disk_norms = {path_norm(rel) for rel in (_rel_of(p) for p in paths) if rel is not None}
+        # A non-deleted document whose file is gone is a rename SOURCE. A new file whose
+        # content_hash UNIQUELY matches one (ambiguous duplicates are left alone) is that
+        # document moved — matched by content, not path, so an external `mv` relocates
+        # the doc instead of creating a duplicate and orphaning the old one's vectors.
+        by_hash: dict[str, list] = {}
+        with self.db.reader() as conn:
+            for r in conn.execute(
+                "SELECT id, path, path_norm, version, content_hash "
+                "FROM documents WHERE is_deleted=0"
+            ).fetchall():
+                if r["path_norm"] not in disk_norms:
+                    by_hash.setdefault(r["content_hash"], []).append(r)
+        rename_src = {h: rows[0] for h, rows in by_hash.items() if len(rows) == 1}
+        claimed: set[int] = set()
+
+        created = updated = unchanged = renamed = 0
+        skipped_deleted: list[str] = []
+        renames: list[str] = []
+        now = now_iso()
+        for p in paths:
+            rel = _rel_of(p)
+            if rel is None:
                 continue
-            rel = "/".join(relp.parts)
             norm, folder, stem = path_norm(rel), folder_of(rel), basename_stem(rel).lower()
-            seen.add(norm)
             content = p.read_text(encoding="utf-8", errors="replace")
             chash = sha256_hex(content)
             meta = parse_frontmatter(content)[0]
             title = derive_title(meta, content, rel)
             tagset = self._merge_tags(meta, content, None)
             mtime = p.stat().st_mtime
+            renamed_from: str | None = None
             with self.db.writer() as conn:
                 row = conn.execute(
                     "SELECT id, version, content_hash, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
@@ -1346,17 +1400,35 @@ class DocumentService:
                     )
                     is_new = False
                 else:
-                    cur = conn.execute(
-                        "INSERT INTO documents(path, path_norm, title, version, content_hash, folder, "
-                        "file_state, vector_dirty, is_deleted, file_mtime, created_at, created_by, updated_at, updated_by) "
-                        "VALUES(?,?,?,?,?,?, 'clean', 1, 0, ?, ?, NULL, ?, NULL)",
-                        (rel, norm, title, 1, chash, folder, mtime, now, now),
-                    )
-                    doc_id, new_version, is_new = cur.lastrowid, 1, True
+                    src = rename_src.get(chash)
+                    if src is not None and src["id"] not in claimed:
+                        claimed.add(src["id"])
+                        doc_id = src["id"]
+                        new_version = src["version"] + 1
+                        renamed_from = src["path"]
+                        conn.execute(
+                            "UPDATE documents SET path=?, path_norm=?, title=?, version=?, "
+                            "content_hash=?, folder=?, file_state='clean', vector_dirty=1, "
+                            "file_mtime=?, updated_at=?, updated_by=NULL WHERE id=?",
+                            (rel, norm, title, new_version, chash, folder, mtime, now, doc_id),
+                        )
+                        # Path/name changed: incoming links resolved to the old name are
+                        # now stale — drop them and re-resolve below (mirrors move()).
+                        graph.unresolve_incoming(conn, doc_id)
+                        is_new = False
+                    else:
+                        cur = conn.execute(
+                            "INSERT INTO documents(path, path_norm, title, version, content_hash, folder, "
+                            "file_state, vector_dirty, is_deleted, file_mtime, created_at, created_by, updated_at, updated_by) "
+                            "VALUES(?,?,?,?,?,?, 'clean', 1, 0, ?, ?, NULL, ?, NULL)",
+                            (rel, norm, title, 1, chash, folder, mtime, now, now),
+                        )
+                        doc_id, new_version, is_new = cur.lastrowid, 1, True
                 conn.execute(
                     "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
-                    "VALUES(?,?,?,?,?,NULL, 'external-reconcile', 'cli', ?)",
-                    (doc_id, new_version, content, title, chash, now),
+                    "VALUES(?,?,?,?,?,NULL, ?, 'cli', ?)",
+                    (doc_id, new_version, content, title, chash,
+                     "rename" if renamed_from else "external-reconcile", now),
                 )
                 self._set_tags(conn, doc_id, tagset)
                 indexing.reindex_fts(conn, doc_id, title, content)
@@ -1366,20 +1438,28 @@ class DocumentService:
                 # External reconciliation is otherwise a silent batch operation; record
                 # who/when so "this file changed outside the app" stays auditable, like
                 # every other write path.
+                detail = (f"v{new_version} rename {renamed_from} -> {rel}" if renamed_from
+                          else f"v{new_version} {'create' if is_new else 'update'}")
                 audit.record(conn, actor=None, via="cli", action="doc_reconcile", target=rel,
-                             detail=f"v{new_version} {'create' if is_new else 'update'}")
-            created += int(is_new)
-            updated += int(not is_new)
+                             detail=detail)
+            if renamed_from:
+                renamed += 1
+                renames.append(f"{renamed_from} -> {rel}")
+            elif is_new:
+                created += 1
+            else:
+                updated += 1
 
         with self.db.reader() as conn:
             missing = [r["path"] for r in conn.execute(
                 "SELECT path, path_norm FROM documents WHERE is_deleted=0").fetchall()
-                if r["path_norm"] not in seen]
+                if r["path_norm"] not in disk_norms]
         embedded = indexing.embed_pending(self.db, self.embedder)
-        log.info("reindex: created=%d updated=%d unchanged=%d skipped_deleted=%d "
-                 "missing_files=%d embedded=%d", created, updated, unchanged,
+        log.info("reindex: created=%d updated=%d renamed=%d unchanged=%d skipped_deleted=%d "
+                 "missing_files=%d embedded=%d", created, updated, renamed, unchanged,
                  len(skipped_deleted), len(missing), embedded)
-        return {"created": created, "updated": updated, "unchanged": unchanged,
+        return {"created": created, "updated": updated, "renamed": renamed,
+                "renames": renames, "unchanged": unchanged,
                 "missing_files": missing, "skipped_deleted": skipped_deleted,
                 "embedded": embedded}
 

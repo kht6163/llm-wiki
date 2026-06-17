@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -75,6 +75,9 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 CREATE INDEX IF NOT EXISTS idx_documents_folder ON documents(folder);
 CREATE INDEX IF NOT EXISTS idx_documents_dirty ON documents(vector_dirty);
+-- Covers the default listing/autocomplete sort (WHERE is_deleted=0 ORDER BY
+-- updated_at DESC) so it seeks instead of full-scanning + sorting the table.
+CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(is_deleted, updated_at DESC);
 
 -- Explicitly-created folders. Folders are otherwise derived from document paths;
 -- this table lets an empty folder persist as a first-class organizational unit
@@ -181,6 +184,9 @@ MIGRATIONS: list[tuple[int, str]] = [
     # section path and deep-link to it. NULL on pre-existing chunks until the
     # document is next edited or a full `reindex --reembed` rebuilds chunks.
     (4, "ALTER TABLE chunks ADD COLUMN heading_path TEXT"),
+    # v5: index the default listing/autocomplete sort (is_deleted + updated_at DESC)
+    # so large vaults seek instead of full-scanning + sorting on every page render.
+    (5, "CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(is_deleted, updated_at DESC)"),
 ]
 
 
