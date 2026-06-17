@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import threading
+import time
 
 from . import graph
 from .embedding import Embedder
 from .markdown_utils import chunk_markdown, extract_links
+from .metrics import EMBED_CHUNKS, EMBED_DURATION
 
 log = logging.getLogger("llm_wiki.indexing")
 
@@ -71,7 +74,13 @@ def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
         rows = conn.execute(
             "SELECT id, text FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
         ).fetchall()
-    embs = embedder.embed_passages([r["text"] for r in rows]) if rows else []
+    if rows:
+        t0 = time.perf_counter()
+        embs = embedder.embed_passages([r["text"] for r in rows])
+        EMBED_DURATION.observe(time.perf_counter() - t0)
+        EMBED_CHUNKS.inc(len(rows))
+    else:
+        embs = []
     embedded = {r["id"]: (r["text"], emb) for r, emb in zip(rows, embs, strict=False)}
     with db.writer() as conn:
         current = {
@@ -121,8 +130,11 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
     texts = [r["text"] for r in rows]
     log.info("embed_pending: embedding %d chunk(s) across %d document(s)", len(texts), len(dirty))
     vectors: list = []
+    t0 = time.perf_counter()
     for i in range(0, len(texts), batch_size):
         vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
+    EMBED_DURATION.observe(time.perf_counter() - t0)
+    EMBED_CHUNKS.inc(len(texts))
     embedded = {r["chunk_id"]: (r["text"], emb) for r, emb in zip(rows, vectors, strict=False)}
 
     cleared = 0
@@ -149,3 +161,50 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
                 cleared += 1
     log.info("embed_pending: cleared vector_dirty on %d/%d document(s)", cleared, len(dirty))
     return cleared
+
+
+class EmbeddingWorker:
+    """Background thread that drains ``vector_dirty`` documents off the write path.
+
+    Writers set ``vector_dirty=1`` inside their commit, then call :meth:`notify`; the
+    worker wakes and runs :func:`embed_pending` to (re)embed everything still dirty. A
+    periodic idle sweep also runs, so documents made dirty without a notify (e.g. an
+    external ``reindex``) are still picked up. This keeps the embedding forward pass —
+    the slowest CPU step — out of the request that saved the document.
+
+    Used only while serving; tests/CLI leave it None and embed inline so write-then-search
+    stays immediately consistent. Anything still dirty at shutdown is embedded by the next
+    startup sweep, so a bounded join on :meth:`stop` never loses vectors."""
+
+    def __init__(self, db, embedder: Embedder, *, idle_interval: float = 30.0) -> None:
+        self._db = db
+        self._embedder = embedder
+        self._idle_interval = idle_interval
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="llmwiki-embed", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def notify(self) -> None:
+        """Wake the worker to embed freshly-dirtied documents (called after a write)."""
+        self._wake.set()
+
+    def stop(self, timeout: float = 10.0) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            # Wake on notify() or every idle_interval, whichever comes first.
+            self._wake.wait(self._idle_interval)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                embed_pending(self._db, self._embedder)
+            except Exception:
+                log.exception("embed worker: sweep failed; will retry")

@@ -29,18 +29,58 @@
   }
 
   // ---- sidebar collapse ------------------------------------------------
+  // On narrow viewports the sidebars are fixed overlays over the content. They
+  // must default closed (else they cover the page on load) and their open state
+  // is NOT persisted — only one overlay shows at a time, dismissed by a backdrop
+  // tap, Esc, or navigation (a full page load re-runs applyCollapsed → closed).
+  // On wide viewports the saved collapse state applies exactly as before.
+  var mqNarrow = window.matchMedia("(max-width: 860px)");
+  function isNarrow() { return mqNarrow.matches; }
+  var backdrop = null;
+
   function applyCollapsed() {
-    shell.classList.toggle("no-left", get("wiki-left-collapsed", "0") === "1");
-    shell.classList.toggle("no-right", get("wiki-right-collapsed", "0") === "1");
+    if (isNarrow()) {
+      shell.classList.add("no-left", "no-right");
+    } else {
+      shell.classList.toggle("no-left", get("wiki-left-collapsed", "0") === "1");
+      shell.classList.toggle("no-right", get("wiki-right-collapsed", "0") === "1");
+    }
+    syncBackdrop();
   }
   function toggleLeft() {
     var n = !shell.classList.contains("no-left");
-    shell.classList.toggle("no-left", n); set("wiki-left-collapsed", n ? "1" : "0");
+    shell.classList.toggle("no-left", n);
+    if (isNarrow()) { if (!n) shell.classList.add("no-right"); }   // one overlay at a time
+    else set("wiki-left-collapsed", n ? "1" : "0");
+    syncBackdrop();
   }
   function toggleRight() {
     var n = !shell.classList.contains("no-right");
-    shell.classList.toggle("no-right", n); set("wiki-right-collapsed", n ? "1" : "0");
+    shell.classList.toggle("no-right", n);
+    if (isNarrow()) { if (!n) shell.classList.add("no-left"); }
+    else set("wiki-right-collapsed", n ? "1" : "0");
+    syncBackdrop();
   }
+  function closeOverlays() { shell.classList.add("no-left", "no-right"); syncBackdrop(); }
+  function syncBackdrop() {
+    var open = isNarrow() &&
+      (!shell.classList.contains("no-left") || !shell.classList.contains("no-right"));
+    if (open && !backdrop) {
+      backdrop = document.createElement("div");
+      backdrop.className = "sb-backdrop";
+      backdrop.addEventListener("click", closeOverlays);
+      shell.appendChild(backdrop);
+      requestAnimationFrame(function () { if (backdrop) backdrop.classList.add("show"); });
+    } else if (!open && backdrop) {
+      var b = backdrop; backdrop = null;
+      b.classList.remove("show");
+      setTimeout(function () { b.remove(); }, 200);
+    }
+  }
+  // Re-apply on the wide<->narrow boundary so the desktop collapse state is
+  // restored when widening, and overlays are forced closed when narrowing.
+  if (mqNarrow.addEventListener) mqNarrow.addEventListener("change", applyCollapsed);
+  else if (mqNarrow.addListener) mqNarrow.addListener(applyCollapsed);
 
   // The right panel is meaningful only on pages that fill it (the viewer). If it
   // has no real content, collapse it unless the user explicitly opened it.
@@ -160,9 +200,13 @@
       .then(function (d) {
         if (!d || !d.ok) return;
         var tree = document.getElementById("file-tree");
-        if (tree) { tree.innerHTML = renderNode(d.tree); bindTree(); }
+        if (tree) { tree.innerHTML = renderNode(d.tree) || EMPTY_TREE_HTML; bindTree(); }
       }).catch(function () {});
   }
+
+  // Empty-tree placeholder; mirrors the server-rendered fallback in base.html.
+  var EMPTY_TREE_HTML = '<p class="tree-empty muted">아직 문서가 없습니다.' +
+    (W.canWrite ? ' 위의 <b>＋ 문서</b>로 첫 노트를 만들어 보세요.' : '') + '</p>';
 
   // Client mirror of templates/_tree.html so a refresh keeps markup/handlers valid.
   function renderNode(node) {
@@ -346,6 +390,7 @@
   // global keyboard: Ctrl/Cmd+\ toggles the left sidebar.
   document.addEventListener("keydown", function (e) {
     if ((e.metaKey || e.ctrlKey) && e.key === "\\") { e.preventDefault(); toggleLeft(); }
+    else if (e.key === "Escape" && backdrop) { closeOverlays(); }
   });
 
   // expose for palette.js

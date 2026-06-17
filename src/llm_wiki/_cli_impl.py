@@ -434,7 +434,7 @@ def _serve(args) -> int:
     configure_logging(settings.log_level, settings.log_file)
 
     print("Loading embedding model… (first run downloads it from HuggingFace)")
-    ctx = build_context(settings, full=True)
+    ctx = build_context(settings, full=True, start_embed_worker=True)
     ctx.embedder.warm()  # load weights now so the first request isn't slow / failing readiness
     if not args.no_recover:
         n = ctx.docs.recover_pending()
@@ -446,6 +446,11 @@ def _serve(args) -> int:
         embedded = ctx.docs.embed_pending()
         if embedded:
             print(f"Re-embedded {embedded} document(s) left pending by the last run.")
+    # Start the background embedder only after the boot sweep, so writes during startup
+    # don't notify a thread that isn't running yet. From here, create/update flag
+    # vector_dirty and hand the slow forward pass to this worker, off the request path.
+    if ctx.embed_worker is not None:
+        ctx.embed_worker.start()
 
     web_app = create_web_app(ctx)
     mcp_app = create_mcp_server(ctx).streamable_http_app()
@@ -470,7 +475,13 @@ def _serve(args) -> int:
 
     print(f"Web UI : http://{settings.host}:{settings.gui_port}")
     print(f"MCP    : http://{settings.host}:{settings.mcp_port}/mcp  (Authorization: Bearer <api_key>)")
-    asyncio.run(_serve_both(settings, web_app, mcp_app))
+    try:
+        asyncio.run(_serve_both(settings, web_app, mcp_app))
+    finally:
+        # Stop the embedder thread; anything still vector_dirty is embedded by the next
+        # startup sweep, so a bounded join can't lose vectors.
+        if ctx.embed_worker is not None:
+            ctx.embed_worker.stop()
     return 0
 
 

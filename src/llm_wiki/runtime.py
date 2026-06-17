@@ -12,6 +12,7 @@ from .config import Settings, get_settings
 from .db import Database
 from .embedding import Embedder, get_embedder
 from .events import EventHub
+from .indexing import EmbeddingWorker
 from .search import FusionParams
 from .services.documents import DocumentService
 
@@ -23,9 +24,11 @@ class AppContext:
     embedder: Embedder
     docs: DocumentService
     events: EventHub
+    embed_worker: EmbeddingWorker | None = None
 
 
-def build_context(settings: Settings | None = None, *, full: bool = True) -> AppContext:
+def build_context(settings: Settings | None = None, *, full: bool = True,
+                  start_embed_worker: bool = False) -> AppContext:
     settings = settings or get_settings()
     settings.ensure_dirs()
     db = Database(settings.db_path)
@@ -42,5 +45,10 @@ def build_context(settings: Settings | None = None, *, full: bool = True) -> App
         vector_factor=settings.search_vector_factor,
         vector_cap=settings.search_vector_cap,
     )
-    docs = DocumentService(db, embedder, settings.vault_path, events=events, search_params=fusion)
-    return AppContext(settings=settings, db=db, embedder=embedder, docs=docs, events=events)
+    # The worker is constructed here but started by the caller (after the startup
+    # embed sweep) so writes during boot don't race an unstarted thread.
+    embed_worker = EmbeddingWorker(db, embedder) if start_embed_worker else None
+    docs = DocumentService(db, embedder, settings.vault_path, events=events,
+                           search_params=fusion, embed_worker=embed_worker)
+    return AppContext(settings=settings, db=db, embedder=embedder, docs=docs,
+                      events=events, embed_worker=embed_worker)

@@ -30,12 +30,17 @@ class RateLimiter:
             self._prune(dq, now)
             return len(dq) < self.max_attempts
 
-    def record_failure(self, key: str) -> None:
+    def record_failure(self, key: str) -> bool:
+        """Record one failure. Returns True only on the failure that *first* reaches
+        ``max_attempts`` within the window — the just-crossed-the-threshold edge — so a
+        caller can act once per window (e.g. write a single audit row) instead of on
+        every failed attempt, which would let a brute-force become a write-amplification."""
         now = time.monotonic()
         with self._lock:
             dq = self._hits[key]
             self._prune(dq, now)
             dq.append(now)
+            return len(dq) == self.max_attempts
 
     def reset(self, key: str) -> None:
         with self._lock:

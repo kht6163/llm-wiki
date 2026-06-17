@@ -1,12 +1,13 @@
 {% extends "base.html" %}
 {% block title %}{% if is_new %}새 문서{% else %}편집{% endif %}{% endblock %}
 {% block content %}
+{% from "_icons.html" import icon %}
 <link rel="stylesheet" href="{{ static('vendor/md-editor.bundle.css') }}">
 <h1>{% if is_new %}새 문서{% else %}편집 · {{ path }}{% endif %}</h1>
 {% if error %}<div class="error">{{ error }}</div>{% endif %}
 {% if conflict %}
 <div class="conflict">
-  <strong>⚠ 충돌로 거부됨.</strong>
+  <strong>{{ icon("alert-triangle") }} 충돌로 거부됨.</strong>
   다른 변경(현재 <b>v{{ conflict.current_version }}</b>{% if conflict.updated_by %}, {{ conflict.updated_by }}{% endif %})이 먼저 적용되었습니다.
   아래 차이를 확인해 병합한 뒤 다시 저장하세요. (base_version은 v{{ conflict.current_version }}로 갱신됨)
   {% if conflict_diff %}

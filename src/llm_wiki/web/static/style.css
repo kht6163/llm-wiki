@@ -121,6 +121,9 @@ h1 { font-size: 1.6em; }
 .conflict { padding: 12px 14px; color: var(--fg); background: var(--warn-soft);
   border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent);
   border-radius: var(--r-md); margin-bottom: 16px; }
+.conflict strong { display: inline-flex; align-items: center; gap: 6px;
+  color: color-mix(in srgb, var(--warn) 75%, var(--fg)); }
+.conflict strong svg { width: 15px; height: 15px; flex: none; }
 .conflict pre { max-height: 320px; }
 
 .doclist { list-style: none; padding: 0; }
@@ -664,23 +667,33 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
    from it so light/dark adapt automatically. */
 .callout {
   --c: var(--accent);
+  /* monochrome line icon (Lucide), masked so it inherits the title's colour —
+     no emoji, consistent with the rest of the icon system + dark-safe. */
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M12 16v-4'/%3E%3Cpath d='M12 8h.01'/%3E%3C/svg%3E");
   border: 1px solid color-mix(in srgb, var(--c) 42%, var(--line));
   border-radius: var(--r-md); padding: 11px 14px; margin: 14px 0;
   background: color-mix(in srgb, var(--c) 9%, transparent);
 }
 .callout-title { font-weight: 700; display: flex; align-items: center; gap: 8px;
   color: color-mix(in srgb, var(--c) 70%, var(--fg)); }
-.callout-title::before { content: "📌"; }
+.callout-title::before {
+  content: ""; width: 16px; height: 16px; flex: none; display: inline-block;
+  background-color: currentColor;
+  -webkit-mask: var(--callout-icon) center / 16px no-repeat;
+  mask: var(--callout-icon) center / 16px no-repeat;
+}
 .callout > :last-child { margin-bottom: 0; }
 .callout-info { --c: var(--accent); }
-.callout-tip, .callout-success { --c: var(--success); }
-.callout-tip .callout-title::before, .callout-success .callout-title::before { content: "💡"; }
-.callout-warning { --c: var(--warn); }
-.callout-warning .callout-title::before { content: "⚠️"; }
-.callout-danger, .callout-error { --c: var(--danger); }
-.callout-danger .callout-title::before, .callout-error .callout-title::before { content: "🛑"; }
-.callout-quote .callout-title::before { content: "❝"; }
-.callout-question .callout-title::before { content: "❓"; }
+.callout-tip, .callout-success { --c: var(--success);
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5'/%3E%3Cpath d='M9 18h6'/%3E%3Cpath d='M10 22h4'/%3E%3C/svg%3E"); }
+.callout-warning { --c: var(--warn);
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z'/%3E%3Cpath d='M12 9v4'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E"); }
+.callout-danger, .callout-error { --c: var(--danger);
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 16h.01'/%3E%3Cpath d='M12 8v4'/%3E%3Cpath d='M15.31 2a2 2 0 0 1 1.41.59l4.69 4.69A2 2 0 0 1 22 8.69v6.62a2 2 0 0 1-.59 1.41l-4.69 4.69a2 2 0 0 1-1.41.59H8.69a2 2 0 0 1-1.41-.59l-4.69-4.69A2 2 0 0 1 2 15.31V8.69a2 2 0 0 1 .59-1.41l4.69-4.69A2 2 0 0 1 8.69 2z'/%3E%3C/svg%3E"); }
+.callout-quote {
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M16 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1 1 1 0 0 0 1 1 4 4 0 0 0 4-4V5a2 2 0 0 0-2-2z'/%3E%3Cpath d='M5 3a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2 1 1 0 0 1 1 1v1a2 2 0 0 1-2 2 1 1 0 0 0-1 1 1 1 0 0 0 1 1 4 4 0 0 0 4-4V5a2 2 0 0 0-2-2z'/%3E%3C/svg%3E"); }
+.callout-question {
+  --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='12' cy='12' r='10'/%3E%3Cpath d='M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3'/%3E%3Cpath d='M12 17h.01'/%3E%3C/svg%3E"); }
 
 /* rendered task checkboxes */
 .rendered .task-item { list-style: none; }
@@ -688,21 +701,36 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 
 .login-shell { max-width: 340px; margin: 8vh auto; padding: 0 16px; }
 
-/* Responsive: collapse the grid to a single column; sidebars slide in as overlays. */
+/* tree empty-state placeholder (sidebar files panel) */
+.tree-empty { padding: 12px 10px 8px; font-size: 0.82em; line-height: 1.55; }
+
+/* Mobile sidebar backdrop: a dimmer behind an open overlay sidebar. JS appends
+   it (narrow viewports only) and toggles .show; tapping it closes the overlay. */
+.sb-backdrop {
+  position: fixed; inset: 0; z-index: 110; background: rgba(0, 0, 0, 0.42);
+  opacity: 0; transition: opacity var(--t) var(--ease);
+}
+.sb-backdrop.show { opacity: 1; }
+
+/* Responsive: collapse the grid to a single column; sidebars become fixed
+   off-canvas overlays that slide in (transform, so the transition is visible)
+   rather than display-toggling. Default: parked off-screen. */
 @media (max-width: 860px) {
   .app-shell, .app-shell.no-left, .app-shell.no-right, .app-shell.no-left.no-right {
     grid-template-columns: var(--ribbon-w) minmax(0, 1fr);
   }
   .sidebar-left, .sidebar-right {
     position: fixed; top: 0; bottom: 0; z-index: 120; width: min(82vw, 320px);
-    box-shadow: 0 0 40px rgba(0,0,0,.3);
+    box-shadow: 0 0 40px rgba(0, 0, 0, 0.3); transition: transform var(--t) var(--ease);
   }
-  .sidebar-left { left: var(--ribbon-w); }
-  .sidebar-right { right: 0; border-left: 1px solid var(--line); }
-  .app-shell.no-left .sidebar-left { display: none; }
-  .app-shell:not(.no-left) .sidebar-left { display: flex; }
-  .app-shell.no-right .sidebar-right { display: none; }
-  .app-shell:not(.no-right) .sidebar-right { display: block; }
+  /* Keep them rendered (override the global display:none collapse) so the
+     transform transition runs; visibility is driven by translate instead. */
+  .app-shell.no-left .sidebar-left { display: flex; }
+  .app-shell.no-right .sidebar-right { display: block; }
+  .sidebar-left { left: var(--ribbon-w); transform: translateX(-110%); }
+  .sidebar-right { right: 0; border-left: 1px solid var(--line); transform: translateX(110%); }
+  .app-shell:not(.no-left) .sidebar-left { transform: translateX(0); }
+  .app-shell:not(.no-right) .sidebar-right { transform: translateX(0); }
   .statusbar { grid-column: 1 / -1; }
   .main-col { grid-column: 2; }
 }

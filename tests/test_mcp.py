@@ -37,7 +37,8 @@ async def test_tools_registered(ctx):
     mcp = create_mcp_server(ctx)
     names = {t.name for t in await mcp.list_tools()}
     expected = {
-        "search_documents", "read_document", "get_document_info", "get_outline", "list_documents",
+        "search_documents", "read_document", "get_document_info", "get_outline", "read_chunk",
+        "list_documents",
         "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
         "get_backlinks", "resolve_links", "get_revisions", "get_revision", "get_graph",
         "assemble_context", "get_related_documents",
@@ -66,6 +67,27 @@ async def test_unauthorized_envelope(ctx, monkeypatch):
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("get_tags", {}))
     assert d["ok"] is False and d["error"]["code"] == "unauthorized"
+
+
+def _audit_count(ctx, action):
+    with ctx.db.reader() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE action=?", (action,)).fetchone()[0]
+
+
+async def test_mcp_auth_failure_audited_once_at_threshold(ctx, monkeypatch):
+    # A Bearer brute-force is persisted to the audit trail exactly once per window — on
+    # the failure that crosses the limiter threshold (10) — so it surfaces in the admin
+    # feed without taking the writer lock on every attempt.
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: "bad-key")
+    mcp = create_mcp_server(ctx)
+    for _ in range(9):
+        await mcp.call_tool("get_tags", {})
+    assert _audit_count(ctx, "mcp_auth_failed") == 0   # below threshold: app-log only
+    await mcp.call_tool("get_tags", {})                # 10th crosses the threshold
+    assert _audit_count(ctx, "mcp_auth_failed") == 1
+    await mcp.call_tool("get_tags", {})                # already blocked: no re-amplification
+    assert _audit_count(ctx, "mcp_auth_failed") == 1
 
 
 async def test_search_rejects_empty_query(editor_mcp):
@@ -262,6 +284,39 @@ async def test_read_tools_e2e(editor_mcp):
     assert rv["ok"] and rv["revisions"]
     one = _payload(await mcp.call_tool("get_revision", {"path": "notes/a.md", "version": 1}))
     assert one["ok"] and "content" in one
+
+
+async def test_read_chunk_tool(editor_mcp):
+    # Chunk-addressable read: pull one matched passage (plus neighbours) instead of
+    # the whole body. Sections are padded so chunk_markdown splits them apart.
+    mcp = editor_mcp
+    body = ("# Doc\n\n## Alpha\n\n" + "alpha " * 80 + "\n\n## Beta\n\n" + "beta " * 80
+            + "\n\n## Gamma\n\n" + "gamma " * 80)
+    _payload(await mcp.call_tool("create_document", {"path": "ch.md", "content": body}))
+
+    c0 = _payload(await mcp.call_tool("read_chunk", {"path": "ch.md", "ordinal": 0}))
+    assert c0["ok"] and c0["ordinal"] == 0 and c0["chunk_count"] >= 1
+    assert c0["has_before"] is False
+    assert c0["chunks"][0]["char_start"] == c0["char_start"]
+
+    # A wide 'after' window pulls every chunk; the joined window reaches the end.
+    full = _payload(await mcp.call_tool("read_chunk", {"path": "ch.md", "ordinal": 0, "after": 20}))
+    assert full["ok"] and len(full["chunks"]) == full["chunk_count"]
+    assert full["has_after"] is False
+
+    miss = _payload(await mcp.call_tool("read_chunk", {"path": "ch.md", "ordinal": 999}))
+    assert miss["ok"] is False and miss["error"]["code"] == "not_found"
+
+
+async def test_search_hit_exposes_chunk_address(editor_mcp):
+    # Every hit carries chunk_ordinal/chunk_id keys so an agent can hand them to
+    # read_chunk; they are None for a BM25-only match (no per-chunk vector rank).
+    mcp = editor_mcp
+    _payload(await mcp.call_tool(
+        "create_document", {"path": "addr.md", "content": "# Addr\n\n" + "needle " * 60}))
+    sd = _payload(await mcp.call_tool("search_documents", {"query": "needle", "mode": "bm25"}))
+    hit = next(r for r in sd["results"] if r["path"] == "addr.md")
+    assert "chunk_ordinal" in hit and "chunk_id" in hit
 
 
 async def test_get_related_documents_tool(editor_mcp):

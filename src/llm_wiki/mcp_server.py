@@ -84,7 +84,17 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 try:
                     principal = _principal(token)
                 except UnauthorizedError as e:
-                    auth_limiter.record_failure(ip_key)
+                    just_blocked = auth_limiter.record_failure(ip_key)
+                    if just_blocked:
+                        # Persist exactly once per window (the threshold-crossing failure)
+                        # so a Bearer brute-force surfaces in the admin audit feed without
+                        # amplifying into writer-lock contention on every attempt. Never let
+                        # an audit write failure mask the auth response.
+                        try:
+                            audit.record_tx(db, actor=actor, via="mcp", action="mcp_auth_failed",
+                                            outcome="blocked", detail=f"ip={_client_ip(ctx)}")
+                        except Exception:
+                            log.exception("failed to audit mcp auth block")
                     outcome = e.code
                     return e.to_dict()
                 auth_limiter.reset(ip_key)
@@ -117,8 +127,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "the top_k cap — raise top_k to see more. Echoes 'mode' and 'top_k'. "
                           "Each hit may include 'heading' (the matched section) and 'heading_path' "
                           "(its breadcrumb); pass 'heading' to read_document(section=) to read just "
-                          "that section. Rejects an empty query with code 'validation' (so 0 "
-                          "results means 'no matches', never 'bad query').")
+                          "that section, or feed a hit's 'chunk_ordinal' to read_chunk to pull that "
+                          "exact passage (plus neighbours) token-cheaply. Rejects an empty query "
+                          "with code 'validation' (so 0 results means 'no matches', never 'bad "
+                          "query').")
     async def search_documents(
         ctx: Context,
         query: str,
@@ -197,6 +209,27 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "read_document(section=)/replace_section/append_section.")
     async def get_outline(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.outline(path)}, "get_outline")
+
+    @mcp.tool(description="Read one indexed chunk of a document by 'ordinal' — the 'chunk_ordinal' a "
+                          "search hit carries — optionally with neighbouring chunks via 'before'/"
+                          "'after'. Chunks are the exact passages the hybrid retriever matches, so "
+                          "this pulls just the relevant section (plus surrounding context) instead "
+                          "of the whole body: the token-cheap follow-up to a search hit. Returns the "
+                          "joined 'text', the per-chunk breakdown (each with heading/heading_path/"
+                          "char range), 'chunk_count', and 'has_before'/'has_after' so you can page "
+                          "outward. Fails 'not_found' if the ordinal is out of range or the document "
+                          "has no indexed chunks yet.")
+    async def read_chunk(
+        ctx: Context, path: str,
+        ordinal: Annotated[int, Field(ge=0,
+                           description="0-based chunk index (a search hit's chunk_ordinal).")],
+        before: Annotated[int, Field(ge=0, le=20,
+                          description="Also include N preceding chunks for context.")] = 0,
+        after: Annotated[int, Field(ge=0, le=20,
+                         description="Also include N following chunks for context.")] = 0,
+    ) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, **docs.read_chunk(
+            path, ordinal, before=before, after=after)}, "read_chunk")
 
     @mcp.tool(description="List documents, optionally filtered by folder/tag. Returns 'count' "
                           "(this page), 'total' (all matches), 'has_more' for paging, and echoes "

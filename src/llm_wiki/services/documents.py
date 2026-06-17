@@ -27,6 +27,7 @@ from ..markdown_utils import (
     derive_title,
     extract_links,
     extract_tags,
+    heading_slug,
     parse_frontmatter,
     rewrite_link_target,
     set_frontmatter_tags,
@@ -140,7 +141,8 @@ def _as_block(text: str) -> str:
 
 class DocumentService:
     def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str, events=None,
-                 search_params: search.FusionParams | None = None):
+                 search_params: search.FusionParams | None = None,
+                 embed_worker: indexing.EmbeddingWorker | None = None):
         self.db = db
         self.embedder = embedder
         self.vault = Path(vault_path)
@@ -149,6 +151,10 @@ class DocumentService:
         self.events = events
         # Hybrid-search fusion tuning (from Settings); defaults match the old constants.
         self.search_params = search_params or search.DEFAULT_FUSION
+        # When set (serving), writes only flag vector_dirty + notify this worker, so the
+        # slow embedding forward pass runs off the request path. None (tests/CLI) -> embed
+        # inline so a write is immediately visible to vector search.
+        self.embed_worker = embed_worker
 
     # ---- helpers --------------------------------------------------------
     def _emit(self, op: str, path: str, version: int, **extra) -> None:
@@ -185,6 +191,16 @@ class DocumentService:
         ):
             out.setdefault(row["doc_id"], []).append(row["tag"])
         return out
+
+    def _embed(self, doc_id: int) -> None:
+        """Embed a document's chunks after a write. With a background worker (serving),
+        flag-and-notify only — ``vector_dirty`` was already set in the write txn — so the
+        slow forward pass is off the request path; without one (tests/CLI), embed inline
+        so the write is immediately visible to vector search."""
+        if self.embed_worker is not None:
+            self.embed_worker.notify()
+        else:
+            indexing.embed_doc(self.db, self.embedder, doc_id)
 
     def _latest_body(self, conn, doc_id: int) -> str:
         r = conn.execute(
@@ -280,6 +296,56 @@ class DocumentService:
                 "tags": tags, "folder": d["folder"], "created_at": d["created_at"],
                 "updated_at": d["updated_at"], "updated_by": self._username(conn, d["updated_by"]),
                 "last_via": lv["via"] if lv else None,
+            }
+
+    def read_chunk(self, path: str, ordinal: int, *, before: int = 0, after: int = 0) -> dict:
+        """Read one indexed chunk by ``ordinal``, optionally with neighbouring chunks.
+
+        Chunks are the very passages the hybrid retriever matches, so an agent that
+        got a ``chunk_ordinal`` from search can pull exactly that section — plus
+        ``before``/``after`` neighbours for context — without re-fetching the whole
+        document. Returns the joined ``text``, the per-chunk breakdown, the total
+        ``chunk_count``, and ``has_before``/``has_after`` so a reader can page outward.
+        """
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        before = clamp_int(before, 0, 20)
+        after = clamp_int(after, 0, 20)
+        with self.db.reader() as conn:
+            d = conn.execute(
+                "SELECT id, path, version FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
+            if not d:
+                raise NotFoundError("No document at this path.", path=rel)
+            total = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE doc_id=?", (d["id"],)
+            ).fetchone()[0]
+            lo = max(0, int(ordinal) - before)
+            hi = int(ordinal) + after
+            rows = conn.execute(
+                "SELECT ordinal, heading, heading_path, text, char_start, char_end "
+                "FROM chunks WHERE doc_id=? AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
+                (d["id"], lo, hi),
+            ).fetchall()
+            if not rows:
+                raise NotFoundError(
+                    "No chunk at this ordinal." if total else "Document has no indexed chunks.",
+                    path=rel, ordinal=int(ordinal), chunk_count=total,
+                )
+            chunks = [{
+                "ordinal": r["ordinal"], "heading": r["heading"],
+                "heading_path": r["heading_path"], "text": r["text"],
+                "char_start": r["char_start"], "char_end": r["char_end"],
+                "anchor": heading_slug(r["heading"]) if r["heading"] else None,
+            } for r in rows]
+            return {
+                "path": d["path"], "version": d["version"],
+                "ordinal": int(ordinal), "chunk_count": total,
+                "char_start": chunks[0]["char_start"], "char_end": chunks[-1]["char_end"],
+                "has_before": chunks[0]["ordinal"] > 0,
+                "has_after": chunks[-1]["ordinal"] < total - 1,
+                "text": "\n\n".join(c["text"] for c in chunks),
+                "chunks": chunks,
             }
 
     def exists(self, path: str) -> bool:
@@ -690,7 +756,7 @@ class DocumentService:
         with self.db.writer() as conn:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         if embed:
-            indexing.embed_doc(self.db, self.embedder, doc_id)
+            self._embed(doc_id)
         DOC_WRITES.labels("create").inc()
         self._emit("create", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via)
@@ -750,7 +816,7 @@ class DocumentService:
         with self.db.writer() as conn:
             conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
         if content_changed and embed:
-            indexing.embed_doc(self.db, self.embedder, doc_id)
+            self._embed(doc_id)
         DOC_WRITES.labels("update").inc()
         self._emit("update", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via,

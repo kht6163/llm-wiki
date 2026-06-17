@@ -55,7 +55,13 @@ from ..services.auth import (
 )
 from ..services.documents import ATTACH_MAX_BYTES
 from ..services.errors import ConflictError, ForbiddenError, ValidationError, WikiError
-from ..util import PathError, clamp_int, normalize_client_ip, word_count
+from ..util import (
+    PathError,
+    clamp_int,
+    content_disposition_attachment,
+    normalize_client_ip,
+    word_count,
+)
 from .security import (
     RateLimiter,
     SecurityHeadersMiddleware,
@@ -557,10 +563,10 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.get("/doc/{path:path}/raw")
     def raw(path: str, request: Request, _p: Principal = Depends(require_user)):
         doc = docs.get(path)
-        filename = doc["path"].rsplit("/", 1)[-1].replace('"', "")
+        filename = doc["path"].rsplit("/", 1)[-1]
         return PlainTextResponse(
             doc["content"], media_type="text/markdown; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={"Content-Disposition": content_disposition_attachment(filename)},
         )
 
     @web.get("/doc/{path:path}/rev/{version}", response_class=HTMLResponse)

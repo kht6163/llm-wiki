@@ -3,6 +3,7 @@
 Authorization lives inline in each handler, so these route-level tests are the
 only thing that catches a missing guard."""
 import re
+from urllib.parse import quote
 
 import pytest
 from starlette.testclient import TestClient
@@ -39,6 +40,18 @@ def create_doc(client: TestClient, path: str, content: str, title: str = ""):
 def test_unauthenticated_redirects_to_login(client):
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/login"
+
+
+def test_raw_download_unicode_content_disposition(client):
+    # A non-ASCII (Korean) filename must use RFC 5987 filename* and never emit raw
+    # CR/LF into the header value (header-injection / broken-download hardening).
+    login(client, "alice")
+    create_doc(client, "노트.md", "# 노트\n\n본문")
+    r = client.get("/doc/" + quote("노트.md") + "/raw")
+    assert r.status_code == 200
+    cd = r.headers["content-disposition"]
+    assert "filename*=UTF-8''" in cd
+    assert "\r" not in cd and "\n" not in cd
 
 
 def test_login_success_and_logout(client):

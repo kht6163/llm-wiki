@@ -41,8 +41,20 @@ MCP_LATENCY = Histogram(
 SEARCH_QUERIES = Counter(
     "llmwiki_search_queries_total", "Search queries by ranking mode.", ["mode"],
 )
+SEARCH_LATENCY = Histogram(
+    "llmwiki_search_duration_seconds",
+    "Hybrid search latency in seconds (BM25 + vector KNN + RRF) by mode.", ["mode"],
+)
 DOC_WRITES = Counter(
     "llmwiki_doc_writes_total", "Document write operations.", ["action"],
+)
+# Embedding is the slowest CPU step on the write path; these isolate its cost so a
+# growing vector_dirty backlog can be attributed to throughput vs. queue depth.
+EMBED_DURATION = Histogram(
+    "llmwiki_embed_duration_seconds", "Embedding forward-pass latency in seconds (per batch).",
+)
+EMBED_CHUNKS = Counter(
+    "llmwiki_embedded_chunks_total", "Chunks sent through the embedding encoder.",
 )
 
 # Index/health gauges — point-in-time state, refreshed from the DB at scrape time

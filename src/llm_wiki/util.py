@@ -6,6 +6,7 @@ import ipaddress
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 # Media / non-document extensions that markdown links may point at; excluded
 # from the link graph.
@@ -84,6 +85,10 @@ def normalize_rel_path(raw: str) -> str:
             continue
         if seg == "..":
             raise PathError("path may not contain '..'")
+        if any(ord(c) < 0x20 or ord(c) == 0x7f for c in seg):
+            # Control chars (esp. CR/LF) would otherwise survive into the .md projection,
+            # logs, and response headers (e.g. Content-Disposition) — reject at the door.
+            raise PathError("path may not contain control characters")
         parts.append(seg)
     if not parts:
         raise PathError("path is empty")
@@ -124,6 +129,19 @@ def folder_of(rel: str) -> str:
 def basename_stem(rel: str) -> str:
     name = rel.rsplit("/", 1)[-1]
     return name[:-3] if name.lower().endswith(".md") else name
+
+
+def content_disposition_attachment(filename: str) -> str:
+    """An ``attachment`` Content-Disposition value with an RFC 5987 UTF-8 ``filename*``
+    plus a sanitized ASCII ``filename`` fallback. Strips control characters and quoting
+    metacharacters, so a document name — possibly non-ASCII (Korean) — can neither break
+    the header value nor inject extra header fields, while modern clients still get the
+    correct UTF-8 name via ``filename*``."""
+    ascii_name = "".join(
+        c for c in filename.encode("ascii", "ignore").decode("ascii")
+        if c >= " " and c != "\x7f"
+    ).replace('"', "").replace("\\", "") or "document.md"
+    return f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename, safe='')}"
 
 
 def safe_join(vault: Path | str, rel: str) -> Path:

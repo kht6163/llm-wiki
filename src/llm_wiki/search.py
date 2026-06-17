@@ -5,11 +5,12 @@ need normalizing.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import asdict, dataclass
 
 from .embedding import Embedder
 from .markdown_utils import heading_slug
-from .metrics import SEARCH_QUERIES
+from .metrics import SEARCH_LATENCY, SEARCH_QUERIES
 from .util import clamp_int
 
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
@@ -39,6 +40,8 @@ class SearchResult:
     version: int
     heading_path: str | None = None   # "H1 > H2" breadcrumb of the matched section
     anchor: str | None = None         # heading slug for a #fragment deep-link
+    chunk_ordinal: int | None = None  # ordinal of the matched chunk (None for BM25-only)
+    chunk_id: int | None = None       # stable chunk id; feed to read_chunk for full passage
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,7 +79,11 @@ def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
     return [(r["doc_id"], r["rank"]) for r in rows]
 
 
-def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int, tuple]]:
+def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int, dict]]:
+    """Vector KNN collapsed to one best chunk per document. Each value is a dict
+    with the matched chunk's distance/heading/text/heading_path plus its stable
+    ``chunk_id`` and ``ordinal`` — the latter two let callers expose a chunk
+    address (for read_chunk) instead of only an opaque snippet."""
     qv = embedder.embed_query(query)
     rows = conn.execute(
         "SELECT chunk_id, distance FROM chunk_vectors "
@@ -91,18 +98,22 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
     chunk_map = {
         c["id"]: c
         for c in conn.execute(
-            f"SELECT id, doc_id, heading, text, heading_path FROM chunks WHERE id IN ({ph})", ids
+            f"SELECT id, doc_id, ordinal, heading, text, heading_path "
+            f"FROM chunks WHERE id IN ({ph})", ids
         )
     }
-    best: dict[int, tuple] = {}  # doc_id -> (distance, heading, text, heading_path)
+    best: dict[int, dict] = {}  # doc_id -> matched-chunk info
     for r in rows:
         ch = chunk_map.get(r["chunk_id"])
         if not ch:
             continue
         d = ch["doc_id"]
-        if d not in best or r["distance"] < best[d][0]:
-            best[d] = (r["distance"], ch["heading"], ch["text"], ch["heading_path"])
-    return sorted(best.items(), key=lambda kv: kv[1][0])
+        if d not in best or r["distance"] < best[d]["distance"]:
+            best[d] = {
+                "distance": r["distance"], "heading": ch["heading"], "text": ch["text"],
+                "heading_path": ch["heading_path"], "chunk_id": ch["id"], "ordinal": ch["ordinal"],
+            }
+    return sorted(best.items(), key=lambda kv: kv[1]["distance"])
 
 
 def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
@@ -111,8 +122,9 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     """Core retrieval+RRF fusion shared by ``search_page`` and ``assemble_context``.
 
     Returns ``(scored, vec_info, match)`` where ``scored`` is ``[(doc_id, rrf_score)]``
-    sorted best-first, ``vec_info`` maps doc_id -> ``(distance, heading, text)`` for the
-    document's closest vector chunk, and ``match`` is the FTS MATCH expression (or None).
+    sorted best-first, ``vec_info`` maps doc_id -> a dict describing the document's
+    closest vector chunk (``distance``/``heading``/``text``/``heading_path``/``chunk_id``/
+    ``ordinal``), and ``match`` is the FTS MATCH expression (or None).
     BM25 pre-filters folder/tags in SQL; the vector leg can't, so callers still re-filter.
     """
     match = _fts_match(query) if mode in ("hybrid", "bm25") else None
@@ -173,6 +185,7 @@ def search_page(
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     SEARCH_QUERIES.labels(mode).inc()
+    t0 = time.perf_counter()
     top_k = clamp_int(top_k, 1, 50)
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
     k = max(top_k * params.candidate_factor, params.candidate_min)
@@ -195,6 +208,7 @@ def search_page(
             heading = None
             heading_path = None
             snippet = ""
+            vi = vec_info.get(did)
             if match:
                 srow = conn.execute(
                     "SELECT snippet(documents_fts, 1, '<mark>', '</mark>', ' … ', 12) "
@@ -203,20 +217,23 @@ def search_page(
                 ).fetchone()
                 if srow and srow[0]:
                     snippet = srow[0]
-            if did in vec_info:
-                heading = vec_info[did][1]
-                heading_path = vec_info[did][3]
+            if vi is not None:
+                heading = vi["heading"]
+                heading_path = vi["heading_path"]
                 if not snippet:
-                    snippet = vec_info[did][2][:240]
+                    snippet = vi["text"][:240]
 
             results.append(SearchResult(
                 path=d["path"], title=d["title"] or d["path"],
                 score=round(score, 6), snippet=snippet, heading=heading, version=d["version"],
                 heading_path=heading_path,
                 anchor=heading_slug(heading) if heading else None,
+                chunk_ordinal=vi["ordinal"] if vi is not None else None,
+                chunk_id=vi["chunk_id"] if vi is not None else None,
             ))
             if len(results) >= want:
                 break
+    SEARCH_LATENCY.labels(mode).observe(time.perf_counter() - t0)
     return results[:top_k], len(results) > top_k
 
 
@@ -324,8 +341,9 @@ def assemble_context(
             if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn):
                 continue
 
-            if did in vec_info:
-                heading, text = vec_info[did][1], vec_info[did][2]
+            vi = vec_info.get(did)
+            if vi is not None:
+                heading, text = vi["heading"], vi["text"]
             else:  # BM25-only match: no per-chunk vector rank — fall back to the lead chunk
                 ch = conn.execute(
                     "SELECT heading, text FROM chunks WHERE doc_id=? ORDER BY ordinal LIMIT 1",
