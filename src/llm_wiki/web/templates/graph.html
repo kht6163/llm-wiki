@@ -62,7 +62,13 @@ async function reloadGraph() {
     container: document.getElementById('cy'),
     elements: els,
     style: graphStyle(),
-    layout: { name: 'cose', animate: false }
+    layout: { name: 'cose', animate: false },
+    // Cytoscape label font-size is in model units, so it scales with zoom. A sparse
+    // graph (a few nodes) otherwise auto-fits to a huge zoom and the labels balloon
+    // off the canvas. Cap the fit zoom to keep nodes + labels at a legible size;
+    // dense graphs fit below 1 and are unaffected.
+    minZoom: 0.2,
+    maxZoom: 1.8
   });
   cy.on('tap', 'node', evt => { if (evt.target.data('exists')) location.href = '/doc/' + encodeURIComponent(evt.target.data('id')); });
 }

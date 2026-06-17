@@ -138,6 +138,28 @@ def test_embed_inside_code_fence_stays_literal():
     assert "![[노트]]" in html  # literal inside the code block
 
 
+def test_wikilink_inside_inline_code_stays_literal():
+    # A wikilink inside a `code span` must NOT expand into a /go link (Obsidian
+    # keeps it literal); otherwise the reading view leaks `[label](/go?…)` in <code>.
+    html = render_markdown("문법은 `[[위키링크]]` 처럼 씁니다\n", "a.md")
+    assert "<code>[[위키링크]]</code>" in html
+    assert "/go" not in html
+
+
+def test_embed_inside_inline_code_stays_literal():
+    res = _resolver({"노트": ("노트", "본문")})
+    html = render_markdown("문법은 `![[노트]]` 처럼 씁니다\n", "a.md", resolve_embed=res)
+    assert "<code>![[노트]]</code>" in html
+    assert "embed-body" not in html
+
+
+def test_wikilink_outside_code_still_expands_with_adjacent_code():
+    # The code-span guard must not suppress a real wikilink elsewhere on the line.
+    html = render_markdown("`코드` 그리고 [[대상]] 링크\n", "a.md")
+    assert "<code>코드</code>" in html
+    assert "/go?" in html and ">대상<" in html
+
+
 # ---- frontmatter property helpers -----------------------------------------
 def test_set_frontmatter_property_scalar_and_list():
     c = "---\ntitle: T\nstatus: draft\n---\n본문\n"

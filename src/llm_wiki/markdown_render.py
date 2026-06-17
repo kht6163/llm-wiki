@@ -61,6 +61,12 @@ _CALLOUT_RE = re.compile(
 _TASK_RE = re.compile(r"<li>\[([ xX])\] ")
 _HILITE_SPLIT_RE = re.compile(r"(<pre>.*?</pre>|<code>.*?</code>)", re.DOTALL)
 _HILITE_RE = re.compile(r"==(\S(?:.*?\S)?)==")
+# Code regions to pass through verbatim when expanding wikilinks/embeds (which run on
+# raw markdown, before the parser): fenced blocks AND inline code spans (single/double
+# backtick). `[[link]]` / `![[embed]]` inside code must stay literal — Obsidian does the
+# same, and the editor's markdown-it rules already skip code spans, so this keeps the
+# server render in parity instead of leaking a `[label](/go?…)` link inside `<code>`.
+_CODE_SPLIT_RE = re.compile(r"(```.*?```|``[^\n]+?``|`[^`\n]+?`)", re.DOTALL)
 
 # ``![[target]]`` / ``![[target#heading]]`` / ``![[target|alias]]`` embeds.
 EMBED_RE = re.compile(r"!\[\[([^\[\]\n]+?)\]\]")
@@ -181,7 +187,7 @@ def _convert_inline(text: str, src_path: str, resolve: EmbedResolver | None,
                     depth: int, seen: frozenset[str], budget: list[int],
                     embeds: list[str]) -> str:
     """Replace embeds (with sentinels, collecting rendered HTML) and wikilinks (with
-    markdown links) outside fenced code blocks."""
+    markdown links) outside code regions — fenced blocks and inline code spans alike."""
     def embed_repl(m: re.Match) -> str:
         target, anchor = _parse_embed(m.group(1))
         if not target:
@@ -192,7 +198,7 @@ def _convert_inline(text: str, src_path: str, resolve: EmbedResolver | None,
         embeds.append(_render_embed(target, anchor, src_path, resolve, depth, seen, budget))
         return _EMBED_SENTINEL.format(len(embeds) - 1)
 
-    parts = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    parts = _CODE_SPLIT_RE.split(text)
     for i in range(0, len(parts), 2):
         seg = EMBED_RE.sub(embed_repl, parts[i])
         seg = WIKILINK_RE.sub(lambda m: _wiki_repl(m, src_path), seg)
