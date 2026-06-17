@@ -1,6 +1,6 @@
 [project]
 name = "llm-wiki"
-version = "0.20.0"
+version = "0.21.0"
 description = "Obsidian-like markdown knowledge base with a web viewer and an HTTP MCP server for LLMs (hybrid BM25+vector search, link graph, optimistic-concurrency multi-user editing)."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
