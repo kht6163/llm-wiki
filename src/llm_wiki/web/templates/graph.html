@@ -25,7 +25,8 @@ function graphStyle() {
     faint = v('--fg-faint', '#6e7781'), line = v('--line', '#d5dbe2'),
     lineStrong = v('--line-strong', '#c2cad4'), inset = v('--inset', '#e9edf2');
   return [
-    { selector: 'node', style: { 'label': 'data(label)', 'font-size': '9px', 'background-color': accent, 'width': 12, 'height': 12, 'color': ink } },
+    { selector: 'node', style: { 'label': 'data(label)', 'font-size': '9px', 'background-color': accent, 'width': 12, 'height': 12, 'color': ink,
+        'text-valign': 'bottom', 'text-halign': 'center', 'text-wrap': 'wrap' } },
     { selector: 'node[?root]', style: { 'background-color': ink, 'width': 18, 'height': 18, 'font-size': '11px' } },
     { selector: 'node[!exists]', style: { 'background-color': inset, 'border-width': 1, 'border-style': 'dashed', 'border-color': lineStrong, 'color': faint } },
     { selector: 'edge', style: { 'width': 1, 'line-color': lineStrong, 'target-arrow-color': lineStrong, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.6 } },
@@ -66,39 +67,53 @@ async function reloadGraph() {
     maxZoom: 8
   });
   cy.on('tap', 'node', evt => { if (evt.target.data('exists')) location.href = '/doc/' + encodeURIComponent(evt.target.data('id')); });
-  // Spread the nodes (so a sparse graph isn't a tight clump near the centre), then
-  // fit + size on layout stop. fit:false because fitAndSize() does the fit itself.
+  // Size the nodes to their real (target) size up-front so cose's overlap-avoidance
+  // spaces them for how big they'll actually render — not the 12px style default — and
+  // spread them well apart (edge length / repulsion scale with node size, so dense
+  // graphs don't pile up). Then fit + re-size on layout stop (see fitAndSize).
+  const m = nodeMetrics();
+  applyNodeSizes(1, m);
   const layout = cy.layout({ name: 'cose', animate: false, fit: false,
-    idealEdgeLength: 120, nodeRepulsion: 16000, nodeOverlap: 16,
-    componentSpacing: 140, padding: 30 });
+    idealEdgeLength: Math.round(m.nodePx * 2.8), nodeRepulsion: 24000,
+    nodeOverlap: Math.round(m.nodePx * 1.2), gravity: 0.3,
+    componentSpacing: Math.round(m.nodePx * 3), padding: 30 });
   layout.one('layoutstop', fitAndSize);
   layout.run();
 }
 
-// Cytoscape node + label sizes are in model units, so they scale with the fit zoom:
-// a sparse graph fits to a high zoom and its labels balloon off-canvas, a dense one
-// shrinks to dots. So after the layout, fit the view to fill the canvas, then set each
-// node's size in model units = a target on-screen pixel size ÷ the current zoom. The
-// target grows as the graph gets sparser (so a few big nodes fill the empty canvas) and
-// shrinks when it's dense; either way the rendered node + label stays a constant,
-// legible size regardless of the fit zoom.
-function fitAndSize() {
-  if (!cy || cy.nodes().empty()) return;
-  // The #cy container is sized by the app-shell grid and can settle after cy init, so
-  // re-measure first or fit() centres on stale dimensions (graph drifts off-centre).
-  cy.resize();
-  const n = cy.nodes().length;
+// Target on-screen sizes (px) derived from the node count: bigger when the graph is
+// sparse (so a few nodes fill the canvas), smaller when dense (to reduce crowding).
+function nodeMetrics() {
+  const n = Math.max(1, cy.nodes().length);
   const nodePx = Math.max(18, Math.min(64, 150 / Math.sqrt(n)));
-  const rootPx = nodePx * 1.5;
-  const fontPx = Math.max(12, Math.min(22, Math.round(nodePx * 0.42)));
-  cy.fit(cy.elements(), Math.round(rootPx * 0.5 + fontPx + 12));
-  const z = cy.zoom() || 1;
+  return { nodePx: nodePx, rootPx: nodePx * 1.5,
+           fontPx: Math.max(12, Math.min(22, Math.round(nodePx * 0.42))) };
+}
+
+// Cytoscape node + label sizes are model units, so they scale with zoom. Set each
+// node's model size = target px ÷ zoom so the *rendered* node, label and below-node
+// gap stay a constant, legible size regardless of the fit zoom. Labels sit below the
+// node (set in graphStyle) and wrap at ~2.4× the node width so long titles stack
+// instead of running across neighbours.
+function applyNodeSizes(z, m) {
   cy.batch(function () {
     cy.nodes().forEach(function (node) {
-      const d = (node.data('root') ? rootPx : nodePx) / z;
-      node.style({ 'width': d, 'height': d, 'font-size': (fontPx / z) + 'px' });
+      const d = (node.data('root') ? m.rootPx : m.nodePx) / z;
+      node.style({ 'width': d, 'height': d, 'font-size': (m.fontPx / z) + 'px',
+        'text-margin-y': (4 / z), 'text-max-width': (m.nodePx * 2.4 / z) + 'px' });
     });
   });
+}
+
+// After the layout: re-measure the container (the app-shell grid can settle after cy
+// init, else fit() centres on stale dimensions and the graph drifts off-centre), fit
+// to fill the canvas, then re-apply sizes for the resulting zoom.
+function fitAndSize() {
+  if (!cy || cy.nodes().empty()) return;
+  cy.resize();
+  const m = nodeMetrics();
+  cy.fit(cy.elements(), Math.round(m.rootPx * 0.5 + m.fontPx + 14));
+  applyNodeSizes(cy.zoom() || 1, m);
 }
 
 // Recolour (not rebuild) on theme change — data-theme toggle or OS scheme — so

@@ -52,6 +52,12 @@ function readTheme() {
 
 function mount(el, opts) {
   opts = opts || {};
+  // On a narrow viewport the side-by-side editor+preview is unusably cramped (each pane
+  // wraps mid-word), so start with the preview pane collapsed — edit-only, full width.
+  // The toolbar's preview / previewOnly buttons still let a phone user view the rendered
+  // output on demand. Desktop keeps the split. Matches the app-shell mobile breakpoint.
+  const startPreview = !(typeof window !== "undefined" && typeof window.matchMedia === "function" &&
+    window.matchMedia("(max-width: 860px)").matches);
   let editorRef = null;
   // Expose md-editor-rt's OWN CodeMirror view so page code can drive it (e.g.
   // the [[ ]] typeahead) without importing @codemirror separately — an external
@@ -80,6 +86,7 @@ function mount(el, opts) {
       language: "en-US",
       codeTheme: "github",
       previewTheme: "default",
+      preview: startPreview,
       toolbars: TOOLBARS,
       noKatex: true,
       noMermaid: true,
