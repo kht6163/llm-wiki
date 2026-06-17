@@ -39,16 +39,19 @@ async function reloadGraph() {
   const info = document.getElementById('ginfo');
   const empty = document.getElementById('gempty');
   info.textContent = '불러오는 중…';
+  info.classList.add('is-loading'); info.setAttribute('aria-busy', 'true');
   let url = '/api/graph?depth=' + encodeURIComponent(depth) + '&limit=500';
   if (root) url += '&root=' + encodeURIComponent(root);
   let data;
   try {
     data = await (await fetch(url)).json();
   } catch (e) {
+    info.classList.remove('is-loading'); info.removeAttribute('aria-busy');
     info.textContent = '그래프를 불러오지 못했습니다.';
     return;
   }
   empty.hidden = data.nodes.length > 0;
+  info.classList.remove('is-loading'); info.removeAttribute('aria-busy');
   info.textContent =
     data.nodes.length + ' 노드 / ' + data.edges.length + ' 엣지' + (data.truncated ? ' (일부 생략됨)' : '');
   const els = [];

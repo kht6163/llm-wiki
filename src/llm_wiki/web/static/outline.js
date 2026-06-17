@@ -7,6 +7,9 @@
   var outline = document.getElementById("outline");
   if (!rendered || !outline) return;
   var spy = null;
+  // Honour the OS reduced-motion preference for click-to-scroll (read live at click
+  // time, not cached). Falls back to smooth if matchMedia is unavailable.
+  var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
 
   function slug(text, used) {
     var base = text.toLowerCase().trim()
@@ -70,7 +73,7 @@
       a.textContent = h.textContent;
       a.addEventListener("click", function (e) {
         e.preventDefault();
-        h.scrollIntoView({ behavior: "smooth", block: "start" });
+        h.scrollIntoView({ behavior: reduceMotion && reduceMotion.matches ? "auto" : "smooth", block: "start" });
         history.replaceState(null, "", "#" + h.id);
       });
       li.appendChild(a);

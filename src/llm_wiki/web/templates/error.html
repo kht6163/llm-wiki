@@ -1,7 +1,11 @@
 {% extends "base.html" %}
+{% from "_icons.html" import icon %}
 {% block title %}오류{% endblock %}
 {% block content %}
-<h1>오류</h1>
-<p>{{ message }}</p>
-<p><a href="/">홈으로</a></p>
+<div class="empty-state">
+  <span class="empty-icon">{{ icon("alert-triangle") }}</span>
+  <p class="empty-title">문제가 발생했습니다</p>
+  <p class="empty-text">{{ message }}</p>
+  <div class="empty-actions"><a class="btn" href="/">홈으로</a></div>
+</div>
 {% endblock %}

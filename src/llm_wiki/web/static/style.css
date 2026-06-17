@@ -15,7 +15,7 @@
   /* ink */
   --fg: #1c2128;
   --fg-muted: #586069;
-  --fg-faint: #6e7781;
+  --fg-faint: #636b75;
   /* lines */
   --line: #d5dbe2;
   --line-strong: #c2cad4;
@@ -30,10 +30,13 @@
   --danger: #cf222e;
   --danger-emphasis: #cf222e;
   --danger-soft: color-mix(in srgb, var(--danger) 11%, transparent);
-  --warn: #9a6700;
+  --warn: #835800;
   --warn-soft: color-mix(in srgb, var(--warn) 13%, transparent);
-  --success: #1a7f37;
+  --success: #16722f;
   --success-soft: color-mix(in srgb, var(--success) 12%, transparent);
+  /* diff add/del — conventional green/red, kept distinct from semantic success/danger; per-theme below */
+  --diff-add-bg: #e6ffec; --diff-add-fg: #04260f;
+  --diff-del-bg: #ffebe9; --diff-del-fg: #3a0a07;
   /* focus ring — always visible for keyboard users */
   --focus: color-mix(in srgb, var(--accent) 60%, transparent);
   /* select chevron (replaces the native OS arrow); stroke tracks fg-muted */
@@ -46,11 +49,13 @@
   /* radii */
   --r-sm: 5px; --r-md: 7px; --r-lg: 10px;
   --shadow-pop: 0 10px 30px rgba(15, 20, 28, 0.16), 0 1px 2px rgba(15, 20, 28, 0.08);
+  --shadow-modal: 0 16px 48px rgba(15, 20, 28, 0.30);
   /* motion */
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
   --t-fast: 0.12s; --t: 0.18s;
-  /* z-index scale: resizer < sticky < dropdown < overlay < modal < toast < tooltip */
+  /* z-index scale: resizer < sticky < nav < dropdown < drawer < drawer-panel < overlay < modal < toast < tooltip */
   --z-resizer: 5; --z-sticky: 10; --z-nav: 20; --z-dropdown: 70;
+  --z-drawer: 110; --z-drawer-panel: 120;
   --z-overlay: 200; --z-modal: 210; --z-toast: 300; --z-tooltip: 400;
   /* legacy aliases */
   --muted: var(--fg-muted);
@@ -89,22 +94,7 @@ pre code { background: none; padding: 0; border: 0; font-size: inherit; }
   }
 }
 
-.topbar {
-  display: flex; align-items: center; gap: 16px; padding: 10px 20px;
-  border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 10;
-}
-.topbar .brand { font-weight: 700; font-size: 1.1em; }
-.topbar nav { margin-left: auto; display: flex; align-items: center; gap: 14px; }
-.topbar .who { color: var(--muted); font-size: 0.85em; }
-.searchbox input { padding: 6px 10px; min-width: 220px; background-color: var(--bg); }
-
-/* Nav: inline links on wide screens; a CSS-only hamburger dropdown on narrow. */
-.nav { margin-left: auto; }
-.navmenu { position: relative; }
-.navmenu > summary { display: none; list-style: none; cursor: pointer; padding: 6px 10px;
-  border: 1px solid var(--line); border-radius: 6px; user-select: none; }
-.navmenu > summary::-webkit-details-marker { display: none; }
-.navlinks { display: flex; align-items: center; gap: 14px; }
+.searchbox input { padding: 6px 10px; background-color: var(--bg); }
 
 main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 80px; }
 h1 { font-size: 1.6em; }
@@ -129,7 +119,8 @@ h1 { font-size: 1.6em; }
 .doclist { list-style: none; padding: 0; }
 .doclist li { padding: 8px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .doclist .title { font-weight: 600; }
-.path { color: var(--fg-muted); font-size: 0.78em; font-family: var(--font-mono); }
+.path { color: var(--fg-muted); font-size: 0.78em; font-family: var(--font-mono);
+  min-width: 0; overflow-wrap: anywhere; }
 .meta { color: var(--fg-muted); font-size: 0.76em; margin-left: auto; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; white-space: nowrap; }
 .tag { font-size: 0.74em; font-family: var(--font-mono); background: var(--inset);
@@ -142,7 +133,7 @@ h1 { font-size: 1.6em; }
 .via-badge { font-size: 0.7em; font-family: var(--font-mono); border-radius: var(--r-sm);
   padding: 1px 6px; border: 1px solid var(--line); background: var(--inset);
   color: var(--fg-muted); white-space: nowrap; }
-.via-badge.via-mcp { color: var(--accent); background: var(--accent-soft);
+.via-badge.via-mcp { color: var(--accent-hover); background: var(--accent-soft);
   border-color: color-mix(in srgb, var(--accent) 46%, var(--line)); }
 .via-badge.via-cli { color: var(--warn); background: var(--warn-soft);
   border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
@@ -235,6 +226,7 @@ button.danger:active { background: color-mix(in srgb, var(--danger) 18%, transpa
   transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
     color var(--t-fast) var(--ease); }
 .btn:hover { background: var(--accent-soft); border-color: var(--accent); text-decoration: none; }
+.btn:active { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 
 /* The full-width auth CTA reads as the page's one primary, so it rests with a
    soft accent fill (still ghost-family — no saturated solid). */
@@ -318,7 +310,10 @@ select {
 .taglist li { display: flex; align-items: center; gap: 6px; }
 
 .list-layout { display: grid; grid-template-columns: 220px 1fr; gap: 24px; }
-@media (max-width: 760px) { .list-layout { grid-template-columns: 1fr; } }
+@media (max-width: 860px) {
+  .list-layout { grid-template-columns: 1fr; }
+  .folders { border-right: 0; padding-right: 0; }
+}
 .folders { border-right: 1px solid var(--line); padding-right: 16px; font-size: 0.9em; }
 .folders h3 { font-size: 0.9em; margin: 6px 0; }
 .folders ul { list-style: none; padding: 0; margin: 0; }
@@ -327,32 +322,24 @@ select {
 
 /* diff view */
 pre.diff { font-size: 0.85em; line-height: 1.45; }
-.diff .d-add { display: block; background: #e6ffec; color: #04260f; }
-.diff .d-del { display: block; background: #ffebe9; color: #3a0a07; }
+.diff .d-add { display: block; background: var(--diff-add-bg); color: var(--diff-add-fg); }
+.diff .d-del { display: block; background: var(--diff-del-bg); color: var(--diff-del-fg); }
 .diff .d-hunk { display: block; color: var(--muted); }
 .diff .d-ctx { display: block; }
 
-/* editor affordances. NOTE: the old custom editor's `.editor-pane`/`.preview`/
-   `.autocomplete` rules were removed — EasyMDE's toolbar button carries a bare
-   `preview` class, and the stale `.preview { min-height: 60vh }` rule collided
-   with it, stretching the toolbar to full height. */
+/* editor affordances. The editor is the vendored md-editor-rt bundle
+   (web/static/vendor/md-editor.bundle.{js,css}), which ships its own
+   toolbar/preview styling; the former custom editor's `.editor-pane`/`.preview`/
+   `.autocomplete` rules were removed. Only `kbd` remains app-level here. */
 kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-width: 2px;
   border-radius: 4px; padding: 0 5px; font-size: 0.85em; font-family: ui-monospace, monospace; }
 
 /* Mobile / narrow screens. */
 @media (max-width: 640px) {
-  .topbar { flex-wrap: wrap; gap: 10px; padding: 10px 14px; }
-  .searchbox { order: 3; flex: 1 1 100%; }
+  .main-topbar .searchbox { flex: 1 1 auto; }
   .searchbox input { min-width: 0; width: 100%; }
   main { padding: 16px 14px 64px; }
   h1 { font-size: 1.35em; }
-  /* Hamburger: hide the inline links until the menu is opened. */
-  .navmenu > summary { display: inline-block; }
-  .navmenu > .navlinks { display: none; position: absolute; right: 0; top: 110%;
-    flex-direction: column; align-items: flex-start; gap: 10px; background: var(--bg);
-    border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px;
-    box-shadow: 0 6px 24px rgba(0,0,0,.18); min-width: 160px; z-index: 20; }
-  .navmenu[open] > .navlinks { display: flex; }
   .searchform { flex-wrap: wrap; }
 }
 
@@ -377,7 +364,9 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
 
 .pager { display: flex; gap: 16px; align-items: center; justify-content: center;
   margin: 20px 0 8px; font-size: 0.9em; }
-.pager a { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px; }
+.pager a { padding: 5px 12px; border: 1px solid var(--line); border-radius: 6px;
+  transition: border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease); }
+.pager a:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 
 /* Realtime change notifications (WebSocket live reflection). */
 .rt-banner { max-width: 1080px; margin: 12px auto 0; padding: 10px 14px; border-radius: var(--r-md);
@@ -390,8 +379,8 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
 .rt-toast.show { opacity: 1; transform: translateY(0); }
 
 /* Hover preview popover (list/search). */
-.doc-popover { position: absolute; z-index: 60; max-width: 360px; background: var(--bg);
-  border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.12);
+.doc-popover { position: absolute; z-index: var(--z-dropdown); max-width: 360px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; box-shadow: var(--shadow-pop);
   padding: 10px 12px; font-size: 0.85em; pointer-events: none; }
 .doc-popover .dp-title { font-weight: 600; margin-bottom: 4px; }
 .doc-popover .dp-excerpt { color: var(--muted); line-height: 1.5; }
@@ -434,11 +423,10 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
     --accent: #58a6ff; --accent-hover: #79b8ff; --accent-emphasis: #1f6feb;
     --danger: #ff7b72; --danger-emphasis: #da3633;
     --warn: #d29922; --success: #3fb950;
+    --diff-add-bg: #12261a; --diff-add-fg: #aff5c6; --diff-del-bg: #2d1517; --diff-del-fg: #ffc9c4;
     --focus: color-mix(in srgb, var(--accent) 65%, transparent);
     --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   }
-  .diff .d-add { background: #12261a; color: #aff5c6; }
-  .diff .d-del { background: #2d1517; color: #ffc9c4; }
 }
 
 /* ======================================================================
@@ -451,11 +439,11 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
    restores the :root defaults, dark mirrors the media block above. */
 [data-theme="light"] {
   --bg: #ffffff; --chrome: #eef1f5; --inset: #e9edf2; --pop: #ffffff;
-  --fg: #1c2128; --fg-muted: #586069; --fg-faint: #6e7781;
+  --fg: #1c2128; --fg-muted: #586069; --fg-faint: #636b75;
   --line: #d5dbe2; --line-strong: #c2cad4;
   --accent: #2563eb; --accent-hover: #1d4ed8; --accent-emphasis: #2563eb;
   --danger: #cf222e; --danger-emphasis: #cf222e;
-  --warn: #9a6700; --success: #1a7f37;
+  --warn: #835800; --success: #16722f;
   --focus: color-mix(in srgb, var(--accent) 60%, transparent);
   --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23586069' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
@@ -466,11 +454,10 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   --accent: #58a6ff; --accent-hover: #79b8ff; --accent-emphasis: #1f6feb;
   --danger: #ff7b72; --danger-emphasis: #da3633;
   --warn: #d29922; --success: #3fb950;
+  --diff-add-bg: #12261a; --diff-add-fg: #aff5c6; --diff-del-bg: #2d1517; --diff-del-fg: #ffc9c4;
   --focus: color-mix(in srgb, var(--accent) 65%, transparent);
   --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
-[data-theme="dark"] .diff .d-add { background: #12261a; color: #aff5c6; }
-[data-theme="dark"] .diff .d-del { background: #2d1517; color: #ffc9c4; }
 
 .app-shell {
   display: grid;
@@ -575,11 +562,12 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .sb-result:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
 .sr-title { font-size: 0.86em; font-weight: 600; }
 .sr-path { font-size: 0.72em; font-family: var(--font-mono); color: var(--fg-faint); }
+.sr-title, .sr-path { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sb-taglist { list-style: none; padding: 0; margin: 0; font-size: 0.86em; }
 .sb-taglist li { padding: 3px 6px; }
 
 /* resizer handles (inner edge of each sidebar) */
-.sb-resizer { position: absolute; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: 5; }
+.sb-resizer { position: absolute; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: var(--z-resizer); }
 .sidebar-left .sb-resizer { right: -3px; }
 .sidebar-right .sb-resizer { left: -3px; }
 .sb-resizer:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
@@ -626,6 +614,8 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .rp-list { list-style: none; padding: 0; margin: 0; font-size: 0.85em; }
 .rp-list li { padding: 2px 0; }
 .rp-list.related li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.rp-list a, .rp-list .broken { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rp-list.related li > a { min-width: 0; }
 
 /* outline (table of contents) */
 .outline-list { list-style: none; padding: 0; margin: 0; font-size: 0.85em; }
@@ -652,18 +642,9 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .sb-stat { white-space: nowrap; }
 .sb-hint { margin-right: auto; }
 
-/* slash command menu (editor) */
-.slash-menu {
-  position: absolute; z-index: 70; background: var(--bg); border: 1px solid var(--line);
-  border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.18); max-height: 280px; overflow: auto;
-  min-width: 220px; padding: 4px;
-}
-.slash-item { padding: 6px 10px; font-size: 0.86em; border-radius: 6px; cursor: pointer; white-space: nowrap; }
-.slash-item.active, .slash-item:hover { background: var(--soft); }
-
 /* command palette / quick switcher */
 .cmd-overlay {
-  position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,.35);
+  position: fixed; inset: 0; z-index: var(--z-overlay); background: rgba(0,0,0,.35);
   display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh;
 }
 /* The `hidden` attribute's UA `display:none` is otherwise overridden by the
@@ -671,7 +652,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .cmd-overlay[hidden] { display: none; }
 .cmd-modal {
   width: min(640px, 92vw); background: var(--bg); border: 1px solid var(--line);
-  border-radius: 12px; box-shadow: 0 16px 48px rgba(0,0,0,.35); overflow: hidden;
+  border-radius: 12px; box-shadow: var(--shadow-modal); overflow: hidden;
 }
 .cmd-input {
   width: 100%; padding: 14px 16px; border: 0; border-bottom: 1px solid var(--line);
@@ -681,7 +662,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .cmd-item {
   display: flex; align-items: baseline; gap: 10px; padding: 8px 12px; border-radius: 8px; cursor: pointer;
 }
-.cmd-item.active { background: var(--soft); }
+.cmd-item.active { background: var(--accent-soft); color: var(--accent); }
 .cmd-label { font-size: 0.92em; }
 .cmd-sub { font-size: 0.78em; margin-left: auto; }
 .cmd-empty { padding: 12px; font-size: 0.9em; }
@@ -689,8 +670,8 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 
 /* tree context menu */
 .ctx-menu {
-  position: fixed; z-index: 210; background: var(--bg); border: 1px solid var(--line);
-  border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.25); padding: 4px; min-width: 160px;
+  position: fixed; z-index: var(--z-modal); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: var(--shadow-pop); padding: 4px; min-width: 160px;
 }
 .ctx-item {
   display: block; width: 100%; text-align: left; padding: 7px 12px; border: 0; background: transparent;
@@ -750,7 +731,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 /* Mobile sidebar backdrop: a dimmer behind an open overlay sidebar. JS appends
    it (narrow viewports only) and toggles .show; tapping it closes the overlay. */
 .sb-backdrop {
-  position: fixed; inset: 0; z-index: 110; background: rgba(0, 0, 0, 0.42);
+  position: fixed; inset: 0; z-index: var(--z-drawer); background: rgba(0, 0, 0, 0.42);
   opacity: 0; transition: opacity var(--t) var(--ease);
 }
 .sb-backdrop.show { opacity: 1; }
@@ -763,7 +744,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
     grid-template-columns: var(--ribbon-w) minmax(0, 1fr);
   }
   .sidebar-left, .sidebar-right {
-    position: fixed; top: 0; bottom: 0; z-index: 120; width: min(82vw, 320px);
+    position: fixed; top: 0; bottom: 0; z-index: var(--z-drawer-panel); width: min(82vw, 320px);
     box-shadow: 0 0 40px rgba(0, 0, 0, 0.3); transition: transform var(--t) var(--ease);
   }
   /* Keep them rendered (override the global display:none collapse) so the
@@ -778,13 +759,24 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   .main-col { grid-column: 2; }
 }
 
+/* Touch input: enlarge the densest chrome controls to a comfortable tap target.
+   Gated on pointer type (not viewport width) so mouse/desktop sizing is untouched
+   even on large touchscreens; reuses existing classes, no new tokens/colours. */
+@media (pointer: coarse) {
+  .icon-btn { width: 36px; height: 36px; }
+  .tt-btn { min-height: 32px; }
+  .tt-icon { padding: 8px; }
+  .rp-tab { min-height: 32px; }
+  .sb-tab { min-height: 36px; }
+}
+
 /* ======================================================================
    [[ ]] wikilink typeahead dropdown (rendered by static/editor.js over the
    md-editor-rt CodeMirror). Appended to <body>, positioned at the caret.
    ====================================================================== */
 .wiki-ac {
-  position: fixed; z-index: 99999; background: var(--bg); border: 1px solid var(--line);
-  border-radius: 8px; box-shadow: 0 8px 28px rgba(0,0,0,.22); max-height: 280px;
+  position: fixed; z-index: var(--z-dropdown); background: var(--bg); border: 1px solid var(--line);
+  border-radius: 8px; box-shadow: var(--shadow-pop); max-height: 280px;
   overflow: auto; min-width: 260px; max-width: 460px; padding: 4px;
 }
 .wiki-ac[hidden] { display: none; }
@@ -792,6 +784,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   display: flex; align-items: baseline; gap: 10px; padding: 6px 10px;
   border-radius: 6px; cursor: pointer; white-space: nowrap;
 }
-.wiki-ac-item.active, .wiki-ac-item:hover { background: var(--soft); }
+.wiki-ac-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
+.wiki-ac-item.active { background: var(--accent-soft); color: var(--accent); }
 .wiki-ac-title { font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; }
 .wiki-ac-path { font-size: 0.76em; margin-left: auto; }

@@ -1,13 +1,18 @@
 {% extends "base.html" %}
+{% from "_icons.html" import icon %}
 {% block title %}깨진 링크{% endblock %}
 {% block content %}
 <h1>깨진 링크 <span class="muted">{{ count }}건</span></h1>
 <p class="muted">존재하지 않는 문서를 가리키는 위키링크/마크다운 링크입니다. 이름 변경·삭제 후 정리에 사용하세요.</p>
 {% if not links %}
-  <p class="muted">깨진 링크가 없습니다. 모든 링크가 존재하는 문서를 가리킵니다.</p>
+  <div class="empty-state">
+    <span class="empty-icon">{{ icon("unlink") }}</span>
+    <p class="empty-title">깨진 링크가 없습니다</p>
+    <p class="empty-text">모든 링크가 존재하는 문서를 가리킵니다.</p>
+  </div>
 {% else %}
 <table class="broken">
-  <thead><tr><th>출처 문서</th><th>가리키는 대상</th><th>형식</th><th>원본</th></tr></thead>
+  <thead><tr><th scope="col">출처 문서</th><th scope="col">가리키는 대상</th><th scope="col">형식</th><th scope="col">원본</th></tr></thead>
   <tbody>
   {% for l in links %}
     <tr>

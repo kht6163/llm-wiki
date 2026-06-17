@@ -46,13 +46,13 @@
   </nav>
 
   <aside class="sidebar-left" id="sidebar-left" aria-label="탐색">
-    <div class="sb-tabs" role="tablist">
-      <button class="sb-tab active" type="button" data-tab="files" role="tab" aria-selected="true">파일</button>
-      <button class="sb-tab" type="button" data-tab="search" role="tab" aria-selected="false">검색</button>
-      <button class="sb-tab" type="button" data-tab="tags" role="tab" aria-selected="false">태그</button>
+    <div class="sb-tabs" role="tablist" aria-label="사이드바">
+      <button class="sb-tab active" type="button" data-tab="files" role="tab" id="sb-tab-files" aria-controls="sb-panel-files" aria-selected="true">파일</button>
+      <button class="sb-tab" type="button" data-tab="search" role="tab" id="sb-tab-search" aria-controls="sb-panel-search" aria-selected="false">검색</button>
+      <button class="sb-tab" type="button" data-tab="tags" role="tab" id="sb-tab-tags" aria-controls="sb-panel-tags" aria-selected="false">태그</button>
     </div>
     <div class="sb-body">
-      <div class="sb-panel" data-panel="files">
+      <div class="sb-panel" data-panel="files" id="sb-panel-files" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-files">
         <div class="tree-toolbar">
           {% if user.can_write %}
           <button class="tt-btn" type="button" data-action="new-doc" title="새 문서">＋ 문서</button>
@@ -70,11 +70,11 @@
           {% endif %}
         </div>
       </div>
-      <div class="sb-panel" data-panel="search" hidden>
+      <div class="sb-panel" data-panel="search" id="sb-panel-search" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-search" hidden>
         <input type="search" class="sb-search-input" id="sb-search-input" placeholder="문서 검색…" aria-label="사이드바 검색">
         <div class="sb-search-results" id="sb-search-results"></div>
       </div>
-      <div class="sb-panel" data-panel="tags" hidden>
+      <div class="sb-panel" data-panel="tags" id="sb-panel-tags" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-tags" hidden>
         <ul class="sb-taglist">
           {% for t in nav_tags %}
           <li><a href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }} <span class="muted">{{ t.count }}</span></a></li>
@@ -84,7 +84,7 @@
         </ul>
       </div>
     </div>
-    <div class="sb-resizer" data-resize="left" role="separator" aria-label="좌측 폭 조절" tabindex="-1"></div>
+    <div class="sb-resizer" data-resize="left" aria-hidden="true"></div>
   </aside>
 
   <div class="main-col">
@@ -110,7 +110,7 @@
   </div>
 
   <aside class="sidebar-right" id="sidebar-right" aria-label="문서 정보">
-    <div class="sb-resizer" data-resize="right" role="separator" aria-label="우측 폭 조절" tabindex="-1"></div>
+    <div class="sb-resizer" data-resize="right" aria-hidden="true"></div>
     {% block right %}{% endblock %}
   </aside>
 

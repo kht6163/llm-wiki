@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_badges.html" import via_badge %}
+{% from "_icons.html" import icon %}
 {% block title %}활동{% endblock %}
 {% block content %}
 {% set action_labels = {
@@ -38,7 +39,11 @@
 </form>
 
 {% if not events %}
-  <p class="muted">해당 조건의 활동이 없습니다.</p>
+  <div class="empty-state">
+    <span class="empty-icon">{{ icon("activity") }}</span>
+    <p class="empty-title">활동이 없습니다</p>
+    <p class="empty-text">해당 조건에 맞는 활동이 없습니다. 기간이나 출처 필터를 바꿔 보세요.</p>
+  </div>
 {% else %}
 <table class="revtable">
   <thead><tr><th scope="col">시각</th><th scope="col">출처</th><th scope="col">동작</th><th scope="col">행위자</th><th scope="col">대상</th><th scope="col">결과</th></tr></thead>

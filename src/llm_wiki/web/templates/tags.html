@@ -1,9 +1,14 @@
 {% extends "base.html" %}
+{% from "_icons.html" import icon %}
 {% block title %}태그{% endblock %}
 {% block content %}
 <h1>태그</h1>
 {% if not tags %}
-  <p class="muted">아직 태그가 없습니다.</p>
+  <div class="empty-state">
+    <span class="empty-icon">{{ icon("inbox") }}</span>
+    <p class="empty-title">아직 태그가 없습니다</p>
+    <p class="empty-text">문서 프런트매터에 태그를 추가하면 여기 모입니다.</p>
+  </div>
 {% endif %}
 <ul class="taglist">
   {% for t in tags %}

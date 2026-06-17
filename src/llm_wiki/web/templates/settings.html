@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "_icons.html" import icon %}
 {% block title %}API 키{% endblock %}
 {% block content %}
 <h1>API 키 (MCP 접속용)</h1>
@@ -15,7 +16,7 @@
   <button class="primary">새 키 발급</button>
 </form>
 <table class="revtable">
-  <thead><tr><th>이름</th><th>prefix</th><th>생성</th><th>마지막 사용</th><th>상태</th><th></th></tr></thead>
+  <thead><tr><th scope="col">이름</th><th scope="col">prefix</th><th scope="col">생성</th><th scope="col">마지막 사용</th><th scope="col">상태</th><th scope="col"></th></tr></thead>
   <tbody>
   {% for k in keys %}
     <tr>
@@ -29,7 +30,13 @@
       {% endif %}</td>
     </tr>
   {% else %}
-    <tr><td colspan="6" class="muted">발급된 키가 없습니다.</td></tr>
+    <tr><td colspan="6">
+      <div class="empty-state">
+        <span class="empty-icon">{{ icon("command") }}</span>
+        <p class="empty-title">발급된 API 키가 없습니다</p>
+        <p class="empty-text">API 키는 MCP 클라이언트가 <code>Authorization: Bearer</code> 헤더로 접속할 때 쓰입니다. 위에서 키를 발급하세요.</p>
+      </div>
+    </td></tr>
   {% endfor %}
   </tbody>
 </table>
