@@ -17,11 +17,16 @@ def configure_logging(level: str = "INFO", log_file: str = "") -> None:
     }
     names = ["console"]
     if log_file:
-        Path(log_file).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        # Expand ~ for BOTH the mkdir and the handler filename. RotatingFileHandler
+        # (open()) does not expand ~, so passing the raw string would create the parent
+        # under $HOME yet write to a literal "./~/..." path — a crash or misplaced log
+        # for the documented LOG_FILE=~/path pattern.
+        log_path = str(Path(log_file).expanduser())
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         handlers["file"] = {
             "class": "logging.handlers.RotatingFileHandler",
             "formatter": "std",
-            "filename": log_file,
+            "filename": log_path,
             "maxBytes": _MAX_BYTES,
             "backupCount": _BACKUPS,
             "encoding": "utf-8",

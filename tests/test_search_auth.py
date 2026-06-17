@@ -32,6 +32,18 @@ def test_search_folder_filter(ctx, principals):
     assert res and all(r.path.startswith("work/") for r in res)
 
 
+def test_search_tag_filter_requires_all_tags(ctx, principals):
+    # Exercises the batch-loaded tag filter path: only docs carrying ALL tags pass.
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "a.md", "shared report content", tags=["release", "todo"])
+    docs.create(p, "b.md", "shared report content", tags=["release"])
+    res, _ = search_page(ctx.db, ctx.embedder, "report content", mode="hybrid",
+                         top_k=10, tags=["release", "todo"])
+    paths = {r.path for r in res}
+    assert "a.md" in paths and "b.md" not in paths
+
+
 def test_bm25_folder_filter_pushed_into_sql(ctx, principals):
     # The folder filter must constrain the candidate LIMIT, not post-filter a fixed
     # top-k. With a small limit, a folder match that ranks LAST must still be found.

@@ -103,8 +103,12 @@
   // ---- resizers --------------------------------------------------------
   function initResize(el) {
     var side = el.getAttribute("data-resize");
-    el.addEventListener("mousedown", function (e) {
+    el.style.touchAction = "none";   // pointer drags shouldn't scroll the page on touch
+    // Pointer events cover mouse, touch, and pen with one path (mouse-only events left
+    // touch/tablet users unable to resize at all).
+    el.addEventListener("pointerdown", function (e) {
       e.preventDefault();
+      try { el.setPointerCapture(e.pointerId); } catch (_) { /* unsupported: fall back */ }
       var startX = e.clientX;
       var varName = side === "left" ? "--left-w" : "--right-w";
       var start = parseInt(getComputedStyle(document.documentElement).getPropertyValue(varName), 10) || (side === "left" ? 260 : 300);
@@ -116,14 +120,16 @@
         document.documentElement.style.setProperty(varName, w + "px");
       }
       function up() {
-        document.removeEventListener("mousemove", move);
-        document.removeEventListener("mouseup", up);
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", up);
+        el.removeEventListener("pointercancel", up);
         document.body.classList.remove("resizing");
         var w = parseInt(getComputedStyle(document.documentElement).getPropertyValue(varName), 10);
         set(side === "left" ? "wiki-left-w" : "wiki-right-w", String(w));
       }
-      document.addEventListener("mousemove", move);
-      document.addEventListener("mouseup", up);
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+      el.addEventListener("pointercancel", up);
     });
   }
 
@@ -276,22 +282,40 @@
 
   // ---- context menu ----------------------------------------------------
   var menuEl = null;
-  function closeMenu() { if (menuEl) { menuEl.remove(); menuEl = null; } }
-  function openMenu(x, y, items) {
+  var menuReturnFocus = null;   // element to refocus when a keyboard-opened menu closes
+  function closeMenu() {
+    if (menuEl) { menuEl.remove(); menuEl = null; }
+    if (menuReturnFocus) {
+      try { menuReturnFocus.focus(); } catch (_) { /* gone from DOM */ }
+      menuReturnFocus = null;
+    }
+  }
+  function openMenu(x, y, items, focusFirst) {
     closeMenu();
     menuEl = document.createElement("div");
     menuEl.className = "ctx-menu";
+    menuEl.setAttribute("role", "menu");
     items.forEach(function (it) {
       if (it.sep) { var s = document.createElement("div"); s.className = "ctx-sep"; menuEl.appendChild(s); return; }
       var b = document.createElement("button");
       b.type = "button"; b.className = "ctx-item" + (it.danger ? " danger" : ""); b.textContent = it.label;
-      b.addEventListener("click", function () { closeMenu(); it.run(); });
+      b.setAttribute("role", "menuitem");
+      b.addEventListener("click", function () { menuReturnFocus = null; closeMenu(); it.run(); });
       menuEl.appendChild(b);
+    });
+    // Arrow/Escape navigation so the menu is operable from the keyboard.
+    menuEl.addEventListener("keydown", function (e) {
+      var btns = Array.prototype.slice.call(menuEl.querySelectorAll("button"));
+      var i = btns.indexOf(document.activeElement);
+      if (e.key === "Escape") { e.preventDefault(); closeMenu(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); (btns[i + 1] || btns[0]).focus(); }
+      else if (e.key === "ArrowUp") { e.preventDefault(); (btns[i - 1] || btns[btns.length - 1]).focus(); }
     });
     document.body.appendChild(menuEl);
     var w = menuEl.offsetWidth, h = menuEl.offsetHeight;
     menuEl.style.left = Math.min(x, window.innerWidth - w - 8) + "px";
     menuEl.style.top = Math.min(y, window.innerHeight - h - 8) + "px";
+    if (focusFirst) { var f = menuEl.querySelector("button"); if (f) f.focus(); }
   }
   document.addEventListener("click", closeMenu);
   document.addEventListener("scroll", closeMenu, true);
@@ -320,30 +344,51 @@
     });
   }
 
+  // Build + open the menu for whichever tree row `target` is inside. Returns the row
+  // (so callers know a menu opened) or null. `focusFirst` focuses the first item, used
+  // for keyboard invocation.
+  function openTreeMenuFor(target, x, y, focusFirst) {
+    var docRow = target.closest && target.closest(".tree-doc");
+    var folderRow = target.closest && target.closest(".tree-folder-row");
+    if (docRow) {
+      var p = docRow.getAttribute("data-doc");
+      openMenu(x, y, [
+        { label: "이름 변경 / 이동", run: function () { renameDoc(p); } },
+        { sep: true },
+        { label: "삭제", danger: true, run: function () { deleteDoc(p); } }
+      ], focusFirst);
+      return docRow;
+    }
+    if (folderRow) {
+      var f = folderRow.getAttribute("data-folder");
+      openMenu(x, y, [
+        { label: "새 문서", run: function () { newDoc(f); } },
+        { label: "새 하위 폴더", run: function () { newFolder(f); } },
+        { sep: true },
+        { label: "빈 폴더 삭제", danger: true, run: function () { deleteFolder(f); } }
+      ], focusFirst);
+      return folderRow;
+    }
+    return null;
+  }
+
   function bindContextMenu() {
     var tree = document.getElementById("file-tree");
     if (!tree || !W.canWrite) return;
     tree.addEventListener("contextmenu", function (e) {
-      var docRow = e.target.closest(".tree-doc");
-      var folderRow = e.target.closest(".tree-folder-row");
-      if (!docRow && !folderRow) return;
+      if (openTreeMenuFor(e.target, e.clientX, e.clientY, false)) e.preventDefault();
+    });
+    // Keyboard parity (WCAG 2.1.1): the ContextMenu key or Shift+F10 opens the menu at
+    // the focused row, so rename/delete don't require a mouse. Focus returns to the row
+    // on close.
+    tree.addEventListener("keydown", function (e) {
+      if (e.key !== "ContextMenu" && !(e.shiftKey && e.key === "F10")) return;
+      var row = e.target.closest && (e.target.closest(".tree-doc") || e.target.closest(".tree-folder-row"));
+      if (!row) return;
+      var r = row.getBoundingClientRect();
       e.preventDefault();
-      if (docRow) {
-        var p = docRow.getAttribute("data-doc");
-        openMenu(e.clientX, e.clientY, [
-          { label: "이름 변경 / 이동", run: function () { renameDoc(p); } },
-          { sep: true },
-          { label: "삭제", danger: true, run: function () { deleteDoc(p); } }
-        ]);
-      } else {
-        var f = folderRow.getAttribute("data-folder");
-        openMenu(e.clientX, e.clientY, [
-          { label: "새 문서", run: function () { newDoc(f); } },
-          { label: "새 하위 폴더", run: function () { newFolder(f); } },
-          { sep: true },
-          { label: "빈 폴더 삭제", danger: true, run: function () { deleteFolder(f); } }
-        ]);
-      }
+      menuReturnFocus = row;
+      openTreeMenuFor(e.target, r.left + 8, r.bottom, true);
     });
   }
 

@@ -215,15 +215,33 @@ def _chunk_heading_for_tokens(conn, doc_id: int, q_tokens: list[str]) -> tuple[s
     return None, None
 
 
-def _passes_filters(d, folder: str | None, tags: list[str] | None, conn) -> bool:
+def _tags_for_doc_ids(conn, ids: list[int]) -> dict[int, list[str]]:
+    """Tags for many documents in ONE query (doc_id -> sorted tags). Replaces a
+    per-document SELECT both when filtering vector candidates by tag and when
+    attaching tags to a result page."""
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    out: dict[int, list[str]] = {}
+    for row in conn.execute(f"SELECT doc_id, tag FROM tags WHERE doc_id IN ({ph}) ORDER BY tag", ids):
+        out.setdefault(row["doc_id"], []).append(row["tag"])
+    return out
+
+
+def _passes_filters(d, folder: str | None, tags: list[str] | None, conn,
+                    tag_map: dict[int, list[str]] | None = None) -> bool:
     """Re-apply folder/tag filters to a vector-matched doc (the BM25 leg already
-    filtered in SQL; the vec leg returns whatever the corpus held)."""
+    filtered in SQL; the vec leg returns whatever the corpus held). When ``tag_map``
+    is supplied (batch-loaded once for all candidates) the per-doc tag query is skipped."""
     if folder:
         f = folder.strip("/")
         if not (d["folder"] == f or d["folder"].startswith(f + "/")):
             return False
     if tags:
-        doctags = {t[0] for t in conn.execute("SELECT tag FROM tags WHERE doc_id=?", (d["id"],))}
+        if tag_map is not None:
+            doctags = set(tag_map.get(d["id"], []))
+        else:
+            doctags = {t[0] for t in conn.execute("SELECT tag FROM tags WHERE doc_id=?", (d["id"],))}
         if not set(tags).issubset(doctags):
             return False
     return True
@@ -252,6 +270,10 @@ def search_page(
         scored, vec_info, match = _rank(conn, embedder, query, mode=mode, k=k,
                                         folder=folder, tags=tags, params=params)
 
+        # When a tag filter is active, batch-load the candidates' tags once instead of
+        # one SELECT per doc inside the filter loop (O(candidates) -> O(1) queries).
+        filter_tags = _tags_for_doc_ids(conn, [d for d, _ in scored]) if tags else None
+
         results: list[SearchResult] = []
         result_ids: list[int] = []
         for did, score in scored:
@@ -261,7 +283,7 @@ def search_page(
             ).fetchone()
             if not d or d["is_deleted"]:
                 continue
-            if not _passes_filters(d, folder, tags, conn):
+            if not _passes_filters(d, folder, tags, conn, filter_tags):
                 continue
 
             heading = None
@@ -300,16 +322,10 @@ def search_page(
             if len(results) >= want:
                 break
 
-        # Batch-load tags for the page in one query (no per-result round-trip), so an
-        # agent can group/filter results without a follow-up read per hit.
+        # Attach each result's tags (one batched query) so an agent can group/filter
+        # the page without a follow-up read per hit.
         if result_ids:
-            qmarks = ",".join("?" * len(result_ids))
-            tagmap: dict[int, list[str]] = {}
-            for trow in conn.execute(
-                f"SELECT doc_id, tag FROM tags WHERE doc_id IN ({qmarks}) ORDER BY tag",
-                result_ids,
-            ):
-                tagmap.setdefault(trow["doc_id"], []).append(trow["tag"])
+            tagmap = _tags_for_doc_ids(conn, result_ids)
             for r, did in zip(results, result_ids, strict=True):
                 r.tags = tagmap.get(did, [])
     SEARCH_LATENCY.labels(mode).observe(time.perf_counter() - t0)
@@ -369,11 +385,15 @@ def related_documents(conn, source_doc_id: int, *, k: int = 8,
     if not best:
         return []
     ordered = sorted(best.items(), key=lambda kv: kv[1])
+    # Batch-load metadata for all candidate docs in one query rather than a SELECT per
+    # neighbour (the candidate set can be 100s of docs on a large vault).
+    ids = [did for did, _ in ordered]
+    ph = ",".join("?" * len(ids))
+    meta = {m["id"]: m for m in conn.execute(
+        f"SELECT id, path, title, folder, is_deleted FROM documents WHERE id IN ({ph})", ids)}
     out: list[dict] = []
     for did, dist in ordered:
-        d = conn.execute(
-            "SELECT path, title, folder, is_deleted FROM documents WHERE id=?", (did,)
-        ).fetchone()
+        d = meta.get(did)
         if not d or d["is_deleted"]:
             continue
         out.append({"path": d["path"], "title": d["title"] or d["path"],
@@ -496,6 +516,7 @@ def assemble_context(
     with db.reader() as conn:
         scored, vec_info, _match = _rank(conn, embedder, question, mode=mode, k=k,
                                          folder=folder, tags=tags, params=params)
+        filter_tags = _tags_for_doc_ids(conn, [d for d, _ in scored]) if tags else None
         for did, score in scored:
             if len(sources) >= max_sources:
                 truncated = True
@@ -504,7 +525,7 @@ def assemble_context(
                 "SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id=?",
                 (did,),
             ).fetchone()
-            if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn):
+            if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn, filter_tags):
                 continue
 
             remaining = max_chars - total

@@ -33,8 +33,10 @@
   var index = 0;
   var searchTimer = null;
 
+  var previousFocus = null;   // element to restore focus to when the palette closes
   function open(m) {
     mode = m;
+    previousFocus = document.activeElement;   // remember where focus was (WCAG 2.4.3)
     overlay.hidden = false;
     input.value = "";
     input.placeholder = m === "switcher" ? "문서 이름/경로로 이동…" : "명령 입력…";
@@ -46,6 +48,11 @@
     overlay.hidden = true; items = []; index = 0;
     input.setAttribute("aria-expanded", "false");
     input.removeAttribute("aria-activedescendant");
+    // Return focus to wherever it was before opening, so keyboard users keep their place.
+    if (previousFocus && previousFocus.focus) {
+      try { previousFocus.focus(); } catch (_) { /* element gone from DOM */ }
+    }
+    previousFocus = null;
   }
 
   // subsequence fuzzy: every char of q appears in order within s.

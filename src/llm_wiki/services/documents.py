@@ -8,6 +8,7 @@ from the latest revision (see ``recover_pending``).
 """
 from __future__ import annotations
 
+import difflib
 import fnmatch
 import hashlib
 import logging
@@ -749,6 +750,44 @@ class DocumentService:
                 raise NotFoundError(f"No revision {version} for this document.", path=rel)
             return {"path": rel, "version": r["version"], "title": r["title"], "content": r["body"],
                     "op": r["op"], "via": r["via"], "author": r["author"], "created_at": r["created_at"]}
+
+    def compare_revisions(self, path: str, from_version: int, to_version: int) -> dict:
+        """Unified line diff between two revisions, computed server-side (the bodies
+        never travel to the caller). Returns classified diff lines (hunk/add/del/ctx)
+        + a change summary — so an agent auditing edits doesn't fetch two full bodies
+        and diff them itself. Mirrors the web /diff view."""
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.reader() as conn:
+            d = conn.execute("SELECT id FROM documents WHERE path_norm=?", (norm,)).fetchone()
+            if not d:
+                raise NotFoundError("No document at this path.", path=rel)
+            rows = {r["version"]: r for r in conn.execute(
+                "SELECT version, body, title FROM revisions WHERE doc_id=? AND version IN (?,?)",
+                (d["id"], int(from_version), int(to_version)))}
+        fr, to = rows.get(int(from_version)), rows.get(int(to_version))
+        if fr is None:
+            raise NotFoundError(f"No revision {from_version} for this document.", path=rel)
+        if to is None:
+            raise NotFoundError(f"No revision {to_version} for this document.", path=rel)
+        diff: list[dict] = []
+        added = deleted = 0
+        for line in difflib.unified_diff(
+                (fr["body"] or "").splitlines(), (to["body"] or "").splitlines(), lineterm="", n=3):
+            if line.startswith(("+++", "---")):
+                continue
+            if line.startswith("@@"):
+                cls = "hunk"
+            elif line.startswith("+"):
+                cls, added = "add", added + 1
+            elif line.startswith("-"):
+                cls, deleted = "del", deleted + 1
+            else:
+                cls = "ctx"
+            diff.append({"cls": cls, "text": line})
+        return {"path": rel, "from_version": int(from_version), "to_version": int(to_version),
+                "from_title": fr["title"], "to_title": to["title"], "diff": diff,
+                "summary": {"lines_added": added, "lines_deleted": deleted}}
 
     def backlinks(self, path: str) -> dict:
         rel = normalize_rel_path(path)

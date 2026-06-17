@@ -694,6 +694,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             audit.record_tx(db, actor=p.username, via="web", action="role_change",
                             target=str(uid), detail=f"role={role}")
         except WikiError as e:
+            audit.record_tx(db, actor=p.username, via="web", action="role_change",
+                            target=str(uid), outcome="error", detail=e.message)
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
 
@@ -705,6 +707,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             audit.record_tx(db, actor=p.username, via="web", action="user_active",
                             target=str(uid), detail=f"active={bool(active)}")
         except WikiError as e:
+            audit.record_tx(db, actor=p.username, via="web", action="user_active",
+                            target=str(uid), outcome="error", detail=e.message)
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
 
@@ -715,6 +719,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             users_svc.set_password(db, uid, password)
             audit.record_tx(db, actor=p.username, via="web", action="password_change", target=str(uid))
         except WikiError as e:
+            audit.record_tx(db, actor=p.username, via="web", action="password_change",
+                            target=str(uid), outcome="error", detail=e.message)
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
 
@@ -724,6 +730,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             users_svc.delete_user(db, uid)
             audit.record_tx(db, actor=p.username, via="web", action="user_delete", target=str(uid))
         except WikiError as e:
+            audit.record_tx(db, actor=p.username, via="web", action="user_delete",
+                            target=str(uid), outcome="error", detail=e.message)
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
 

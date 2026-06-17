@@ -684,3 +684,38 @@ def test_realtime_banner_escapes_untrusted_values(client):
     assert "function esc(" in js          # escape helper present
     assert "esc(to)" in js                # move banner escapes the document path
     assert "esc(whoVia(ev))" in js        # edit banner escapes the username
+
+
+def test_tree_context_menu_is_keyboard_accessible(client):
+    # C1: rename/delete must be reachable without a mouse (WCAG 2.1.1).
+    js = client.get("/static/shell.js").text
+    assert "ContextMenu" in js and "F10" in js     # keyboard trigger
+    assert "openTreeMenuFor" in js                 # shared open path for mouse + keyboard
+
+
+def test_sidebar_resizer_supports_touch(client):
+    # C3: pointer events cover mouse + touch + pen (was mouse-only).
+    js = client.get("/static/shell.js").text
+    assert "pointerdown" in js and "setPointerCapture" in js
+    assert "mousedown" not in js                    # fully migrated off mouse-only events
+
+
+def test_command_palette_restores_focus_on_close(client):
+    # C2: closing the palette returns focus to where it was (WCAG 2.4.3).
+    js = client.get("/static/palette.js").text
+    assert "previousFocus" in js
+
+
+def test_user_mod_failure_is_audited(client, ctx):
+    # D1: a rejected user-modification (demoting the only admin) must still leave an
+    # audit row with outcome="error" — the security trail can't have silent gaps.
+    from llm_wiki.services import audit
+    login(client, "admin")
+    with ctx.db.reader() as conn:
+        uid = conn.execute("SELECT id FROM users WHERE username='admin'").fetchone()[0]
+    r = client.post(f"/admin/users/{uid}/role",
+                    data={"role": "editor", "csrf_token": _token(client, "/admin/users")},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    rows = audit.recent(ctx.db, action="role_change")
+    assert any(x["outcome"] == "error" for x in rows)

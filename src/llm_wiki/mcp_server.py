@@ -405,6 +405,15 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda _p: {"ok": True, **docs.revision(path, version)},
                            "get_revision")
 
+    @mcp.tool(description="Unified line diff between two revisions of a document. The bodies are "
+                          "diffed server-side and never travel to you, so comparing large revisions "
+                          "is cheap. Returns 'diff' (classified lines: hunk/add/del/ctx) and "
+                          "'summary' {lines_added, lines_deleted} — use it to audit what changed "
+                          "between versions instead of fetching both full bodies.")
+    async def compare_revisions(ctx: Context, path: str, from_version: int, to_version: int) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, **docs.compare_revisions(
+            path, from_version, to_version)}, "compare_revisions")
+
     @mcp.tool(description="Link graph as {nodes, edges} (Cytoscape/D3). root=None for the "
                           "whole vault; otherwise BFS to 'depth' around the root document.")
     async def get_graph(

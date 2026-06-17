@@ -40,7 +40,8 @@ async def test_tools_registered(ctx):
         "search_documents", "read_document", "get_document_info", "get_outline", "read_chunk",
         "list_documents",
         "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
-        "get_backlinks", "resolve_links", "get_revisions", "get_revision", "get_graph",
+        "get_backlinks", "resolve_links", "get_revisions", "get_revision", "compare_revisions",
+        "get_graph",
         "assemble_context", "get_related_documents",
         "create_document", "update_document", "patch_document", "replace_section",
         "append_section", "append_to_document", "patch_tags", "move_document",
@@ -151,6 +152,18 @@ async def test_patch_regex_occurrence_tool(editor_mcp):
         {"path": "r.md", "find": r"^- \[ \]", "replace": "- [x]", "mode": "regex",
          "occurrence": 2, "return_content": "full"}))
     assert d["ok"] and d["content"] == "- [ ] a\n- [x] b\n"
+
+
+async def test_compare_revisions_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "cmp.md", "content": "a\nb\n"}))
+    _payload(await editor_mcp.call_tool(
+        "update_document", {"path": "cmp.md", "base_version": 1, "content": "a\nB\nc\n"}))
+    d = _payload(await editor_mcp.call_tool(
+        "compare_revisions", {"path": "cmp.md", "from_version": 1, "to_version": 2}))
+    assert d["ok"] and d["from_version"] == 1 and d["to_version"] == 2
+    classes = {ln["cls"] for ln in d["diff"]}
+    assert "add" in classes and "del" in classes
+    assert d["summary"]["lines_added"] >= 1 and d["summary"]["lines_deleted"] >= 1
 
 
 async def test_restore_revision_tool(editor_mcp):

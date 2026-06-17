@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 
 import uvicorn
+from pydantic import ValidationError
 
 from .config import ConfigError, get_settings
 from .db import SCHEMA_VERSION, get_meta
@@ -493,14 +494,30 @@ def _safe_join(base: Path, rel: str) -> Path | None:
     return None
 
 
-def _serve(args) -> int:
-    settings = get_settings()
+def _apply_serve_overrides(settings, args):
+    """Merge --host/--gui-port/--mcp-port onto the loaded settings and RE-VALIDATE.
+    Plain attribute assignment doesn't re-run Settings' validators (no
+    validate_assignment), so without this a CLI override could slip an out-of-range
+    port — or two identical ports — past the distinct-ports check and only fail at
+    bind() time with an opaque 'address already in use'."""
+    overrides = {}
     if args.host:
-        settings.host = args.host
+        overrides["host"] = args.host
     if args.gui_port:
-        settings.gui_port = args.gui_port
+        overrides["gui_port"] = args.gui_port
     if args.mcp_port:
-        settings.mcp_port = args.mcp_port
+        overrides["mcp_port"] = args.mcp_port
+    if not overrides:
+        return settings
+    merged = {**settings.model_dump(), **overrides}
+    try:
+        return type(settings).model_validate(merged)
+    except ValidationError as e:
+        raise ConfigError(f"Invalid --host/--gui-port/--mcp-port override:\n{e}") from e
+
+
+def _serve(args) -> int:
+    settings = _apply_serve_overrides(get_settings(), args)
 
     # Logging is already configured for all commands in _dispatch().
     print("Loading embedding model… (first run downloads it from HuggingFace)")

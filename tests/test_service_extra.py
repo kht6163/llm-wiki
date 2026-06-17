@@ -3,8 +3,26 @@ durability paths that previously had no coverage."""
 import pytest
 
 from llm_wiki.services import users as users_svc
-from llm_wiki.services.errors import ConflictError, ValidationError
+from llm_wiki.services.errors import ConflictError, NotFoundError, ValidationError
 from llm_wiki.util import PathError, normalize_rel_path, safe_join
+
+
+def test_compare_revisions_diffs_two_versions(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "c.md", "line one\nline two\n")
+    docs.update(p, "c.md", 1, "line one\nline two changed\nline three\n")
+    out = docs.compare_revisions("c.md", 1, 2)
+    assert out["from_version"] == 1 and out["to_version"] == 2
+    classes = {d["cls"] for d in out["diff"]}
+    assert "add" in classes and "del" in classes
+    assert out["summary"]["lines_added"] >= 1 and out["summary"]["lines_deleted"] >= 1
+
+
+def test_compare_revisions_missing_version_raises(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "c.md", "body")
+    with pytest.raises(NotFoundError):
+        docs.compare_revisions("c.md", 1, 99)
 
 
 # -- path safety -----------------------------------------------------------
