@@ -229,6 +229,22 @@ def create_web_app(app: AppContext) -> FastAPI:
         ctx.update(kw)
         return templates.TemplateResponse(request, name, ctx, status_code=status)
 
+    def embed_resolver(from_path: str):
+        """A render_markdown embed resolver bound to a document's folder: resolves an
+        ``![[target]]`` to the live target doc {path,title,content}, or None. Embeds are
+        always rendered against the current vault (Obsidian semantics), even in a past
+        revision view."""
+        def resolve(target: str) -> dict | None:
+            rel = docs.resolve_link(target, from_path)
+            if not rel:
+                return None
+            try:
+                d = docs.get(rel)
+            except WikiError:
+                return None
+            return {"path": d["path"], "title": d["title"], "content": d["content"]}
+        return resolve
+
     def login_redirect() -> RedirectResponse:
         return RedirectResponse("/login", status_code=303)
 
@@ -459,10 +475,32 @@ def create_web_app(app: AppContext) -> FastAPI:
         doc = docs.toggle_task(p, path, index=index, base_version=base_version)
         return JSONResponse({"ok": True, "version": doc["version"]})
 
+    @web.post("/api/doc/{path:path}/properties")
+    async def api_doc_properties(path: str, request: Request, p: Principal = Depends(require_user)):
+        # Replace the whole editable frontmatter property set in one revision. JSON body:
+        # {base_version?, properties: [{key, values: [..] | "a, b"}]}.
+        data = await request.json()
+        base_version = data.get("base_version")
+        props: list[tuple[str, list[str]]] = []
+        for item in data.get("properties") or []:
+            key = str((item or {}).get("key") or "")
+            values = (item or {}).get("values")
+            if isinstance(values, str):
+                values = [v for v in (s.strip() for s in values.split(",")) if v]
+            elif isinstance(values, list):
+                values = [str(v) for v in values]
+            else:
+                values = []
+            props.append((key, values))
+        doc = docs.replace_properties(p, path, props, base_version=base_version)
+        return JSONResponse({"ok": True, "version": doc["version"]})
+
     @web.post("/api/preview")
     def api_preview(request: Request, content: str = Form(""), path: str = Form("preview.md"),
                     _p: Principal = Depends(require_user)):
-        return JSONResponse({"ok": True, "html": render_markdown(content, path or "preview.md")})
+        target = path or "preview.md"
+        return JSONResponse({"ok": True, "html": render_markdown(
+            content, target, resolve_embed=embed_resolver(target))})
 
     @web.get("/api/doc/{path:path}/preview")
     def api_doc_preview(path: str, request: Request, _p: Principal = Depends(require_user)):
@@ -478,7 +516,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             "ok": True, "path": doc["path"], "version": doc["version"], "title": doc["title"],
             "updated_at": doc["updated_at"], "updated_by": doc["updated_by"],
             "last_via": doc.get("last_via"), "tags": doc["tags"],
-            "html": render_markdown(doc["content"], doc["path"]),
+            "html": render_markdown(doc["content"], doc["path"],
+                                    resolve_embed=embed_resolver(doc["path"])),
         })
 
     @web.post("/api/upload")
@@ -596,7 +635,8 @@ def create_web_app(app: AppContext) -> FastAPI:
     def revision_view(path: str, version: int, request: Request,
                       _p: Principal = Depends(require_user)):
         rev = docs.revision(path, version)
-        html = render_markdown(rev["content"], rev["path"])
+        html = render_markdown(rev["content"], rev["path"],
+                               resolve_embed=embed_resolver(rev["path"]))
         return render("revision.html", request, rev=rev, html=html)
 
     @web.get("/doc/{path:path}/diff", response_class=HTMLResponse)
@@ -634,7 +674,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             doc = docs.get(path)
         except WikiError:
             return render("missing.html", request, path=path)
-        html = render_markdown(doc["content"], doc["path"])
+        html = render_markdown(doc["content"], doc["path"],
+                               resolve_embed=embed_resolver(doc["path"]))
         backlinks = docs.backlinks(doc["path"])["backlinks"]
         outgoing = docs.links(doc["path"])["links"]
         stats = word_count(doc["content"])

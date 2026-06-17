@@ -28,15 +28,25 @@
     {{ via_badge(doc.last_via) }}
     {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
   </div>
-  {% if properties %}
-  <dl class="doc-props" aria-label="문서 속성">
-    {% for key, values in properties %}
-    <div class="prop">
-      <dt class="prop-key">{{ key }}</dt>
-      <dd class="prop-val">{% for v in values %}<span class="prop-chip">{{ v }}</span>{% endfor %}</dd>
+  {% if properties or user.can_write %}
+  <section class="doc-props-wrap" id="doc-props-wrap"
+           data-path="{{ doc.path }}" data-version="{{ doc.version }}">
+    {% if properties %}
+    <dl class="doc-props" aria-label="문서 속성">
+      {% for key, values in properties %}
+      <div class="prop" data-key="{{ key }}">
+        <dt class="prop-key">{{ key }}</dt>
+        <dd class="prop-val">{% for v in values %}<span class="prop-chip">{{ v }}</span>{% endfor %}</dd>
+      </div>
+      {% endfor %}
+    </dl>
+    {% endif %}
+    {% if user.can_write %}
+    <div class="prop-actions">
+      <button type="button" class="prop-edit" data-action="edit-props">속성 편집</button>
     </div>
-    {% endfor %}
-  </dl>
+    {% endif %}
+  </section>
   {% endif %}
   <div class="rendered" id="doc-rendered">{{ html|safe }}</div>
 </article>
@@ -45,6 +55,7 @@
 <script src="{{ static('outline.js') }}"></script>
 <script src="{{ static('tasks.js') }}"></script>
 <script src="{{ static('related.js') }}"></script>
+{% if user.can_write %}<script src="{{ static('props.js') }}"></script>{% endif %}
 {% endblock %}
 
 {% block right %}

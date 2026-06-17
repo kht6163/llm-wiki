@@ -83,6 +83,60 @@ def test_view_renders_frontmatter_as_properties_panel(client):
     assert "draft" in body and "별명" in body     # the non-title/tags values show
 
 
+def test_view_expands_note_embed(client):
+    # ![[note]] in a document transcludes the target's rendered body in the reading view.
+    login(client, "alice")
+    create_doc(client, "target.md", "# 대상\n\n임베드된 본문입니다\n")
+    create_doc(client, "host.md", "앞 문단\n\n![[target]]\n")  # embeds resolve by note name
+    body = client.get("/doc/host.md").text
+    assert 'class="embed' in body and "embed-body" in body
+    assert "임베드된 본문입니다" in body
+
+
+def test_property_panel_editable_for_editor_not_viewer(client):
+    login(client, "alice")  # editor
+    create_doc(client, "p.md", "---\ntitle: T\nstatus: draft\n---\n\n# T\n\nbody")
+    editor_view = client.get("/doc/p.md").text
+    assert 'data-action="edit-props"' in editor_view
+    assert "props.js" in editor_view
+    client.get("/logout")
+    login(client, "bob")  # viewer
+    viewer_view = client.get("/doc/p.md").text
+    assert 'data-action="edit-props"' not in viewer_view
+
+
+def test_properties_endpoint_replaces_set(client):
+    login(client, "alice")
+    create_doc(client, "p.md", "---\ntitle: T\nstatus: draft\nauthor: kim\n---\n\n# T\n\nbody")
+    tok = _token(client, "/doc/p.md")
+    r = client.post(
+        "/api/doc/p.md/properties",
+        json={"base_version": 1, "properties": [
+            {"key": "status", "values": "done"},
+            {"key": "aliases", "values": "별명1, 별명2"},
+        ]},
+        headers={"X-CSRF-Token": tok},
+    )
+    assert r.status_code == 200 and r.json()["ok"] is True
+    body = client.get("/doc/p.md").text
+    assert "done" in body and "별명1" in body and "별명2" in body
+    assert "kim" not in body  # author dropped (omitted from the set)
+    assert "T" in body        # reserved title preserved
+
+
+def test_properties_endpoint_rejects_reserved_key(client):
+    login(client, "alice")
+    create_doc(client, "p.md", "# T\n\nbody")
+    tok = _token(client, "/doc/p.md")
+    r = client.post(
+        "/api/doc/p.md/properties",
+        json={"base_version": 1, "properties": [{"key": "title", "values": "x"}]},
+        headers={"X-CSRF-Token": tok},
+    )
+    assert r.status_code == 400
+    assert r.json()["ok"] is False
+
+
 def test_settings_empty_state_has_no_table_chrome(client):
     # With no keys, the calm standalone empty-state shows — not a column-header row
     # boxed in a bordered table cell.

@@ -164,6 +164,39 @@ h1 { font-size: 1.6em; }
   background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm);
   padding: 0 7px; color: var(--fg); font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
 }
+/* Inline property editor (props.js) */
+.doc-props-wrap { margin: 0 0 20px; max-width: 74ch; }
+.doc-props-wrap .doc-props { margin: 0 0 6px; }
+.prop-actions { display: flex; }
+.prop-edit {
+  font-size: 0.74em; padding: 2px 9px; color: var(--fg-muted); border: 1px solid var(--line);
+  background: transparent; border-radius: var(--r-sm); cursor: pointer;
+}
+.prop-edit:hover { border-color: var(--accent); color: var(--accent); }
+.doc-props-wrap.editing .doc-props, .doc-props-wrap.editing .prop-actions { display: none; }
+.props-editor {
+  padding: 10px 13px; background: var(--inset); border: 1px solid var(--line);
+  border-radius: var(--r-md); display: flex; flex-direction: column; gap: 7px; font-size: 0.85em;
+}
+.pe-list { display: flex; flex-direction: column; gap: 6px; }
+.pe-row { display: flex; gap: 7px; align-items: center; }
+.pe-key, .pe-val {
+  padding: 4px 8px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); color: var(--fg); font-family: var(--font-mono); font-size: 0.95em;
+}
+.pe-key { flex: 0 0 30%; min-width: 0; }
+.pe-val { flex: 1; min-width: 0; }
+.pe-rm {
+  flex: none; width: 26px; height: 26px; line-height: 1; padding: 0; border: 1px solid var(--line);
+  background: transparent; color: var(--fg-muted); border-radius: var(--r-sm); cursor: pointer;
+}
+.pe-rm:hover { border-color: var(--danger); color: var(--danger); }
+.pe-add {
+  align-self: flex-start; font-size: 0.92em; padding: 3px 9px; color: var(--fg-muted);
+  border: 1px dashed var(--line); background: transparent; border-radius: var(--r-sm); cursor: pointer;
+}
+.pe-add:hover { border-color: var(--accent); color: var(--accent); }
+.pe-actions { display: flex; gap: 8px; }
 /* Reading surface — prose capped near 74ch for legibility; dense data
    (tables, code) may exceed it. Heading rhythm tightened for a tool, with a
    hairline under section heads instead of size alone carrying hierarchy. */
@@ -777,6 +810,32 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   mask: var(--callout-icon) center / 16px no-repeat;
 }
 .callout > :last-child { margin-bottom: 0; }
+
+/* Note embeds (transclusion): ![[note]] / ![[note#heading]] expanded inline. A
+   bordered, inset-tinted block — a small monospace title link header over the
+   embedded body. Missing/cycle/collapsed variants are header-only chips. */
+.rendered .embed { margin: 14px 0; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--inset); overflow: hidden; }
+.rendered .embed-head {
+  display: flex; align-items: baseline; gap: 8px; padding: 5px 12px;
+  font-family: var(--font-mono); font-size: 0.8em;
+}
+.rendered .embed-title { font-weight: 600; overflow-wrap: anywhere; }
+.rendered .embed-note { color: var(--fg-muted); }
+.rendered .embed-body { padding: 2px 14px; border-top: 1px solid var(--line); background: var(--bg); }
+.rendered .embed-body > :first-child { margin-top: 10px; }
+.rendered .embed-body > :last-child { margin-bottom: 10px; }
+.rendered .embed-missing .embed-title, .rendered .embed-cycle .embed-title,
+.rendered .embed-collapsed .embed-title { color: var(--fg-muted); }
+/* Editor live-preview placeholder (md-extensions.js): the preview can't expand an
+   embed without the vault, so it shows a compact chip linking to the note. */
+.embed-placeholder {
+  display: inline-flex; align-items: baseline; gap: 7px; padding: 1px 8px; margin: 0 1px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--inset);
+  font-family: var(--font-mono); font-size: 0.92em;
+}
+.embed-placeholder .embed-note { color: var(--fg-muted); font-size: 0.85em; }
+
 .callout-info { --c: var(--accent); }
 .callout-tip, .callout-success { --c: var(--success);
   --callout-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5'/%3E%3Cpath d='M9 18h6'/%3E%3Cpath d='M10 22h4'/%3E%3C/svg%3E"); }

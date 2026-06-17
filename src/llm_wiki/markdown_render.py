@@ -1,16 +1,26 @@
 """Render markdown to safe HTML for the web viewer, with Obsidian-style
-``[[wikilink]]`` support. Wikilinks become links to a ``/go`` resolver route so
-rendering needs no database access. Output is sanitized with bleach.
+``[[wikilink]]`` support and ``![[note]]`` / ``![[note#heading]]`` embeds
+(transclusion). Wikilinks become links to a ``/go`` resolver route so plain
+rendering needs no database access; embeds expand inline only when a
+``resolve_embed`` callback is supplied (the web view route injects one).
+Output is sanitized with bleach.
 """
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+from html import escape
 from urllib.parse import quote
 
 import bleach
 from markdown_it import MarkdownIt
 
-from .markdown_utils import WIKILINK_RE, parse_frontmatter
+from .markdown_utils import WIKILINK_RE, parse_frontmatter, section_text
+from .util import path_norm
+
+# An embed resolver maps a raw link target (e.g. "folder/Note") to the target
+# document as {"path", "title", "content"}, or None when it doesn't resolve.
+EmbedResolver = Callable[[str], "dict | None"]
 
 _md = (
     MarkdownIt("commonmark", {"html": False, "linkify": True, "typographer": False})
@@ -51,6 +61,16 @@ _CALLOUT_RE = re.compile(
 _TASK_RE = re.compile(r"<li>\[([ xX])\] ")
 _HILITE_SPLIT_RE = re.compile(r"(<pre>.*?</pre>|<code>.*?</code>)", re.DOTALL)
 _HILITE_RE = re.compile(r"==(\S(?:.*?\S)?)==")
+
+# ``![[target]]`` / ``![[target#heading]]`` / ``![[target|alias]]`` embeds.
+EMBED_RE = re.compile(r"!\[\[([^\[\]\n]+?)\]\]")
+# Recursion safety: cap nesting depth and total expansions per render, and track the
+# ancestor chain to refuse cycles (A embeds B embeds A).
+_MAX_EMBED_DEPTH = 4
+_MAX_EMBEDS = 50
+# Private-use sentinel: markdown-it passes it through untouched (not link/typography
+# significant), so we can swap rendered embed HTML back in after the parser runs.
+_EMBED_SENTINEL = "EMBED{}"
 
 
 def _callouts(html: str) -> str:
@@ -105,26 +125,101 @@ def _wiki_repl(m: re.Match, src_path: str) -> str:
     return f"[{label}]({href})"
 
 
-def _convert_wikilinks(text: str, src_path: str) -> str:
-    # Protect fenced code blocks so wikilinks inside them stay literal.
+def _parse_embed(inner: str) -> tuple[str, str | None]:
+    """Split an embed's inner text into (target, anchor); the ``|alias`` part (Obsidian
+    uses it for embed dimensions) is dropped — we don't size embeds."""
+    inner = inner.split("|", 1)[0].strip()
+    if "#" in inner:
+        target, anchor = inner.split("#", 1)
+        return target.strip(), anchor.strip()
+    return inner, None
+
+
+def _embed_box(cls: str, title_html: str, note: str = "", body: str = "") -> str:
+    note_html = f'<span class="embed-note">{escape(note)}</span>' if note else ""
+    body_html = f'<div class="embed-body">{body}</div>' if body else ""
+    return (f'<div class="embed {cls}"><div class="embed-head">{title_html}{note_html}</div>'
+            f'{body_html}</div>')
+
+
+def _render_embed(target: str, anchor: str | None, src_path: str,
+                  resolve: EmbedResolver, depth: int, seen: frozenset[str],
+                  budget: list[int]) -> str:
+    """Render one ``![[target#anchor]]`` embed to HTML (recursing into the target)."""
+    label = target + (f"#{anchor}" if anchor else "")
+    go = f"/go?from={quote(src_path)}&target={quote(target)}"
+    # No resolver, depth/budget exhausted -> show a collapsed link instead of expanding.
+    if depth >= _MAX_EMBED_DEPTH or budget[0] <= 0:
+        return _embed_box("embed-collapsed",
+                          f'<a class="embed-title" href="{go}">{escape(label)}</a>',
+                          note="펼치지 않음")
+    res = resolve(target)
+    if not res:
+        return _embed_box("embed-missing",
+                          f'<span class="embed-title">{escape(label)}</span>', note="없는 문서")
+    path = res["path"]
+    if path_norm(path) in seen:
+        return _embed_box("embed-cycle",
+                          f'<span class="embed-title">{escape(res.get("title") or path)}</span>',
+                          note="순환 임베드")
+    body = res.get("content") or ""
+    head_label = escape(res.get("title") or path)
+    if anchor:
+        sect = section_text(body, anchor)
+        if sect is None:
+            return _embed_box("embed-missing",
+                              f'<span class="embed-title">{escape(label)}</span>', note="없는 섹션")
+        body = sect
+        head_label += f' › {escape(anchor)}'
+    budget[0] -= 1
+    inner = _render(body, path, resolve, depth + 1, seen | {path_norm(path)}, budget)
+    doc_href = "/doc/" + quote(path)
+    return _embed_box("", f'<a class="embed-title" href="{doc_href}">{head_label}</a>', body=inner)
+
+
+def _convert_inline(text: str, src_path: str, resolve: EmbedResolver | None,
+                    depth: int, seen: frozenset[str], budget: list[int],
+                    embeds: list[str]) -> str:
+    """Replace embeds (with sentinels, collecting rendered HTML) and wikilinks (with
+    markdown links) outside fenced code blocks."""
+    def embed_repl(m: re.Match) -> str:
+        target, anchor = _parse_embed(m.group(1))
+        if not target:
+            return m.group(0)
+        if resolve is None:
+            # Plain render (no DB context): keep the embed visible as a wikilink.
+            return f"[[{m.group(1)}]]"
+        embeds.append(_render_embed(target, anchor, src_path, resolve, depth, seen, budget))
+        return _EMBED_SENTINEL.format(len(embeds) - 1)
+
     parts = re.split(r"(```.*?```)", text, flags=re.DOTALL)
     for i in range(0, len(parts), 2):
-        parts[i] = WIKILINK_RE.sub(lambda m: _wiki_repl(m, src_path), parts[i])
+        seg = EMBED_RE.sub(embed_repl, parts[i])
+        seg = WIKILINK_RE.sub(lambda m: _wiki_repl(m, src_path), seg)
+        parts[i] = seg
     return "".join(parts)
 
 
-def render_markdown(text: str, src_path: str = "") -> str:
+def _render(text: str, src_path: str, resolve: EmbedResolver | None,
+            depth: int, seen: frozenset[str], budget: list[int]) -> str:
     # YAML frontmatter is metadata, not prose. Left in, CommonMark turns the
     # opening `---` into an <hr> and the `key: value` lines + closing `---` into a
     # setext <h2>, so the block renders as a broken heading atop every document.
     # Strip it before the parser; the values are surfaced separately as Properties.
     body = (text or "")[parse_frontmatter(text or "")[1]:]
-    html = _md.render(_convert_wikilinks(body, src_path))
+    embeds: list[str] = []
+    here = path_norm(src_path) if src_path else None
+    seen_here = seen | ({here} if here else set())
+    html = _md.render(_convert_inline(body, src_path, resolve, depth, seen_here, budget, embeds))
     # Obsidian-flavored post-processing before sanitization: callout blocks,
-    # task-list checkboxes, and ==highlight==.
+    # task-list checkboxes, and ==highlight==. (Embed HTML is swapped in afterwards,
+    # so it is rendered exactly once — by the recursive call that produced it.)
     html = _callouts(html)
     html = _tasklist(html)
     html = _highlight(html)
+    for i, embed_html in enumerate(embeds):
+        token = _EMBED_SENTINEL.format(i)
+        html = html.replace(f"<p>{token}</p>", embed_html).replace(token, embed_html)
     return bleach.clean(
         html,
         tags=_ALLOWED_TAGS,
@@ -132,3 +227,12 @@ def render_markdown(text: str, src_path: str = "") -> str:
         protocols=_ALLOWED_PROTOCOLS,
         strip=True,
     )
+
+
+def render_markdown(text: str, src_path: str = "", *,
+                    resolve_embed: EmbedResolver | None = None) -> str:
+    """Render markdown to sanitized HTML. ``![[note]]`` / ``![[note#heading]]`` embeds
+    expand inline only when ``resolve_embed`` is given (target -> {path,title,content}
+    or None); without it they stay as plain links so callers without DB access (tests,
+    snippet previews) still render safely."""
+    return _render(text, src_path, resolve_embed, 0, frozenset(), [_MAX_EMBEDS])

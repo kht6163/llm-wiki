@@ -41,6 +41,35 @@ function wikilink(md, goBase) {
   });
 }
 
+// ![[target]] / ![[target#heading]] -> an embed placeholder chip. The editor preview
+// has no vault access to expand the target (the server reading view does that), so it
+// shows a labelled chip linking to the note instead of the transcluded content.
+function embed(md, goBase) {
+  md.inline.ruler.before("image", "embed", function (state, silent) {
+    const src = state.src, start = state.pos;
+    if (src.charCodeAt(start) !== 0x21 || src.charCodeAt(start + 1) !== 0x5b ||
+        src.charCodeAt(start + 2) !== 0x5b) return false; // ![[
+    const end = src.indexOf("]]", start + 3);
+    if (end < 0) return false;
+    const inner = src.slice(start + 3, end).trim();
+    if (!inner) return false;
+    if (!silent) {
+      let linkpart = inner.split("|")[0].trim();
+      let target = linkpart, anchor = null;
+      const h = linkpart.indexOf("#");
+      if (h >= 0) { target = linkpart.slice(0, h).trim(); anchor = linkpart.slice(h + 1).trim(); }
+      const label = target + (anchor ? " › " + anchor : "");
+      const href = goBase + encodeURIComponent(target);
+      const tok = state.push("html_inline", "", 0);
+      tok.content = '<span class="embed-placeholder"><a href="' + md.utils.escapeHtml(href) +
+        '" class="embed-title">' + md.utils.escapeHtml(label) + "</a>" +
+        '<span class="embed-note">임베드</span></span>';
+    }
+    state.pos = end + 2;
+    return true;
+  });
+}
+
 // > [!type] title  ->  <div class="callout callout-type"><div class="callout-title">…
 function callouts(md) {
   md.core.ruler.push("callouts", function (state) {
@@ -180,6 +209,7 @@ function frontmatter(md) {
 export function installWikiExtensions(md, opts) {
   opts = opts || {};
   frontmatter(md);
+  embed(md, opts.goBase || "/go?target=");
   wikilink(md, opts.goBase || "/go?target=");
   callouts(md);
   mark(md);

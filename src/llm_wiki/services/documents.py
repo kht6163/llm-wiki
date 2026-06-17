@@ -29,11 +29,14 @@ from ..markdown_utils import (
     SCHEME_RE,
     _mask,
     derive_title,
+    document_properties,
     extract_links,
     extract_tags,
     heading_slug,
     parse_frontmatter,
+    remove_frontmatter_property,
     rewrite_link_target,
+    set_frontmatter_property,
     set_frontmatter_tags,
 )
 from ..metrics import DOC_WRITES
@@ -1214,6 +1217,91 @@ class DocumentService:
         new_content = set_frontmatter_tags(doc["content"], target)
         updated = self.update(principal, doc["path"], doc["version"], new_content)
         return {"path": updated["path"], "version": updated["version"], "tags": updated["tags"]}
+
+    # ``title``/``tags`` are surfaced and edited through dedicated paths (the heading and
+    # the tag list), so the generic property editor leaves them alone to avoid two ways
+    # to write the same field.
+    _PROP_RESERVED = {"title", "tags"}
+    _PROP_KEY_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+    def _validate_prop_key(self, key: str) -> str:
+        key = (key or "").strip()
+        if not key or not self._PROP_KEY_RE.match(key):
+            raise ValidationError("property key must be letters/digits/_/- only.")
+        if key.lower() in self._PROP_RESERVED:
+            raise ValidationError(f"'{key}' is managed elsewhere (use the title/tags editors).")
+        return key
+
+    @staticmethod
+    def _norm_prop_value(value: str | list[str]) -> str | list[str]:
+        if isinstance(value, list):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return str(value).strip()
+
+    def set_property(self, principal: Principal, path: str, key: str,
+                     value: str | list[str], base_version: int | None = None) -> dict:
+        """Set/replace one frontmatter property (body + other keys untouched), through
+        the CAS update path. An empty value removes the key."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        key = self._validate_prop_key(key)
+        doc = self.get(path)
+        val = self._norm_prop_value(value)
+        if not val:
+            new_content = remove_frontmatter_property(doc["content"], key)
+        else:
+            new_content = set_frontmatter_property(
+                doc["content"], key, val if isinstance(val, str) or len(val) > 1 else val[0])
+        if new_content == doc["content"]:
+            return self.get(doc["path"])
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, new_content)
+
+    def remove_property(self, principal: Principal, path: str, key: str,
+                        base_version: int | None = None) -> dict:
+        """Remove one frontmatter property (no-op if absent), through CAS update."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        key = self._validate_prop_key(key)
+        doc = self.get(path)
+        new_content = remove_frontmatter_property(doc["content"], key)
+        if new_content == doc["content"]:
+            return self.get(doc["path"])
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, new_content)
+
+    def replace_properties(self, principal: Principal, path: str,
+                           props: list[tuple[str, list[str]]],
+                           base_version: int | None = None) -> dict:
+        """Replace the whole editable property set in one revision: drops omitted keys,
+        sets the rest. ``title``/``tags`` and the body are preserved. ``props`` is an
+        ordered list of (key, values); empty value-lists drop the key."""
+        if not principal.can_write:
+            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+        cleaned: list[tuple[str, list[str]]] = []
+        seen_keys: set[str] = set()
+        for key, values in props:
+            key = self._validate_prop_key(key)
+            if key.lower() in seen_keys:
+                raise ValidationError(f"duplicate property key '{key}'.")
+            seen_keys.add(key.lower())
+            vals = [str(v).strip() for v in values if str(v).strip()]
+            cleaned.append((key, vals))
+        doc = self.get(path)
+        content = doc["content"]
+        keep = {k.lower() for k, _ in cleaned}
+        for existing_key, _ in document_properties(content):
+            if existing_key.lower() not in keep:
+                content = remove_frontmatter_property(content, existing_key)
+        for key, vals in cleaned:
+            if not vals:
+                content = remove_frontmatter_property(content, key)
+            else:
+                content = set_frontmatter_property(content, key, vals[0] if len(vals) == 1 else vals)
+        if content == doc["content"]:
+            return self.get(doc["path"])
+        bv = doc["version"] if base_version is None else int(base_version)
+        return self.update(principal, doc["path"], bv, content)
 
     def broken_links(self, limit: int = 200) -> dict:
         """Vault-wide unresolved links (dangling references) for cleanup tooling."""

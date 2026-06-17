@@ -1,6 +1,11 @@
 import pytest
 
-from llm_wiki.services.errors import ConflictError, ForbiddenError, NotFoundError
+from llm_wiki.services.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+)
 
 
 def test_create_read_update_version(ctx, principals):
@@ -96,3 +101,86 @@ def test_revisions(ctx, principals):
     assert len(hist["revisions"]) == 2
     rev1 = docs.revision("r.md", 1)
     assert rev1["content"] == "one"
+
+
+# ---- frontmatter property editing -----------------------------------------
+def test_set_property_adds_and_updates_through_cas(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "# P\n\nbody")
+    d = docs.set_property(p, "p.md", "status", "draft")
+    assert d["version"] == 2 and "status: draft" in d["content"]
+    d2 = docs.set_property(p, "p.md", "status", "done")
+    assert "status: done" in d2["content"] and "draft" not in d2["content"]
+    # body preserved across property edits
+    assert "body" in d2["content"]
+
+
+def test_set_property_list_value_becomes_inline_list(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "# P\n\nbody")
+    d = docs.set_property(p, "p.md", "aliases", ["별명1", "별명2"])
+    assert "aliases: [별명1, 별명2]" in d["content"]
+
+
+def test_set_property_empty_value_removes_key(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "---\nstatus: draft\n---\nbody")
+    d = docs.set_property(p, "p.md", "status", "")
+    assert "status" not in d["content"]
+
+
+def test_remove_property_is_idempotent_noop(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    doc = docs.create(p, "p.md", "# P\n\nbody")
+    d = docs.remove_property(p, "p.md", "status")  # absent -> no version bump
+    assert d["version"] == doc["version"]
+
+
+def test_property_key_title_and_tags_are_reserved(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "# P\n\nbody")
+    for reserved in ("title", "tags"):
+        with pytest.raises(ValidationError):
+            docs.set_property(p, "p.md", reserved, "x")
+
+
+def test_property_key_must_be_simple(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "# P\n\nbody")
+    with pytest.raises(ValidationError):
+        docs.set_property(p, "p.md", "bad key!", "x")
+
+
+def test_viewer_cannot_edit_properties(ctx, principals):
+    docs = ctx.docs
+    docs.create(principals["editor"], "p.md", "# P\n\nbody")
+    with pytest.raises(ForbiddenError):
+        docs.set_property(principals["viewer"], "p.md", "status", "draft")
+
+
+def test_replace_properties_drops_omitted_keeps_reserved(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "---\ntitle: T\ntags: [x]\nstatus: draft\nauthor: kim\n---\nbody",
+                tags=["x"])
+    # keep status (changed), drop author, add due; title/tags untouched
+    d = docs.replace_properties(p, "p.md", [("status", ["done"]), ("due", ["2026-07-01"])])
+    assert "status: done" in d["content"]
+    assert "author" not in d["content"]
+    assert "due: 2026-07-01" in d["content"]
+    assert "title: T" in d["content"] and "x" in d["tags"]
+
+
+def test_property_edit_conflicts_on_stale_base_version(ctx, principals):
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "p.md", "# P\n\nbody")           # v1
+    docs.update(p, "p.md", base_version=1, content="# P\n\nchanged")  # v2
+    with pytest.raises(ConflictError):
+        docs.set_property(p, "p.md", "status", "draft", base_version=1)

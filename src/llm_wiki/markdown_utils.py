@@ -51,6 +51,26 @@ def heading_slug(text: str) -> str:
     return s or "section"
 
 
+def section_text(body: str, heading: str) -> str | None:
+    """Return the markdown of the section whose heading matches ``heading`` (the first
+    match, compared by heading slug so spacing/case differences don't matter), from the
+    heading line up to the next heading of the same or higher level. ``None`` if no such
+    heading. Used to embed ``![[note#heading]]`` section transclusions."""
+    want = heading_slug(heading)
+    heads = list(HEADING_RE.finditer(body))
+    for idx, h in enumerate(heads):
+        if heading_slug(h.group(2)) != want:
+            continue
+        level = len(h.group(1))
+        end = len(body)
+        for nxt in heads[idx + 1:]:
+            if len(nxt.group(1)) <= level:
+                end = nxt.start()
+                break
+        return body[h.start():end].strip()
+    return None
+
+
 def _parse_simple_yaml(raw: str) -> dict:
     """Minimal frontmatter parser: scalar ``key: value``, inline ``[a, b]`` lists,
     and block ``- item`` lists. Sufficient for title/tags/aliases."""
@@ -206,6 +226,70 @@ def set_frontmatter_tags(content: str, tags: list[str]) -> str:
     if not tags:
         return content
     return f"---\ntags: {_format_tag_list(tags)}\n---\n\n{content}"
+
+
+_KEY_RE = re.compile(r"^([A-Za-z0-9_\-]+):[ \t]*(.*)$")
+
+
+def _emit_frontmatter_value(key: str, value: str | list[str]) -> str:
+    """One frontmatter line for ``key``. Lists become an inline ``[a, b]``; scalars are
+    quoted only when they contain YAML-significant characters or edge whitespace."""
+    if isinstance(value, list):
+        return f"{key}: {_format_tag_list([str(v) for v in value])}"
+    v = str(value)
+    if v == "" or v != v.strip() or any(c in v for c in ":#[]{}\"'") or v[:1] in "-?&*!|>%@`":
+        return f'{key}: "' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return f"{key}: {v}"
+
+
+def _drop_key_lines(lines: list[str], i: int) -> int:
+    """Advance past the value of the key at ``lines[i]`` — a scalar/inline line, plus any
+    following block ``- item`` lines. Returns the index after the value."""
+    km = _KEY_RE.match(lines[i])
+    i += 1
+    if km and km.group(2).strip() == "":
+        while i < len(lines) and re.match(r"^[ \t]*-[ \t]+", lines[i]):
+            i += 1
+    return i
+
+
+def _rewrite_frontmatter(content: str, key: str, new_line: str | None) -> str:
+    """Set (``new_line`` given) or remove (``new_line`` None) one frontmatter key,
+    preserving every other key and the body. Creates a block when setting into a
+    document that has none; drops an emptied block entirely."""
+    key_l = key.strip().lower()
+    m = FRONTMATTER_RE.match(content or "")
+    if not m:
+        return content if new_line is None else f"---\n{new_line}\n---\n\n{content or ''}"
+    rest = content[m.end():]
+    lines = m.group(1).split("\n")
+    kept: list[str] = []
+    placed = False
+    i = 0
+    while i < len(lines):
+        km = _KEY_RE.match(lines[i])
+        if km and km.group(1).strip().lower() == key_l:
+            i = _drop_key_lines(lines, i)
+            if new_line is not None and not placed:
+                kept.append(new_line)
+                placed = True
+            continue
+        kept.append(lines[i])
+        i += 1
+    if new_line is not None and not placed:
+        kept.append(new_line)
+    body = "\n".join(kept).strip("\n")
+    return f"---\n{body}\n---\n{rest}" if body else rest.lstrip("\n")
+
+
+def set_frontmatter_property(content: str, key: str, value: str | list[str]) -> str:
+    """Set/replace a single frontmatter ``key`` (other keys and the body untouched)."""
+    return _rewrite_frontmatter(content, key, _emit_frontmatter_value(key.strip(), value))
+
+
+def remove_frontmatter_property(content: str, key: str) -> str:
+    """Remove a single frontmatter ``key`` (no-op if absent)."""
+    return _rewrite_frontmatter(content, key, None)
 
 
 def _is_internal_md(url: str) -> bool:

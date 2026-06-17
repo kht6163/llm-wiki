@@ -46,6 +46,7 @@ async def test_tools_registered(ctx):
         "create_document", "update_document", "patch_document", "replace_section",
         "append_section", "append_to_document", "patch_tags", "move_document",
         "delete_document", "restore_revision", "rename_references", "edit_documents",
+        "set_document_property", "remove_document_property",
     }
     assert expected <= names, names
 
@@ -152,6 +153,25 @@ async def test_patch_regex_occurrence_tool(editor_mcp):
         {"path": "r.md", "find": r"^- \[ \]", "replace": "- [x]", "mode": "regex",
          "occurrence": 2, "return_content": "full"}))
     assert d["ok"] and d["content"] == "- [ ] a\n- [x] b\n"
+
+
+async def test_set_and_remove_property_tools(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "p.md", "content": "# P\n\nbody"}))
+    d = _payload(await editor_mcp.call_tool(
+        "set_document_property",
+        {"path": "p.md", "key": "aliases", "value": ["별명1", "별명2"], "return_content": "full"}))
+    assert d["ok"] and "aliases: [별명1, 별명2]" in d["content"]
+    # remove it again
+    r = _payload(await editor_mcp.call_tool("remove_document_property",
+                                            {"path": "p.md", "key": "aliases", "return_content": "full"}))
+    assert r["ok"] and "aliases" not in r["content"]
+
+
+async def test_set_property_rejects_reserved_key(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "p.md", "content": "# P\n\nbody"}))
+    d = _payload(await editor_mcp.call_tool(
+        "set_document_property", {"path": "p.md", "key": "title", "value": "x"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
 async def test_compare_revisions_tool(editor_mcp):

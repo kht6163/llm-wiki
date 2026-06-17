@@ -574,6 +574,40 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **docs.patch_tags(p, path, add=add, remove=remove)},
                            "patch_tags")
 
+    @mcp.tool(description="Set or replace a single frontmatter property without rewriting the body "
+                          "(editor/admin only) — e.g. status, aliases, due, author. 'value' is a "
+                          "string or a list of strings (a list is written as an inline YAML list); "
+                          "an empty value removes the property. 'title' and 'tags' are managed "
+                          "elsewhere (use update_document's title / patch_tags) and are rejected "
+                          "with 'validation'. base_version optional (defaults to current); runs "
+                          "through the same optimistic-locking update.")
+    async def set_document_property(
+        ctx: Context, path: str, key: str,
+        value: Annotated[str | list[str],
+                         Field(description="Scalar or list value; empty removes the key.")] = "",
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.set_property(
+            p, path, key, value, base_version=base_version), return_content)},
+            "set_document_property", shape=lambda d: _shape_conflict(d, return_content))
+
+    @mcp.tool(description="Remove a single frontmatter property from a document (editor/admin only); "
+                          "no-op if absent. 'title'/'tags' are managed elsewhere and rejected. "
+                          "base_version optional; runs through the same optimistic-locking update.")
+    async def remove_document_property(
+        ctx: Context, path: str, key: str,
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.remove_property(
+            p, path, key, base_version=base_version), return_content)},
+            "remove_document_property", shape=lambda d: _shape_conflict(d, return_content))
+
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
                           "re-resolving links (editor/admin only). Fails 'conflict' if the "
                           "destination exists. Set fix_references=true to ALSO rewrite the link "
