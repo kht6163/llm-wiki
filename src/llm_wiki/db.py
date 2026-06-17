@@ -199,6 +199,10 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA busy_timeout=10000")
+    # Cap WAL growth: auto-checkpoint every ~1000 pages on commit. The embedding
+    # worker also issues a periodic wal_checkpoint(TRUNCATE) to reset the -wal file
+    # that a long-lived reader connection could otherwise pin from growing back.
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
     return conn
 
 

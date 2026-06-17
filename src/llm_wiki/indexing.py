@@ -15,7 +15,12 @@ import time
 from . import graph
 from .embedding import Embedder
 from .markdown_utils import chunk_markdown, extract_links
-from .metrics import EMBED_CHUNKS, EMBED_DURATION
+from .metrics import (
+    EMBED_CHUNKS,
+    EMBED_DURATION,
+    EMBED_WORKER_LAST_SUCCESS,
+    EMBED_WORKER_RUNS,
+)
 
 log = logging.getLogger("llm_wiki.indexing")
 
@@ -61,6 +66,18 @@ def reindex_links(conn: sqlite3.Connection, doc_id: int, body: str, folder: str)
     graph.store_links(conn, doc_id, extract_links(body), folder)
 
 
+def _embed_text(row) -> str:
+    """The text actually sent to the embedder for a chunk: its heading breadcrumb
+    (``heading_path``, e.g. "Install > Linux") prepended to the body. The stored chunk
+    ``text`` — what read_chunk / assemble_context cite — is left unchanged; only the
+    embedding INPUT is enriched, so a short code/table chunk inherits its structural
+    context in vector space and matches better. Changing this alters vector meaning →
+    requires ``reindex --reembed`` (dimension is unchanged, so startup is not refused)."""
+    text = row["text"] or ""
+    hp = row["heading_path"]
+    return f"{hp}\n\n{text}" if hp else text
+
+
 def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
     """Compute + upsert vectors for one document's chunks, then clear vector_dirty.
     Runs outside the write transaction that produced the chunks.
@@ -72,11 +89,11 @@ def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
     otherwise the changed chunks stay dirty for a later embed."""
     with db.reader() as conn:
         rows = conn.execute(
-            "SELECT id, text FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
+            "SELECT id, text, heading_path FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
         ).fetchall()
     if rows:
         t0 = time.perf_counter()
-        embs = embedder.embed_passages([r["text"] for r in rows])
+        embs = embedder.embed_passages([_embed_text(r) for r in rows])
         EMBED_DURATION.observe(time.perf_counter() - t0)
         EMBED_CHUNKS.inc(len(rows))
     else:
@@ -121,13 +138,13 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
         dirty = [r[0] for r in conn.execute(
             "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0")]
         rows = conn.execute(
-            "SELECT c.id AS chunk_id, c.text AS text "
+            "SELECT c.id AS chunk_id, c.text AS text, c.heading_path AS heading_path "
             "FROM chunks c JOIN documents d ON d.id=c.doc_id "
             "WHERE d.vector_dirty=1 AND d.is_deleted=0 ORDER BY c.doc_id, c.ordinal"
         ).fetchall()
     if not dirty:
         return 0
-    texts = [r["text"] for r in rows]
+    texts = [_embed_text(r) for r in rows]
     log.info("embed_pending: embedding %d chunk(s) across %d document(s)", len(texts), len(dirty))
     vectors: list = []
     t0 = time.perf_counter()
@@ -198,13 +215,32 @@ class EmbeddingWorker:
             self._thread.join(timeout=timeout)
 
     def _run(self) -> None:
+        failures = 0
         while not self._stop.is_set():
-            # Wake on notify() or every idle_interval, whichever comes first.
-            self._wake.wait(self._idle_interval)
+            # Wake on notify() or sooner-of-idle_interval; back off (capped) after
+            # consecutive failures so a persistent error (OOM, disk full) doesn't
+            # busy-spin the logs/CPU.
+            wait = self._idle_interval * (2 ** min(failures, 5))
+            self._wake.wait(wait)
             self._wake.clear()
             if self._stop.is_set():
                 break
             try:
                 embed_pending(self._db, self._embedder)
+                EMBED_WORKER_RUNS.labels("ok").inc()
+                EMBED_WORKER_LAST_SUCCESS.set_to_current_time()
+                failures = 0
+                # Best-effort WAL truncation: a long-lived reader can otherwise keep the
+                # -wal file from being reset by autocheckpoint. The worker is the natural
+                # periodic hook; TRUNCATE no-ops harmlessly if other readers are active.
+                try:
+                    with self._db.reader() as conn:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except Exception:
+                    pass
             except Exception:
-                log.exception("embed worker: sweep failed; will retry")
+                failures += 1
+                EMBED_WORKER_RUNS.labels("error").inc()
+                (log.error if failures >= 3 else log.warning)(
+                    "embed worker: sweep failed (%d consecutive); backing off", failures)
+                log.debug("embed worker traceback", exc_info=True)

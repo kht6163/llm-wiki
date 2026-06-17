@@ -83,3 +83,30 @@ def test_assemble_context_folder_filter(ctx, principals):
 def test_assemble_context_rejects_empty_question(ctx):
     with pytest.raises(ValidationError):
         ctx.docs.assemble_context("   ")
+
+
+def test_assemble_context_expands_to_neighbour_chunks(ctx, principals):
+    # A generous budget should pull neighbouring chunks around the matched one, so a
+    # passage straddling a chunk boundary isn't cut in half (read_chunk-style expansion).
+    body = ("# Doc\n\n## Alpha\n\n" + "alpha " * 60 + "\n\n## Beta\n\n" + "beta " * 60
+            + "\n\n## Gamma\n\n" + "gamma " * 60)
+    ctx.docs.create(principals["editor"], "exp.md", body)
+    res = ctx.docs.assemble_context("beta", mode="bm25", max_chars=8000, max_sources=1)
+    assert res["count"] == 1
+    assert "beta" in res["context"]
+    assert ("alpha" in res["context"]) or ("gamma" in res["context"])  # neighbour pulled in
+
+
+def test_trim_to_budget_word_and_fence_boundaries():
+    from llm_wiki.search import _trim_to_budget
+    out, trunc = _trim_to_budget("alpha beta gamma delta", 12)
+    assert trunc and out == "alpha beta"               # word boundary, not mid-word
+    fenced, ftrunc = _trim_to_budget("```py\nprint(1)\n" + "x" * 50, 18)
+    assert ftrunc and fenced.count("```") % 2 == 0      # never a half-open code fence
+
+
+def test_embed_text_prepends_heading_path():
+    from llm_wiki.indexing import _embed_text
+    assert _embed_text({"text": "apt install", "heading_path": "Install > Linux"}) == \
+        "Install > Linux\n\napt install"
+    assert _embed_text({"text": "body", "heading_path": None}) == "body"

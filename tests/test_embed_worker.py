@@ -49,3 +49,27 @@ def test_default_context_embeds_inline(ctx, principals):
     # The default build_context has no worker -> inline embedding -> not dirty after write.
     ctx.docs.create(principals["editor"], "inline.md", "# I\n\n" + "gamma " * 40)
     assert _dirty(ctx.db, "inline.md") == 0
+
+
+def test_worker_records_health_metric(ctx, principals):
+    # A successful sweep bumps the ok counter — the signal that a backgrounded worker
+    # is alive and succeeding (silent stall = silently rotting RAG otherwise).
+    from llm_wiki.metrics import EMBED_WORKER_RUNS
+    before = EMBED_WORKER_RUNS.labels("ok")._value.get()
+    worker = indexing.EmbeddingWorker(ctx.db, ctx.embedder, idle_interval=0.05)
+    docs = DocumentService(ctx.db, ctx.embedder, ctx.settings.vault_path, embed_worker=worker)
+    worker.start()
+    try:
+        docs.create(principals["editor"], "metric.md", "# M\n\n" + "alpha " * 60)
+        deadline = time.time() + 15
+        while time.time() < deadline and EMBED_WORKER_RUNS.labels("ok")._value.get() <= before:
+            time.sleep(0.1)
+        assert EMBED_WORKER_RUNS.labels("ok")._value.get() > before
+    finally:
+        worker.stop()
+
+
+def test_db_sets_wal_autocheckpoint(ctx):
+    # WAL growth cap is configured on every connection.
+    with ctx.db.reader() as conn:
+        assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == 1000

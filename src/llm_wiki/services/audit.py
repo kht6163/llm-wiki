@@ -8,6 +8,7 @@ mcp_server), to avoid taking the writer lock on every read.
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime, timedelta
 
 from ..db import Database
 from ..util import clamp_int, now_iso
@@ -71,3 +72,20 @@ def recent(db: Database, *, limit: int = 100, since: str | None = None,
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def prune(db: Database, *, older_than_days: int, apply: bool) -> dict:
+    """Delete audit_log rows older than ``older_than_days`` (0 = keep all). Returns a
+    report; ``apply=False`` counts without deleting. Used by the ``prune`` CLI to bound
+    the append-only log's growth. ``idx_audit_ts`` covers the ts range scan."""
+    days = max(0, int(older_than_days))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with db.reader() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE ts < ?", (cutoff,)).fetchone()[0]
+    if apply and count:
+        with db.writer() as conn:
+            conn.execute("DELETE FROM audit_log WHERE ts < ?", (cutoff,))
+        log.info("audit prune: deleted %d row(s) older than %dd (before %s)", count, days, cutoff)
+    return {"cutoff": cutoff, "older_than_days": days,
+            "deletable_events": count, "applied": bool(apply)}

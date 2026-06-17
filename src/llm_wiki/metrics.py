@@ -56,6 +56,16 @@ EMBED_DURATION = Histogram(
 EMBED_CHUNKS = Counter(
     "llmwiki_embedded_chunks_total", "Chunks sent through the embedding encoder.",
 )
+# Background embedding worker health: with embedding off the request path, a silently
+# stalled worker = silently rotting RAG. These distinguish "alive and succeeding",
+# "alive and failing", and "last success was long ago" (worker dead / wedged).
+EMBED_WORKER_RUNS = Counter(
+    "llmwiki_embed_worker_runs_total", "Background embedding sweeps by outcome.", ["outcome"],
+)
+EMBED_WORKER_LAST_SUCCESS = Gauge(
+    "llmwiki_embed_worker_last_success_timestamp_seconds",
+    "Unix time of the last successful background embedding sweep.",
+)
 
 # Index/health gauges — point-in-time state, refreshed from the DB at scrape time
 # (and reused by /readyz). A growing vector_dirty backlog is a silent RAG-quality

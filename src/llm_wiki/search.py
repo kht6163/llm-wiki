@@ -304,6 +304,91 @@ def related_documents(conn, source_doc_id: int, *, k: int = 8,
     return out
 
 
+def _trim_to_budget(text: str, limit: int) -> tuple[str, bool]:
+    """Trim ``text`` to <= ``limit`` chars at a natural boundary (paragraph > line >
+    sentence > word) instead of mid-token, and never leave a half-open code fence.
+    Returns ``(trimmed, was_truncated)``."""
+    if len(text) <= limit:
+        return text, False
+    cut = text[:limit]
+    for sep in ("\n\n", "\n", ". ", "。", " "):
+        idx = cut.rfind(sep)
+        if idx >= limit // 2:  # don't discard more than half just to hit a boundary
+            cut = cut[:idx]
+            break
+    cut = cut.rstrip()
+    if cut.count("```") % 2 == 1:  # balance an unclosed fence so the snippet stays valid
+        cut += "\n```"
+    return cut, True
+
+
+def _best_token_chunk(rows, q_tokens: list[str]) -> int:
+    """Ordinal of the chunk containing the most query tokens (lead chunk as fallback) —
+    used when a doc matched on BM25 only, so its citation comes from where the query
+    actually appears rather than blindly from the first chunk."""
+    if not q_tokens:
+        return rows[0]["ordinal"]
+    best_ord, best_score = rows[0]["ordinal"], -1
+    for r in rows:
+        low = (r["text"] or "").lower()
+        score = sum(low.count(tok) for tok in q_tokens)
+        if score > best_score:
+            best_score, best_ord = score, r["ordinal"]
+    return best_ord
+
+
+def _passage_for_doc(conn, doc_id: int, vi: dict | None, q_tokens: list[str],
+                     budget: int, *, max_chunks: int = 5) -> tuple[str | None, str, bool] | None:
+    """Build a citation passage for one document: start at the most relevant chunk (the
+    vector-matched one, else the best token-overlap chunk) and expand to neighbours
+    (after, then before) in ordinal order while ``budget`` allows, so a passage that
+    straddles a chunk boundary isn't cut in half. The joined text is boundary-trimmed
+    to ``budget``. Returns ``(heading, text, truncated)`` or None if the doc has no
+    usable chunk text."""
+    rows = conn.execute(
+        "SELECT ordinal, heading, text FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
+    ).fetchall()
+    if not rows:
+        return None
+    by_ord = {r["ordinal"]: r for r in rows}
+    if vi is not None and vi["ordinal"] in by_ord:
+        center = vi["ordinal"]
+    else:
+        center = _best_token_chunk(rows, q_tokens)
+    heading = by_ord[center]["heading"]
+
+    picked = [center]
+    used = len((by_ord[center]["text"] or "").strip())
+    lo = hi = center
+    while len(picked) < max_chunks:
+        progressed = False
+        nxt = by_ord.get(hi + 1)
+        if nxt is not None:
+            t = (nxt["text"] or "").strip()
+            if used + len(t) + 2 <= budget:
+                hi += 1
+                picked.append(hi)
+                used += len(t) + 2
+                progressed = True
+        if len(picked) < max_chunks:
+            prv = by_ord.get(lo - 1)
+            if prv is not None:
+                t = (prv["text"] or "").strip()
+                if used + len(t) + 2 <= budget:
+                    lo -= 1
+                    picked.append(lo)
+                    used += len(t) + 2
+                    progressed = True
+        if not progressed:
+            break
+
+    raw = "\n\n".join((by_ord[o]["text"] or "").strip() for o in sorted(picked)).strip()
+    if not raw:
+        return None
+    text, trunc = _trim_to_budget(raw, budget)
+    return heading, text, trunc
+
+
 def assemble_context(
     db, embedder: Embedder, question: str, *,
     max_chars: int = 6000, max_sources: int = 8, mode: str = "hybrid",
@@ -312,16 +397,18 @@ def assemble_context(
 ) -> dict:
     """Retrieve and assemble citation-tagged context for a question — a one-call RAG
     primitive for LLM clients. Ranks documents with the same hybrid retriever as
-    search, then for each top document includes its passage most relevant to the
-    question (the vector-matched chunk, or the lead chunk as a fallback), in rank
-    order, until ``max_chars`` or ``max_sources`` is reached. Returns ``context``
-    (the assembled text with ``[n]`` markers), the ``sources`` those markers cite,
-    and ``truncated`` (more relevant content existed beyond the budget)."""
+    search, then for each top document includes its most relevant passage (the
+    vector-matched chunk, or the best token-overlap chunk for a BM25-only match),
+    expanded to neighbouring chunks while the budget allows and boundary-trimmed (never
+    mid-word or mid-code-fence), in rank order until ``max_chars`` or ``max_sources``.
+    Returns ``context`` (assembled text with ``[n]`` markers), the ``sources`` those
+    markers cite, and ``truncated`` (more relevant content existed beyond the budget)."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     max_chars = clamp_int(max_chars, 200, 24000)
     max_sources = clamp_int(max_sources, 1, 20)
     k = max(max_sources * params.candidate_factor, params.candidate_min)
+    q_tokens = [t.lower() for t in _TOKEN_RE.findall(question or "")]
 
     sources: list[dict] = []
     parts: list[str] = []
@@ -341,34 +428,24 @@ def assemble_context(
             if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn):
                 continue
 
-            vi = vec_info.get(did)
-            if vi is not None:
-                heading, text = vi["heading"], vi["text"]
-            else:  # BM25-only match: no per-chunk vector rank — fall back to the lead chunk
-                ch = conn.execute(
-                    "SELECT heading, text FROM chunks WHERE doc_id=? ORDER BY ordinal LIMIT 1",
-                    (did,),
-                ).fetchone()
-                heading, text = (ch["heading"], ch["text"]) if ch else (None, "")
-            text = (text or "").strip()
-            if not text:
-                continue
-
             remaining = max_chars - total
             if remaining <= 0:
                 truncated = True
                 break
-            piece = text if len(text) <= remaining else text[:remaining]
-            if len(piece) < len(text):
+            passage = _passage_for_doc(conn, did, vec_info.get(did), q_tokens, remaining)
+            if passage is None:
+                continue
+            heading, text, was_trunc = passage
+            if was_trunc:
                 truncated = True
             n = len(sources) + 1
             cite = f"[{n}] {d['path']}" + (f" › {heading}" if heading else "")
-            parts.append(f"{cite}\n{piece}")
-            total += len(piece)
+            parts.append(f"{cite}\n{text}")
+            total += len(text)
             sources.append({
                 "n": n, "path": d["path"], "title": d["title"] or d["path"],
                 "heading": heading, "version": d["version"],
-                "score": round(score, 6), "chars": len(piece),
+                "score": round(score, 6), "chars": len(text),
             })
 
     context = "\n\n".join(parts)

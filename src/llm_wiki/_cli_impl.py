@@ -87,6 +87,15 @@ def _build_parser() -> argparse.ArgumentParser:
     rs.add_argument("--in", dest="in_", required=True, help="Snapshot .tar to restore from.")
     rs.add_argument("--force", action="store_true",
                     help="Overwrite even if the target DB/vault is not empty.")
+
+    pr = sub.add_parser("prune", help="Delete old revisions / audit rows and reclaim space.")
+    pr.add_argument("--keep", type=int, default=20,
+                    help="Revisions to keep per document (most recent N; min 1). Default 20.")
+    pr.add_argument("--older-than-days", type=int, default=90,
+                    help="Delete audit_log rows older than this many days (0 = keep all). Default 90.")
+    pr.add_argument("--no-vacuum", action="store_true", help="Skip VACUUM after deleting.")
+    pr.add_argument("--force", action="store_true",
+                    help="Actually delete. Without it, prints a dry-run preview only.")
     return p
 
 
@@ -125,6 +134,8 @@ def _dispatch(args) -> int:
         return _snapshot(args)
     if args.cmd == "restore":
         return _restore(args)
+    if args.cmd == "prune":
+        return _prune(args)
     return 2
 
 
@@ -269,6 +280,29 @@ def _print_import_report(report: dict, src: Path, into: str, dry_run: bool,
     if not dry_run and report["broken_links"]:
         print(f"{len(report['broken_links'])} link(s) created by this import are still "
               f"unresolved.")
+
+
+def _prune(args) -> int:
+    from .services import audit
+
+    ctx = build_context(full=False)
+    apply = args.force
+    rev = ctx.docs.prune_revisions(keep=args.keep, apply=apply)
+    print(f"revisions: {rev['deletable_revisions']} prunable "
+          f"(keeping the latest {rev['keep']} per document)")
+    if args.older_than_days > 0:
+        aud = audit.prune(ctx.db, older_than_days=args.older_than_days, apply=apply)
+        print(f"audit_log: {aud['deletable_events']} row(s) older than "
+              f"{args.older_than_days}d (before {aud['cutoff']})")
+    if not apply:
+        print("\nDry run — nothing deleted. Re-run with --force to apply.")
+        return 0
+    if not args.no_vacuum:
+        print("Reclaiming space (VACUUM)…")
+        with ctx.db.reader() as conn:
+            conn.execute("VACUUM")
+    print("Prune complete.")
+    return 0
 
 
 def _backup(args) -> int:

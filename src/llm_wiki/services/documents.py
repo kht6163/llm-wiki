@@ -1268,6 +1268,31 @@ class DocumentService:
         ``recover_pending`` (file-state only) does not see."""
         return indexing.embed_pending(self.db, self.embedder)
 
+    def prune_revisions(self, *, keep: int, apply: bool) -> dict:
+        """Delete all but the most recent ``keep`` revisions per document. ``keep`` is
+        forced to >=1 so each document's latest snapshot — the source of its body — is
+        always retained. ``apply=False`` counts without deleting. Irreversible: pruned
+        revisions can no longer be viewed (history/diff) or restored. Used by the
+        ``prune`` CLI to bound the full-body revision log's growth."""
+        keep = max(1, int(keep))
+        count_sql = (
+            "SELECT COUNT(*) FROM (SELECT ROW_NUMBER() OVER "
+            "(PARTITION BY doc_id ORDER BY version DESC) AS rn FROM revisions) WHERE rn > ?"
+        )
+        with self.db.reader() as conn:
+            deletable = conn.execute(count_sql, (keep,)).fetchone()[0]
+        if apply and deletable:
+            with self.db.writer() as conn:
+                conn.execute(
+                    "DELETE FROM revisions WHERE id IN (SELECT id FROM (SELECT id, ROW_NUMBER() "
+                    "OVER (PARTITION BY doc_id ORDER BY version DESC) AS rn FROM revisions) "
+                    "WHERE rn > ?)",
+                    (keep,),
+                )
+            log.info("revision prune: deleted %d revision(s), keeping latest %d per document",
+                     deletable, keep)
+        return {"keep": keep, "deletable_revisions": deletable, "applied": bool(apply)}
+
     def reindex_all(self, reembed: bool = False) -> dict:
         """Reconcile the DB with the on-disk vault (handles external edits / new
         files). New files are created; changed files get an 'external-reconcile'
