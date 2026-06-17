@@ -15,6 +15,7 @@
   <input name="name" placeholder="키 이름 (예: my-agent)" required>
   <button class="primary">새 키 발급</button>
 </form>
+{% if keys %}
 <table class="revtable">
   <thead><tr><th scope="col">이름</th><th scope="col">prefix</th><th scope="col">생성</th><th scope="col">마지막 사용</th><th scope="col">상태</th><th scope="col"></th></tr></thead>
   <tbody>
@@ -29,16 +30,15 @@
         <form method="post" action="/settings/keys/{{ k.id }}/revoke" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">폐기</button></form>
       {% endif %}</td>
     </tr>
-  {% else %}
-    <tr><td colspan="6">
-      <div class="empty-state">
-        <span class="empty-icon">{{ icon("command") }}</span>
-        <p class="empty-title">발급된 API 키가 없습니다</p>
-        <p class="empty-text">API 키는 MCP 클라이언트가 <code>Authorization: Bearer</code> 헤더로 접속할 때 쓰입니다. 위에서 키를 발급하세요.</p>
-      </div>
-    </td></tr>
   {% endfor %}
   </tbody>
 </table>
+{% else %}
+<div class="empty-state">
+  <span class="empty-icon">{{ icon("command") }}</span>
+  <p class="empty-title">발급된 API 키가 없습니다</p>
+  <p class="empty-text">API 키는 MCP 클라이언트가 <code>Authorization: Bearer</code> 헤더로 접속할 때 쓰입니다. 위에서 키를 발급하세요.</p>
+</div>
+{% endif %}
 <p class="muted">MCP 엔드포인트(streamable-http): <code>http://{{ request.url.hostname }}:&lt;MCP_PORT&gt;/mcp</code></p>
 {% endblock %}

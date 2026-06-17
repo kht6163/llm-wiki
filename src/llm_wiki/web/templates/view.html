@@ -28,6 +28,16 @@
     {{ via_badge(doc.last_via) }}
     {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
   </div>
+  {% if properties %}
+  <dl class="doc-props" aria-label="문서 속성">
+    {% for key, values in properties %}
+    <div class="prop">
+      <dt class="prop-key">{{ key }}</dt>
+      <dd class="prop-val">{% for v in values %}<span class="prop-chip">{{ v }}</span>{% endfor %}</dd>
+    </div>
+    {% endfor %}
+  </dl>
+  {% endif %}
   <div class="rendered" id="doc-rendered">{{ html|safe }}</div>
 </article>
 <script src="{{ static('vendor/hljs.bundle.js') }}"></script>

@@ -23,6 +23,25 @@ def test_hybrid_search_finds_doc(ctx, principals):
     assert any(r.path == "python.md" for r in res_vec)
 
 
+def test_fts_body_excludes_frontmatter(ctx, principals):
+    # The BM25 snippet leg must not leak `tags: [...]` / `---` from frontmatter;
+    # only body prose is indexed (title is a separate column, tags a separate table).
+    docs = ctx.docs
+    p = principals["editor"]
+    docs.create(p, "fm.md", "---\ntitle: 제목\ntags: [alpha, beta]\n---\n\n본문 내용입니다\n")
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT f.body FROM documents_fts f JOIN documents d ON d.id = f.rowid "
+            "WHERE d.path_norm = ?",
+            ("fm.md",),
+        ).fetchone()
+    body = row[0]
+    assert "본문 내용입니다" in body
+    assert "tags:" not in body
+    assert "alpha" not in body
+    assert "---" not in body
+
+
 def test_search_folder_filter(ctx, principals):
     docs = ctx.docs
     p = principals["editor"]

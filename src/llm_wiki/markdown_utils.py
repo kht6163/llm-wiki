@@ -98,6 +98,33 @@ def parse_frontmatter(text: str) -> tuple[dict, int]:
     return _parse_simple_yaml(m.group(1)), m.end()
 
 
+# Frontmatter keys already surfaced elsewhere in the reading view (the title is the
+# page <h1>, tags are the #chips in the doc-meta bar), so the Properties panel omits
+# them to avoid duplicating machine data.
+_PROPS_OMIT = {"title", "tags"}
+
+
+def document_properties(content: str) -> list[tuple[str, list[str]]]:
+    """Ordered (key, values) frontmatter properties for the reading-view panel.
+
+    Excludes title/tags (shown elsewhere) and empty values. Every value is
+    normalized to a list of display strings so the template renders scalars and
+    inline lists uniformly (one chip each)."""
+    meta, _ = parse_frontmatter(content or "")
+    props: list[tuple[str, list[str]]] = []
+    for key, value in meta.items():
+        if key.lower() in _PROPS_OMIT:
+            continue
+        if isinstance(value, list):
+            vals = [str(v).strip() for v in value if str(v).strip()]
+        else:
+            text = str(value).strip()
+            vals = [text] if text else []
+        if vals:
+            props.append((key, vals))
+    return props
+
+
 def _mask(text: str) -> str:
     """Replace frontmatter, fenced code, and inline code with same-length spaces so
     link/tag regexes do not match inside them while character offsets stay aligned."""

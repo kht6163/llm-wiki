@@ -147,6 +147,23 @@ h1 { font-size: 1.6em; }
 .doc-meta { color: var(--fg-muted); font-size: 0.78em; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; margin: 6px 0 20px; padding-bottom: 14px;
   border-bottom: 1px solid var(--line); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Frontmatter Properties — structured metadata surfaced from YAML frontmatter
+   (title/tags omitted; already the h1 + doc-meta chips). All-monospace key→value
+   grid on the inset surface: the "mechanical info in mono" signature, dense and
+   scannable, no decoration. Values render as inset chips (lists = one chip each). */
+.doc-props {
+  margin: 0 0 20px; padding: 9px 13px; max-width: 74ch;
+  display: grid; grid-template-columns: minmax(6.5em, max-content) 1fr; gap: 5px 16px;
+  background: var(--inset); border: 1px solid var(--line); border-radius: var(--r-md);
+  font-family: var(--font-mono); font-size: 0.8em;
+}
+.doc-props .prop { display: contents; }
+.doc-props .prop-key { color: var(--fg-muted); padding-top: 1px; overflow-wrap: anywhere; }
+.doc-props .prop-val { margin: 0; display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+.doc-props .prop-chip {
+  background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 0 7px; color: var(--fg); font-variant-numeric: tabular-nums; overflow-wrap: anywhere;
+}
 /* Reading surface — prose capped near 74ch for legibility; dense data
    (tables, code) may exceed it. Heading rhythm tightened for a tool, with a
    hairline under section heads instead of size alone carrying hierarchy. */
@@ -156,10 +173,15 @@ h1 { font-size: 1.6em; }
 .rendered h1, .rendered h2, .rendered h3, .rendered h4 {
   line-height: 1.3; margin: 1.6em 0 0.5em; text-wrap: balance; scroll-margin-top: 12px;
 }
-.rendered h1 { font-size: 1.5em; }
+/* The page <h1> in .doc-head (1.6em) is THE document title; demote an in-body
+   `# heading` so it reads as a section head under it, not a second competing title.
+   Same hairline underline as h2 carries the level by structure, not size alone. */
+.rendered h1 { font-size: 1.3em; padding-bottom: 0.24em; border-bottom: 1px solid var(--line); }
 .rendered h2 { font-size: 1.24em; padding-bottom: 0.24em; border-bottom: 1px solid var(--line); }
 .rendered h3 { font-size: 1.08em; }
-.rendered h4 { font-size: 0.96em; color: var(--fg-muted); }
+/* h4 keeps full ink and carries its level by weight, not by dimming (a muted,
+   near-body-size heading loses its heading affordance). */
+.rendered h4 { font-size: 0.96em; font-weight: 600; }
 .rendered p { text-wrap: pretty; }
 .rendered a { text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 2px; }
 .rendered a:hover { text-decoration-color: var(--accent); }
@@ -283,6 +305,10 @@ select {
 .revtable select { padding: 4px 28px 4px 8px; background-position: right 8px center; }
 
 .login { max-width: 340px; margin: 8vh auto; }
+/* A quiet monospace wordmark anchors the otherwise context-free auth card in the
+   same machine-data voice as the status-bar brand — no accent, no decoration. */
+.login-brand { font-family: var(--font-mono); font-size: 0.84em; color: var(--fg-muted);
+  letter-spacing: 0.02em; margin-bottom: 2px; }
 .login form { display: flex; flex-direction: column; gap: 12px; }
 .login label { display: flex; flex-direction: column; gap: 4px; }
 .login input { padding: 8px 10px; }
@@ -342,6 +368,13 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   main { padding: 16px 14px 64px; }
   h1 { font-size: 1.35em; }
   .searchform { flex-wrap: wrap; }
+  /* The doc toolbar is a single flex row with no wrap/shrink control; squeezed by a
+     wrapping CJK title it collapses each item to one glyph per line. Stack it under
+     the title and let it scroll horizontally as a compact dense-tool toolbar. */
+  .doc-head { flex-direction: column; align-items: stretch; gap: 10px; }
+  .doc-actions { margin-left: 0; overflow-x: auto; scrollbar-width: none; }
+  .doc-actions::-webkit-scrollbar { display: none; }
+  .doc-actions > a, .doc-actions > .inline, .doc-actions button { white-space: nowrap; flex: 0 0 auto; }
 }
 
 /* Wide data tables (revisions, activity, broken links) restack as labelled cards on
@@ -535,7 +568,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .tree-row:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
 .tree-doc.active {
-  background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  background: var(--accent-soft); color: var(--accent-hover); font-weight: 600;
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .tree-label { overflow: hidden; text-overflow: ellipsis; }
@@ -610,7 +643,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   transition: border-color var(--t-fast) var(--ease), color var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease);
 }
 .rp-tab:hover { color: var(--fg); border-color: var(--line-strong); }
-.rp-tab.active { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.rp-tab.active { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
 .rp-body h3 { font-size: 0.85em; margin: 14px 0 6px; }
 .rp-list { list-style: none; padding: 0; margin: 0; font-size: 0.85em; }
 .rp-list li { padding: 2px 0; }
@@ -626,7 +659,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .outline-list a:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
 /* Scroll-spy current section — same selection vocabulary as the active file-tree row. */
 .outline-list a.active {
-  background: var(--accent-soft); color: var(--accent); font-weight: 600;
+  background: var(--accent-soft); color: var(--accent-hover); font-weight: 600;
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .ol-h1 { padding-left: 0; } .ol-h2 { padding-left: 10px; } .ol-h3 { padding-left: 20px; }
@@ -663,7 +696,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .cmd-item {
   display: flex; align-items: baseline; gap: 10px; padding: 8px 12px; border-radius: 8px; cursor: pointer;
 }
-.cmd-item.active { background: var(--accent-soft); color: var(--accent); }
+.cmd-item.active { background: var(--accent-soft); color: var(--accent-hover); }
 .cmd-label { font-size: 0.92em; }
 .cmd-sub { font-size: 0.78em; margin-left: auto; }
 .cmd-empty { padding: 12px; font-size: 0.9em; }
@@ -769,6 +802,10 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   .tt-icon { padding: 8px; }
   .rp-tab { min-height: 32px; }
   .sb-tab { min-height: 36px; }
+  /* The doc actions are mostly bare anchors (only 삭제 is a button); give them a
+     comfortable tap target matching the chrome controls above. */
+  .doc-actions > a, .doc-actions button { min-height: 36px; display: inline-flex; align-items: center; }
+  .doc-actions > a { padding: 0 6px; }
 }
 
 /* ======================================================================
@@ -786,6 +823,6 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   border-radius: 6px; cursor: pointer; white-space: nowrap;
 }
 .wiki-ac-item:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); }
-.wiki-ac-item.active { background: var(--accent-soft); color: var(--accent); }
+.wiki-ac-item.active { background: var(--accent-soft); color: var(--accent-hover); }
 .wiki-ac-title { font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; }
 .wiki-ac-path { font-size: 0.76em; margin-left: auto; }

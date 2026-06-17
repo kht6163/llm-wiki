@@ -38,6 +38,7 @@ from markupsafe import Markup
 from starlette.middleware.sessions import SessionMiddleware
 
 from ..markdown_render import render_markdown
+from ..markdown_utils import document_properties
 from ..metrics import BUILD_INFO, PrometheusMiddleware, collect_index_gauges, render_latest
 from ..runtime import AppContext
 from ..services import audit
@@ -637,8 +638,9 @@ def create_web_app(app: AppContext) -> FastAPI:
         backlinks = docs.backlinks(doc["path"])["backlinks"]
         outgoing = docs.links(doc["path"])["links"]
         stats = word_count(doc["content"])
+        properties = document_properties(doc["content"])
         return render("view.html", request, doc=doc, html=html, backlinks=backlinks,
-                      outgoing=outgoing, stats=stats)
+                      outgoing=outgoing, stats=stats, properties=properties)
 
     @web.get("/api/doc/{path:path}/related")
     def api_related(path: str, request: Request, _p: Principal = Depends(require_user)):

@@ -10,7 +10,7 @@ from urllib.parse import quote
 import bleach
 from markdown_it import MarkdownIt
 
-from .markdown_utils import WIKILINK_RE
+from .markdown_utils import WIKILINK_RE, parse_frontmatter
 
 _md = (
     MarkdownIt("commonmark", {"html": False, "linkify": True, "typographer": False})
@@ -114,7 +114,12 @@ def _convert_wikilinks(text: str, src_path: str) -> str:
 
 
 def render_markdown(text: str, src_path: str = "") -> str:
-    html = _md.render(_convert_wikilinks(text or "", src_path))
+    # YAML frontmatter is metadata, not prose. Left in, CommonMark turns the
+    # opening `---` into an <hr> and the `key: value` lines + closing `---` into a
+    # setext <h2>, so the block renders as a broken heading atop every document.
+    # Strip it before the parser; the values are surfaced separately as Properties.
+    body = (text or "")[parse_frontmatter(text or "")[1]:]
+    html = _md.render(_convert_wikilinks(body, src_path))
     # Obsidian-flavored post-processing before sanitization: callout blocks,
     # task-list checkboxes, and ==highlight==.
     html = _callouts(html)

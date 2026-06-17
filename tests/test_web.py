@@ -71,6 +71,34 @@ def test_search_no_results_shows_empty_state(client):
     assert "검색 결과가 없습니다" in body
 
 
+def test_view_renders_frontmatter_as_properties_panel(client):
+    # Frontmatter must not leak as a setext heading; extra keys (not title/tags)
+    # surface as the monospace Properties panel instead.
+    login(client, "alice")
+    create_doc(client, "props.md",
+               "---\ntitle: 속성 문서\ntags: [x]\nstatus: draft\naliases: [별명]\n---\n\n# 본문\n\n내용\n")
+    body = client.get("/doc/props.md").text
+    assert "status: draft" not in body          # raw frontmatter line is gone
+    assert 'class="doc-props"' in body           # surfaced as a panel
+    assert "draft" in body and "별명" in body     # the non-title/tags values show
+
+
+def test_settings_empty_state_has_no_table_chrome(client):
+    # With no keys, the calm standalone empty-state shows — not a column-header row
+    # boxed in a bordered table cell.
+    login(client, "alice")
+    body = client.get("/settings").text
+    assert "발급된 API 키가 없습니다" in body
+    assert "empty-state" in body
+    assert "revtable" not in body
+
+
+def test_login_screen_shows_wordmark(client):
+    body = client.get("/login").text
+    assert 'class="login-brand"' in body
+    assert "llm-wiki" in body
+
+
 def test_login_success_and_logout(client):
     r = login(client, "admin")
     assert r.status_code == 200 and "llm-wiki" in r.text

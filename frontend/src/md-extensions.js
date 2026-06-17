@@ -96,8 +96,90 @@ function mark(md) {
   });
 }
 
+// Minimal frontmatter YAML parser mirroring markdown_utils._parse_simple_yaml:
+// scalar `key: value`, inline `[a, b]` lists, block `- item` lists; keys lowercased.
+function parseSimpleYaml(raw) {
+  const meta = {};
+  const lines = raw.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim() || line.trimStart().startsWith("#")) { i++; continue; }
+    const m = /^([A-Za-z0-9_-]+):[ \t]*(.*)$/.exec(line);
+    if (!m) { i++; continue; }
+    const key = m[1].trim().toLowerCase();
+    const val = m[2].trim();
+    if (val === "") {
+      const items = [];
+      let j = i + 1;
+      while (j < lines.length && /^[ \t]*-[ \t]+/.test(lines[j])) {
+        items.push(lines[j].replace(/^[ \t]*-[ \t]+/, "").trim().replace(/^['"]|['"]$/g, ""));
+        j++;
+      }
+      if (items.length) { meta[key] = items; i = j; continue; }
+      meta[key] = ""; i++; continue;
+    }
+    if (val.startsWith("[") && val.endsWith("]")) {
+      meta[key] = val.slice(1, -1).split(",").map((x) => x.trim().replace(/^['"]|['"]$/g, "")).filter(Boolean);
+    } else {
+      meta[key] = val.replace(/^['"]|['"]$/g, "");
+    }
+    i++;
+  }
+  return meta;
+}
+
+// Keys omitted from the Properties panel (title = the h1, tags = the doc-meta chips),
+// matching markdown_utils.document_properties on the server.
+const PROPS_OMIT = new Set(["title", "tags"]);
+
+// Render parsed frontmatter as the SAME .doc-props panel the server emits, so the
+// live preview matches the reading view. Returns "" when there's nothing to show.
+function renderProps(md, meta) {
+  const rows = [];
+  for (const key of Object.keys(meta)) {
+    if (PROPS_OMIT.has(key)) continue;
+    const vals = (Array.isArray(meta[key]) ? meta[key] : [meta[key]]).map((v) => String(v).trim()).filter(Boolean);
+    if (!vals.length) continue;
+    const chips = vals.map((v) => '<span class="prop-chip">' + md.utils.escapeHtml(v) + "</span>").join("");
+    rows.push('<div class="prop"><dt class="prop-key">' + md.utils.escapeHtml(key) +
+      '</dt><dd class="prop-val">' + chips + "</dd></div>");
+  }
+  return rows.length ? '<dl class="doc-props" aria-label="문서 속성">' + rows.join("") + "</dl>" : "";
+}
+
+// Consume a leading `---\n…\n---` YAML block at line 0 and re-surface it as the
+// Properties panel — mirrors render_markdown()'s strip so the preview never shows
+// the raw frontmatter as a setext heading.
+function frontmatter(md) {
+  md.block.ruler.before("hr", "frontmatter", function (state, startLine, endLine, silent) {
+    if (startLine !== 0 || state.sCount[startLine] !== 0) return false;
+    const begin = state.bMarks[startLine] + state.tShift[startLine];
+    if (state.src.slice(begin, state.eMarks[startLine]).trim() !== "---") return false;
+    let nextLine = startLine + 1;
+    let found = false;
+    for (; nextLine < endLine; nextLine++) {
+      const p = state.bMarks[nextLine] + state.tShift[nextLine];
+      if (state.sCount[nextLine] === 0 && state.src.slice(p, state.eMarks[nextLine]).trim() === "---") { found = true; break; }
+    }
+    if (!found) return false;
+    if (silent) return true;
+    const yaml = state.getLines(startLine + 1, nextLine, 0, false);
+    state.line = nextLine + 1;
+    const tok = state.push("frontmatter", "", 0);
+    tok.map = [startLine, state.line];
+    tok.meta = yaml;
+    tok.block = true;
+    return true;
+  });
+  md.renderer.rules.frontmatter = function (tokens, idx) {
+    return renderProps(md, parseSimpleYaml(tokens[idx].meta));
+  };
+}
+
 export function installWikiExtensions(md, opts) {
   opts = opts || {};
+  frontmatter(md);
   wikilink(md, opts.goBase || "/go?target=");
   callouts(md);
   mark(md);

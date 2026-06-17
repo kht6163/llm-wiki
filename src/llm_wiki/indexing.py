@@ -14,7 +14,7 @@ import time
 
 from . import graph
 from .embedding import Embedder
-from .markdown_utils import chunk_markdown, extract_links
+from .markdown_utils import chunk_markdown, extract_links, parse_frontmatter
 from .metrics import (
     EMBED_CHUNKS,
     EMBED_DURATION,
@@ -26,10 +26,16 @@ log = logging.getLogger("llm_wiki.indexing")
 
 
 def reindex_fts(conn: sqlite3.Connection, doc_id: int, title: str, body: str) -> None:
+    # Index body prose only: YAML frontmatter is metadata (title is its own column,
+    # tags live in the tags table), so leaving it in just leaks `tags: [...]` / `---`
+    # into BM25 snippets. chunk_markdown already strips it, so this aligns the FTS
+    # leg with the vector leg. Existing rows pick this up on the next `reindex`.
+    text = body or ""
+    body = text[parse_frontmatter(text)[1]:]
     conn.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
     conn.execute(
         "INSERT INTO documents_fts(rowid, title, body) VALUES(?,?,?)",
-        (doc_id, title or "", body or ""),
+        (doc_id, title or "", body),
     )
 
 
