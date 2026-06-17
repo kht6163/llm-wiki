@@ -62,15 +62,43 @@ async function reloadGraph() {
     container: document.getElementById('cy'),
     elements: els,
     style: graphStyle(),
-    layout: { name: 'cose', animate: false },
-    // Cytoscape label font-size is in model units, so it scales with zoom. A sparse
-    // graph (a few nodes) otherwise auto-fits to a huge zoom and the labels balloon
-    // off the canvas. Cap the fit zoom to keep nodes + labels at a legible size;
-    // dense graphs fit below 1 and are unaffected.
-    minZoom: 0.2,
-    maxZoom: 1.8
+    minZoom: 0.1,
+    maxZoom: 8
   });
   cy.on('tap', 'node', evt => { if (evt.target.data('exists')) location.href = '/doc/' + encodeURIComponent(evt.target.data('id')); });
+  // Spread the nodes (so a sparse graph isn't a tight clump near the centre), then
+  // fit + size on layout stop. fit:false because fitAndSize() does the fit itself.
+  const layout = cy.layout({ name: 'cose', animate: false, fit: false,
+    idealEdgeLength: 120, nodeRepulsion: 16000, nodeOverlap: 16,
+    componentSpacing: 140, padding: 30 });
+  layout.one('layoutstop', fitAndSize);
+  layout.run();
+}
+
+// Cytoscape node + label sizes are in model units, so they scale with the fit zoom:
+// a sparse graph fits to a high zoom and its labels balloon off-canvas, a dense one
+// shrinks to dots. So after the layout, fit the view to fill the canvas, then set each
+// node's size in model units = a target on-screen pixel size ÷ the current zoom. The
+// target grows as the graph gets sparser (so a few big nodes fill the empty canvas) and
+// shrinks when it's dense; either way the rendered node + label stays a constant,
+// legible size regardless of the fit zoom.
+function fitAndSize() {
+  if (!cy || cy.nodes().empty()) return;
+  // The #cy container is sized by the app-shell grid and can settle after cy init, so
+  // re-measure first or fit() centres on stale dimensions (graph drifts off-centre).
+  cy.resize();
+  const n = cy.nodes().length;
+  const nodePx = Math.max(18, Math.min(64, 150 / Math.sqrt(n)));
+  const rootPx = nodePx * 1.5;
+  const fontPx = Math.max(12, Math.min(22, Math.round(nodePx * 0.42)));
+  cy.fit(cy.elements(), Math.round(rootPx * 0.5 + fontPx + 12));
+  const z = cy.zoom() || 1;
+  cy.batch(function () {
+    cy.nodes().forEach(function (node) {
+      const d = (node.data('root') ? rootPx : nodePx) / z;
+      node.style({ 'width': d, 'height': d, 'font-size': (fontPx / z) + 'px' });
+    });
+  });
 }
 
 // Recolour (not rebuild) on theme change — data-theme toggle or OS scheme — so
