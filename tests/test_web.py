@@ -646,3 +646,16 @@ def test_login_throttle_block_is_audited_once(ctx, principals):
     assert len(blocks) == 1
     assert blocks[0]["via"] == "web" and blocks[0]["outcome"] == "blocked"
     assert "7.7.7.7" in (blocks[0]["detail"] or "")
+
+
+def test_realtime_banner_escapes_untrusted_values(client):
+    # realtime.js builds change banners with innerHTML; the two attacker-influenced
+    # values it interpolates — the move-target path (paths allow '<'/'>') and the
+    # change author username (unrestricted) — must be HTML-escaped, or a crafted path
+    # / username becomes stored DOM XSS in every viewer's browser.
+    r = client.get("/static/realtime.js")
+    assert r.status_code == 200
+    js = r.text
+    assert "function esc(" in js          # escape helper present
+    assert "esc(to)" in js                # move banner escapes the document path
+    assert "esc(whoVia(ev))" in js        # edit banner escapes the username

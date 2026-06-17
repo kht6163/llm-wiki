@@ -33,9 +33,28 @@ class Embedder:
         if self._model is None:
             with self._lock:
                 if self._model is None:
-                    from sentence_transformers import SentenceTransformer
+                    try:
+                        from sentence_transformers import SentenceTransformer
 
-                    self._model = SentenceTransformer(self.model_name)
+                        self._model = SentenceTransformer(self.model_name)
+                    except Exception as e:
+                        # A bad EMBEDDING_MODEL, no network/HF access, or a broken
+                        # install would otherwise surface as a raw multi-line
+                        # traceback on `serve`/`init-db`/`reindex`/`import`. Convert
+                        # it to a ConfigError the CLI prints as one clear line with
+                        # remediation steps.
+                        from .config import ConfigError
+
+                        raise ConfigError(
+                            f"could not load embedding model {self.model_name!r}: "
+                            f"{type(e).__name__}: {e}\n"
+                            "  - check EMBEDDING_MODEL for typos\n"
+                            "  - ensure network / HuggingFace access (or a populated local "
+                            "model cache)\n"
+                            "  - if dependencies are missing, run 'uv sync'\n"
+                            "  - if you changed the model on purpose, run "
+                            "'llm-wiki reindex --reembed' to rebuild vectors at the new dimension"
+                        ) from e
         return self._model
 
     @property

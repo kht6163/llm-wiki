@@ -14,6 +14,15 @@
     return p.split("/").map(encodeURIComponent).join("/");
   }
 
+  // Escape text before it goes into banner innerHTML. Document paths and usernames
+  // are attacker-influenced (paths allow '<'/'>'; usernames are unrestricted), and
+  // both are interpolated below — without this they would execute as markup.
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
   // Human-readable label for the surface that authored a change.
   function viaLabel(via) {
     return via === "mcp" ? "에이전트" : via === "cli" ? "CLI" : via === "web" ? "사람" : "";
@@ -90,15 +99,15 @@
     }
     if (ev.op === "move") {
       var to = ev.to || "";
-      banner('이 문서가 <a href="/doc/' + encPath(to) + '">' + to +
+      banner('이 문서가 <a href="/doc/' + encPath(to) + '">' + esc(to) +
              "</a> (으)로 이동되었습니다.", "warn");
       return;
     }
     // create / update
     if (ev.version && ev.version <= version) return; // stale or our own echo
     if (mode === "edit") {
-      var who = whoVia(ev) ? " · " + whoVia(ev) : "";
-      banner("⚠ 다른 곳에서 이 문서가 변경되었습니다 (v" + ev.version + who +
+      var who = whoVia(ev) ? " · " + esc(whoVia(ev)) : "";
+      banner("⚠ 다른 곳에서 이 문서가 변경되었습니다 (v" + esc(ev.version) + who +
              "). 지금 저장하면 충돌로 거부될 수 있습니다. 변경분을 합치려면 다시 여세요.", "warn");
     } else {
       refreshRendered(ev);

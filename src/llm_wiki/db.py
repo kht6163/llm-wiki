@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -162,6 +162,24 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
+
+-- Idempotency ledger for retry-safe writes (e.g. append_to_document). A client that
+-- retries a request after a lost response replays its key; the prior result is
+-- returned instead of applying the write a second time. Uniqueness is per
+-- (scope, user, key); the row is written inside the same transaction as the write
+-- it guards, so a UNIQUE collision rolls the duplicate write back.
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  id             INTEGER PRIMARY KEY,
+  scope          TEXT NOT NULL,        -- operation family, e.g. 'append'
+  user_id        INTEGER NOT NULL,     -- the requesting principal
+  idem_key       TEXT NOT NULL,        -- client-supplied unique operation id
+  doc_id         INTEGER,              -- document the write landed on
+  result_version INTEGER,              -- version produced by the original write
+  result_path    TEXT,                 -- path produced by the original write
+  created_at     TEXT NOT NULL,
+  UNIQUE(scope, user_id, idem_key)
+);
+CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
 """
 
 # Numbered forward migrations for EXISTING databases, applied in ascending order.

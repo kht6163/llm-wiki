@@ -13,9 +13,11 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -84,6 +86,11 @@ IMPORT_ATTACH_EXTS = ALLOWED_ATTACH_EXTS
 _EMBED_RE = re.compile(r"!\[\[([^\[\]\n]+?)\]\]")
 # Standard markdown image `![alt](url "title")`.
 _IMG_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s]+)(?:[ \t]+\"[^\"]*\")?\)")
+
+# How long an idempotency key stays replayable. Retries happen within seconds, so a
+# week is generous; older rows are swept opportunistically on each keyed write to
+# bound the ledger's growth.
+_IDEM_RETENTION_DAYS = 7
 
 
 def _attachment_subname(name: str, ext: str, data: bytes) -> str:
@@ -294,6 +301,21 @@ class DocumentService:
             dest = self.vault / ".trash" / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(src, dest)
+
+    # ---- idempotency ----------------------------------------------------
+    def _idem_lookup(self, scope: str, user_id: int, key: str) -> dict | None:
+        """Return the cached result of a previously-applied write with this
+        (scope, user, key), or None if the key is new. Lets a client safely retry
+        a write whose response was lost without applying it twice."""
+        with self.db.reader() as conn:
+            row = conn.execute(
+                "SELECT result_path, result_version FROM idempotency_keys "
+                "WHERE scope=? AND user_id=? AND idem_key=?",
+                (scope, user_id, key)).fetchone()
+        if row is None:
+            return None
+        return {"ok": True, "path": row["result_path"],
+                "version": row["result_version"], "deduplicated": True}
 
     # ---- reads ----------------------------------------------------------
     def get(self, path: str) -> dict:
@@ -848,7 +870,8 @@ class DocumentService:
 
     def update(self, principal: Principal, path: str, base_version: int | None, content: str,
                title: str | None = None, tags: list[str] | None = None,
-               *, embed: bool = True) -> dict:
+               *, embed: bool = True,
+               idempotency: tuple[str, int, str] | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
                 f"Role '{principal.role}' cannot modify documents (read/search only).")
@@ -895,6 +918,19 @@ class DocumentService:
             indexing.reindex_links(conn, doc_id, content, folder)
             audit.record(conn, actor=principal.username, via=principal.via,
                          action="doc_update", target=rel, detail=f"v{new_version}")
+            if idempotency is not None:
+                # Stamp the key in the SAME transaction as the write it guards. If a
+                # concurrent request already committed this key, the UNIQUE constraint
+                # raises here and the whole write rolls back — so the duplicate never
+                # lands (the caller then replays the original result).
+                scope, uid, key = idempotency
+                conn.execute(
+                    "INSERT INTO idempotency_keys(scope, user_id, idem_key, doc_id, "
+                    "result_version, result_path, created_at) VALUES(?,?,?,?,?,?,?)",
+                    (scope, uid, key, doc_id, new_version, rel, now))
+                cutoff = (datetime.now(UTC) - timedelta(days=_IDEM_RETENTION_DAYS)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
 
         mtime = self._write_file(rel, content)
         with self.db.writer() as conn:
@@ -955,18 +991,28 @@ class DocumentService:
 
     def append_to_document(self, principal: Principal, path: str, text: str,
                            ensure_heading: str | None = None,
-                           base_version: int | None = None) -> dict:
+                           base_version: int | None = None,
+                           idempotency_key: str | None = None) -> dict:
         """Append a text block to the document — the natural agent-journaling
         primitive (decision logs, daily notes). With ``ensure_heading`` the block
         goes at the end of that heading's section, creating the heading (h2) at the
         document end if it doesn't exist yet; without it, the block lands at the very
         end. Like the section editors, ``base_version`` defaults to the server-read
         version so a plain append doesn't need a round-trip and won't spuriously
-        conflict."""
+        conflict.
+
+        ``idempotency_key`` makes the append retry-safe: a key the server has already
+        applied replays the prior result instead of appending again, so a client that
+        retries after a lost response won't duplicate the block. Use a fresh key per
+        logical append."""
         if not principal.can_write:
             raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
         if not text or not text.strip():
             raise ValidationError("'text' is required.")
+        if idempotency_key:
+            cached = self._idem_lookup("append", principal.user_id, idempotency_key)
+            if cached is not None:
+                return cached
         doc = self.get(path)
         body = doc["content"]
         if ensure_heading and ensure_heading.strip():
@@ -987,7 +1033,16 @@ class DocumentService:
             prefix = (base + "\n\n") if base else ""
             new_body = prefix + _as_block(text)
         bv = doc["version"] if base_version is None else int(base_version)
-        return self.update(principal, doc["path"], bv, new_body)
+        idem = ("append", principal.user_id, idempotency_key) if idempotency_key else None
+        try:
+            return self.update(principal, doc["path"], bv, new_body, idempotency=idem)
+        except sqlite3.IntegrityError:
+            # A concurrent request with the same key committed between our pre-check and
+            # our commit; our write rolled back. Replay the original result.
+            cached = self._idem_lookup("append", principal.user_id, idempotency_key) if idempotency_key else None
+            if cached is not None:
+                return cached
+            raise
 
     def patch(self, principal: Principal, path: str, find: str, replace: str,
               base_version: int | None = None, count: int = 1,
@@ -1271,8 +1326,13 @@ class DocumentService:
                 raise self._conflict(conn, doc_id, rel)
             body = self._latest_body(conn, doc_id)
             new_version = row["version"] + 1
+            # file_state='pending' guards the post-commit _trash_file the same way
+            # create()/update() guard their file write: a crash between this commit
+            # and the trash leaves the row pending, and recover_pending() finishes
+            # the trash on the next start (it would otherwise be an on-disk orphan
+            # the DB has already marked deleted).
             conn.execute(
-                "UPDATE documents SET is_deleted=1, version=version+1, file_state='clean', "
+                "UPDATE documents SET is_deleted=1, version=version+1, file_state='pending', "
                 "vector_dirty=0, updated_at=?, updated_by=? WHERE id=?",
                 (now, principal.user_id, doc_id),
             )
@@ -1288,6 +1348,8 @@ class DocumentService:
             audit.record(conn, actor=principal.username, via=principal.via,
                          action="doc_delete", target=rel, detail=f"v{new_version}")
         self._trash_file(rel)
+        with self.db.writer() as conn:
+            conn.execute("UPDATE documents SET file_state='clean' WHERE id=?", (doc_id,))
         DOC_WRITES.labels("delete").inc()
         self._emit("delete", rel, new_version,
                    updated_by=principal.username, via=principal.via)
@@ -1324,19 +1386,31 @@ class DocumentService:
 
     # ---- maintenance ----------------------------------------------------
     def recover_pending(self) -> int:
-        """Re-project any documents left in file_state='pending' by a crash."""
+        """Finish any file projection a crash left half-done (file_state='pending').
+        Live docs are re-written from their latest revision; deleted docs whose
+        ``_trash_file`` never ran have their leftover file trashed now. Both then
+        clear to 'clean'. Idempotent."""
         with self.db.reader() as conn:
-            rows = conn.execute(
+            live = conn.execute(
                 "SELECT id, path FROM documents WHERE file_state='pending' AND is_deleted=0"
             ).fetchall()
-            bodies = {r["id"]: (r["path"], self._latest_body(conn, r["id"])) for r in rows}
+            gone = conn.execute(
+                "SELECT id, path FROM documents WHERE file_state='pending' AND is_deleted=1"
+            ).fetchall()
+            bodies = {r["id"]: (r["path"], self._latest_body(conn, r["id"])) for r in live}
+            trash = [(r["id"], r["path"]) for r in gone]
         for doc_id, (rel, body) in bodies.items():
             mtime = self._write_file(rel, body)
             with self.db.writer() as conn:
                 conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
-        if bodies:
-            log.info("recover_pending: re-projected %d file(s) from the latest revision", len(bodies))
-        return len(bodies)
+        for doc_id, rel in trash:
+            self._trash_file(rel)
+            with self.db.writer() as conn:
+                conn.execute("UPDATE documents SET file_state='clean' WHERE id=?", (doc_id,))
+        if bodies or trash:
+            log.info("recover_pending: re-projected %d file(s), trashed %d leftover delete(s)",
+                     len(bodies), len(trash))
+        return len(bodies) + len(trash)
 
     def embed_pending(self) -> int:
         """Embed any documents still flagged ``vector_dirty`` (no-op when none are).

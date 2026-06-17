@@ -476,19 +476,24 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "block goes at the end of that heading's section, creating the heading "
                           "if missing; without it, at the very end. No base_version needed: it "
                           "reads the current version server-side, so a plain append is one call "
-                          "and won't spuriously conflict.")
+                          "and won't spuriously conflict. Pass a fresh 'idempotency_key' to make a "
+                          "retry safe — replaying a key returns the prior result instead of "
+                          "appending the block twice (returns 'deduplicated': true).")
     async def append_to_document(
         ctx: Context, path: str, text: str,
         ensure_heading: Annotated[str | None,
                                   Field(description="Append under this heading (created if absent).")] = None,
         base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        idempotency_key: Annotated[str | None,
+                                   Field(description="Unique id for this append; replaying it returns "
+                                         "the original result without appending again (retry-safe).")] = None,
         return_content: Annotated[Literal["full", "metadata"],
                                   Field(description="'full' echoes the body (and current_content on a "
                                         "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_to_document(
-            p, path, text, ensure_heading=ensure_heading, base_version=base_version),
-            return_content)}, "append_to_document",
+            p, path, text, ensure_heading=ensure_heading, base_version=base_version,
+            idempotency_key=idempotency_key), return_content)}, "append_to_document",
             shape=lambda d: _shape_conflict(d, return_content))
 
     @mcp.tool(description="Restore a past revision's content as a new edit (editor/admin only) — a "

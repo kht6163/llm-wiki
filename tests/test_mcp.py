@@ -129,6 +129,20 @@ async def test_append_to_document_tool(editor_mcp):
     assert d["ok"] and d["content"].rstrip().endswith("b")
 
 
+async def test_append_to_document_idempotency_key_dedups(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "log.md", "content": "# Log\n"}))
+    first = _payload(await editor_mcp.call_tool(
+        "append_to_document", {"path": "log.md", "text": "entry", "idempotency_key": "k1"}))
+    assert first["ok"] and not first.get("deduplicated")
+    # A retry with the same key returns the prior result without appending again.
+    again = _payload(await editor_mcp.call_tool(
+        "append_to_document", {"path": "log.md", "text": "entry", "idempotency_key": "k1"}))
+    assert again["ok"] and again["deduplicated"] is True
+    assert again["version"] == first["version"]
+    body = _payload(await editor_mcp.call_tool("read_document", {"path": "log.md"}))["content"]
+    assert body.count("entry") == 1
+
+
 async def test_patch_regex_occurrence_tool(editor_mcp):
     _payload(await editor_mcp.call_tool(
         "create_document", {"path": "r.md", "content": "- [ ] a\n- [ ] b\n"}))

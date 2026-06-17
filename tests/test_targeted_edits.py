@@ -49,6 +49,46 @@ def test_append_rejects_empty_and_viewer(docs, principals):
         docs.append_to_document(principals["viewer"], "e.md", "nope")
 
 
+# ---- append idempotency (retry-safe) ------------------------------------
+def test_append_without_key_appends_each_time(docs, principals):
+    p = principals["editor"]
+    docs.create(p, "log.md", "# Log\n")
+    docs.append_to_document(p, "log.md", "entry")
+    docs.append_to_document(p, "log.md", "entry")
+    assert docs.get("log.md")["content"].count("entry") == 2  # no key => not deduped
+
+
+def test_append_with_idempotency_key_dedups_retry(docs, principals):
+    p = principals["editor"]
+    docs.create(p, "log.md", "# Log\n")
+    first = docs.append_to_document(p, "log.md", "entry", idempotency_key="k1")
+    v1 = first["version"]
+    # A retry with the SAME key returns the prior result and does not append again.
+    again = docs.append_to_document(p, "log.md", "entry", idempotency_key="k1")
+    assert again["deduplicated"] is True
+    assert again["version"] == v1
+    assert docs.get("log.md")["content"].count("entry") == 1
+    assert docs.get("log.md")["version"] == v1
+
+
+def test_append_distinct_keys_both_apply(docs, principals):
+    p = principals["editor"]
+    docs.create(p, "log.md", "# Log\n")
+    docs.append_to_document(p, "log.md", "entry", idempotency_key="k1")
+    docs.append_to_document(p, "log.md", "entry", idempotency_key="k2")
+    assert docs.get("log.md")["content"].count("entry") == 2  # different keys => both land
+
+
+def test_append_key_is_scoped_per_user(docs, principals):
+    # The same key string used by two users must not collide.
+    a, b = principals["editor"], principals["admin"]
+    docs.create(a, "log.md", "# Log\n")
+    docs.append_to_document(a, "log.md", "alice", idempotency_key="shared")
+    docs.append_to_document(b, "log.md", "admin", idempotency_key="shared")
+    body = docs.get("log.md")["content"]
+    assert "alice" in body and "admin" in body
+
+
 # ---- patch: occurrence + regex ------------------------------------------
 def test_patch_literal_targets_nth_occurrence(docs, principals):
     p = principals["editor"]
