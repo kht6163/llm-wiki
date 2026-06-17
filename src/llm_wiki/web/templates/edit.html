@@ -31,15 +31,34 @@
       data-path="{{ path }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   {% if is_new %}
-    <label>경로 <input type="text" name="path" value="{{ path }}" placeholder="folder/note.md"
-                       list="folders" autocomplete="off" required></label>
-    <datalist id="folders">
-      {% for f in folders|default([]) %}<option value="{{ f }}/"></option>{% endfor %}
-    </datalist>
+    {% set _parts = path.rsplit('/', 1) if path else [''] %}
+    {% set _folder = _parts[0] if _parts|length > 1 else '' %}
+    {% set _name = _parts[-1] %}
+    {% set _stem = _name[:-3] if _name.lower().endswith('.md') else _name %}
+    <div class="loc-field">
+      <div class="loc-row">
+        <label class="loc-folder">위치
+          <input type="text" id="loc-folder" value="{{ _folder }}" list="folders"
+                 autocomplete="off" placeholder="루트 (최상위)">
+        </label>
+        <label class="loc-name">이름
+          <span class="loc-name-wrap">
+            <input type="text" id="loc-name" value="{{ _stem }}" autocomplete="off"
+                   placeholder="문서 이름" required>
+            <span class="loc-ext" aria-hidden="true">.md</span>
+          </span>
+        </label>
+      </div>
+      <p class="loc-preview" id="loc-preview" aria-live="polite"></p>
+      <datalist id="folders">
+        {% for f in folders|default([]) %}<option value="{{ f }}"></option>{% endfor %}
+      </datalist>
+      <input type="hidden" name="path" id="loc-path" value="{{ path }}">
+    </div>
   {% else %}
     <input type="hidden" name="base_version" value="{{ base_version }}">
   {% endif %}
-  <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="(비우면 자동 추출)"></label>
+  <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="{% if is_new %}(비우면 이름에서 자동){% else %}(비우면 자동 추출){% endif %}"></label>
   <!-- The textarea is the form field (carries content on submit); md-editor-rt
        mounts into #md-editor-mount and mirrors its value back into it. -->
   <textarea id="editor" name="content" aria-label="마크다운 본문" hidden>{{ content }}</textarea>

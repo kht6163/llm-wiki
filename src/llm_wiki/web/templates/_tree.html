@@ -2,14 +2,17 @@
    {name, path, folders:[child nodes], docs:[{path,title}]}. Folders use native
    <details> so collapse/expand works without JS; shell.js layers on persistence
    and auto-reveal. #}
-{% macro render_tree(node) %}
+{% macro render_tree(node, can_write=False) %}
   {% for f in node.folders %}
     <details class="tree-folder" data-folder="{{ f.path }}">
       <summary class="tree-row tree-folder-row" data-folder="{{ f.path }}">
         <span class="tree-twisty" aria-hidden="true"></span>
         <span class="tree-label">{{ f.name }}</span>
+        {% if can_write %}<button type="button" class="tree-add" tabindex="-1"
+          data-action="new-doc-here" data-folder="{{ f.path }}"
+          title="여기에 새 문서" aria-label="여기에 새 문서">＋</button>{% endif %}
       </summary>
-      <div class="tree-children">{{ render_tree(f) }}</div>
+      <div class="tree-children">{{ render_tree(f, can_write) }}</div>
     </details>
   {% endfor %}
   {% for d in node.docs %}

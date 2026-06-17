@@ -517,7 +517,7 @@ def create_web_app(app: AppContext) -> FastAPI:
     def new_get(request: Request, path: str = "", p: Principal = Depends(require_user)):
         return render("edit.html", request, is_new=True, path=path, title="", content="",
                       base_version=0, conflict=None, error=None, can_write=p.can_write,
-                      folders=docs.folders())
+                      folders=docs.list_folders())
 
     @web.post("/new")
     def new_post(request: Request, path: str = Form(...), content: str = Form(""),
@@ -529,11 +529,11 @@ def create_web_app(app: AppContext) -> FastAPI:
             # field error, not a dead end) instead of bouncing to the global error page.
             return render("edit.html", request, status=400, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
-                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.folders())
+                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.list_folders())
         except WikiError as e:
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
-                          error=e.message, can_write=p.can_write, folders=docs.folders())
+                          error=e.message, can_write=p.can_write, folders=docs.list_folders())
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}/edit", response_class=HTMLResponse)

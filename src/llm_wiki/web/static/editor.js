@@ -4,6 +4,32 @@
 // CSRF, image upload, light/dark theme sync, and the status-bar word count.
 (function () {
   "use strict";
+
+  // ---- new-doc location control: folder + name -> hidden `path` + live preview ----
+  // The location is chosen in the tree (or here), so the user types a name, not a
+  // path. `.md` is implied (the server appends it); the folder is a plain field with
+  // a datalist of existing folders, so creating into a new folder still works. Runs
+  // before the editor guard below so it wires up even if the editor bundle is absent.
+  (function locationControl() {
+    var folder = document.getElementById("loc-folder");
+    var name = document.getElementById("loc-name");
+    var hidden = document.getElementById("loc-path");
+    var preview = document.getElementById("loc-preview");
+    if (!folder || !name || !hidden) return;
+    function sync() {
+      var f = folder.value.trim().replace(/^\/+|\/+$/g, "");
+      var stem = name.value.trim().replace(/\.md$/i, "");
+      var full = (f ? f + "/" : "") + stem;
+      hidden.value = full ? full + ".md" : "";
+      if (preview) preview.textContent = full ? "생성 위치 · " + full + ".md" : "";
+    }
+    folder.addEventListener("input", sync);
+    name.addEventListener("input", sync);
+    sync();
+    // Pre-named from the tree -> let them write; otherwise focus the name first.
+    if (!name.value.trim()) { name.focus(); }
+  })();
+
   var form = document.querySelector(".editform");
   var textarea = document.getElementById("editor");
   var mountEl = document.getElementById("md-editor-mount");

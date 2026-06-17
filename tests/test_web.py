@@ -223,6 +223,73 @@ def test_new_post_invalid_path_stays_on_form(client):
     assert "my draft content" in r.text           # the draft is preserved
 
 
+def test_new_form_shows_location_control_split_from_path(client):
+    # The new-doc form must not make the user type a raw path: it splits the incoming
+    # ?path into a folder field + a name field with a static `.md` unit.
+    login(client, "admin")
+    r = client.get("/new?path=" + quote("projects/회의록.md"))
+    assert r.status_code == 200
+    assert 'id="loc-folder"' in r.text and 'id="loc-name"' in r.text
+    assert 'value="projects"' in r.text      # folder prefilled
+    assert 'value="회의록"' in r.text         # name prefilled WITHOUT the .md
+    assert 'class="loc-ext"' in r.text        # the static `.md` unit
+    # the old free-form "folder/note.md" path field is gone
+    assert 'placeholder="folder/note.md"' not in r.text
+
+
+def test_new_form_folder_field_lists_existing_folders(client):
+    login(client, "admin")
+    create_doc(client, "work/report.md", "body")
+    r = client.get("/new")
+    assert '<option value="work">' in r.text   # datalist offers the existing folder
+
+
+def test_create_accepts_name_without_md_extension(client):
+    # Name-only creation: the server appends `.md`, so the tree/editor never force it.
+    login(client, "admin")
+    r = client.post(
+        "/new",
+        data={"path": "notes/quicknote", "content": "hello", "title": "",
+              "csrf_token": _token(client, "/new")},
+        follow_redirects=False,
+    )
+    assert r.status_code in (302, 303)
+    assert r.headers["location"] == "/doc/notes/quicknote.md"
+
+
+def test_tree_folder_has_create_here_affordance_for_editors(client):
+    login(client, "alice")                     # editor
+    create_doc(client, "work/report.md", "body")
+    home = client.get("/").text
+    assert 'data-action="new-doc-here"' in home
+    assert 'data-folder="work"' in home
+
+
+def test_tree_create_here_affordance_hidden_for_viewers(client):
+    login(client, "alice")
+    create_doc(client, "work/report.md", "body")  # editor seeds a folder
+    client.get("/logout")
+    login(client, "bob")                       # viewer
+    home = client.get("/").text
+    assert 'data-action="new-doc-here"' not in home
+
+
+def test_editor_js_wires_location_control(client):
+    js = client.get("/static/editor.js").text
+    assert "loc-folder" in js and "loc-path" in js
+
+
+def test_shell_js_context_menu_creates_in_folder_and_at_root(client):
+    # File-explorer create UX lives in shell.js: a folder menu (doc + subfolder) and a
+    # root menu on empty space (doc + folder). The folder-fill rule makes empty space
+    # below the items count as the tree.
+    js = client.get("/static/shell.js").text
+    assert "새 하위 폴더" in js          # create a subfolder under a folder
+    assert '"새 폴더"' in js             # create a folder at the root (empty-space menu)
+    css = client.get("/static/style.css").text
+    assert '.sb-panel[data-panel="files"]' in css
+
+
 def test_editor_has_unsaved_changes_guard(client):
     # C1: editor.js guards Cancel / navigation when there are unsaved edits.
     js = client.get("/static/editor.js").text

@@ -218,10 +218,14 @@
   function renderNode(node) {
     var h = "";
     (node.folders || []).forEach(function (f) {
+      var addBtn = W.canWrite
+        ? '<button type="button" class="tree-add" tabindex="-1" data-action="new-doc-here"' +
+          ' data-folder="' + esc(f.path) + '" title="여기에 새 문서" aria-label="여기에 새 문서">＋</button>'
+        : "";
       h += '<details class="tree-folder" data-folder="' + esc(f.path) + '">' +
         '<summary class="tree-row tree-folder-row" data-folder="' + esc(f.path) + '">' +
         '<span class="tree-twisty" aria-hidden="true"></span>' +
-        '<span class="tree-label">' + esc(f.name) + '</span></summary>' +
+        '<span class="tree-label">' + esc(f.name) + '</span>' + addBtn + '</summary>' +
         '<div class="tree-children">' + renderNode(f) + '</div></details>';
     });
     (node.docs || []).forEach(function (dd) {
@@ -238,17 +242,41 @@
   }
 
   // ---- inline create (new folder / new doc) ---------------------------
-  function inlineInput(placeholder, initial, onConfirm) {
+  // The input is rendered INSIDE the target folder (auto-expanded) so you can see
+  // where the new item will land — like Obsidian/IDE explorers. `opts.folder` picks
+  // the parent ("" = vault root, rendered at the top of the tree); `opts.leaf` shows
+  // a leaf twisty so a new doc lines up with sibling documents.
+  function inlineInput(placeholder, onConfirm, opts) {
+    opts = opts || {};
     var tree = document.getElementById("file-tree");
     if (!tree) return;
+    var container = tree, anchor = tree.firstChild, prefix = "";
+    if (opts.folder) {
+      var det = tree.querySelector('details.tree-folder[data-folder="' + cssEsc(opts.folder) + '"]');
+      if (det) {
+        det.open = true;                       // reveal where it lands
+        var kids = det.querySelector(".tree-children");
+        if (kids) { container = kids; anchor = kids.firstChild; }
+        prefix = opts.folder.split("/").pop() + "/";
+      }
+    }
     var row = document.createElement("div");
     row.className = "tree-row tree-input-row";
+    var tw = document.createElement("span");
+    tw.className = "tree-twisty" + (opts.leaf ? " tree-twisty-leaf" : "");
+    tw.setAttribute("aria-hidden", "true");
+    row.appendChild(tw);
+    if (prefix) {
+      var pre = document.createElement("span");
+      pre.className = "tree-add-prefix"; pre.textContent = prefix;
+      row.appendChild(pre);
+    }
     var inp = document.createElement("input");
     inp.type = "text"; inp.className = "tree-inline-input"; inp.placeholder = placeholder;
-    inp.value = initial || "";
     row.appendChild(inp);
-    tree.insertBefore(row, tree.firstChild);
-    inp.focus(); inp.select();
+    container.insertBefore(row, anchor);
+    row.scrollIntoView({ block: "nearest" });
+    inp.focus();
     var closed = false;
     function done(commit) {
       if (closed) return;       // Enter/Escape then blur must not fire twice
@@ -265,18 +293,20 @@
   }
 
   function newFolder(parent) {
-    inlineInput("폴더 이름", "", function (name) {
+    inlineInput("폴더 이름", function (name) {
       var path = (parent ? parent + "/" : "") + name;
       postForm("/api/folders", { path: path }).then(function (res) {
         if (res.ok && res.data.ok) { refreshTree(); toast("폴더 생성: " + res.data.path); }
         else toast("폴더 생성 실패: " + msg(res.data));
       });
-    });
+    }, { folder: parent });
   }
   function newDoc(parent) {
-    inlineInput("문서 경로 (예: note.md)", parent ? parent + "/" : "", function (name) {
-      location.href = "/new?path=" + encodeURIComponent(name);
-    });
+    // Name only — `.md` is implied and the folder comes from where you created it.
+    inlineInput("문서 이름", function (name) {
+      var path = (parent ? parent + "/" : "") + name;
+      location.href = "/new?path=" + encodeURIComponent(path);
+    }, { folder: parent, leaf: true });
   }
   function msg(d) { return (d && d.error && (d.error.message || d.error)) || (d && d.message) || "오류"; }
 
@@ -369,7 +399,12 @@
       ], focusFirst);
       return folderRow;
     }
-    return null;
+    // Empty space (not on any row) -> create at the vault root, like a file explorer.
+    openMenu(x, y, [
+      { label: "새 문서", run: function () { newDoc(""); } },
+      { label: "새 폴더", run: function () { newFolder(""); } }
+    ], focusFirst);
+    return target;
   }
 
   function bindContextMenu() {
@@ -434,6 +469,12 @@
     else if (a === "collapse-all") { collapseAll(); }
     else if (a === "new-folder") { newFolder(""); }
     else if (a === "new-doc") { newDoc(""); }
+    else if (a === "new-doc-here") {
+      // The button lives inside a <summary>; stop the click from toggling the folder
+      // (newDoc opens it explicitly) and from creating at the wrong scope.
+      e.preventDefault(); e.stopPropagation();
+      newDoc(btn.getAttribute("data-folder"));
+    }
     else if (a === "palette" && window.WikiPalette) { window.WikiPalette.openCommands(); }
     else if (a === "switcher" && window.WikiPalette) { window.WikiPalette.openSwitcher(); }
   });

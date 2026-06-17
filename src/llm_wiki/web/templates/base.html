@@ -64,7 +64,7 @@
         <div class="file-tree" id="file-tree">
           {% from "_tree.html" import render_tree %}
           {% if nav_tree.folders or nav_tree.docs %}
-          {{ render_tree(nav_tree) }}
+          {{ render_tree(nav_tree, user.can_write) }}
           {% else %}
           <p class="tree-empty muted">아직 문서가 없습니다.{% if user.can_write %} 위의 <b>＋ 문서</b>로 첫 노트를 만들어 보세요.{% endif %}</p>
           {% endif %}
