@@ -13,7 +13,7 @@
   </div>
   {% endif %}
 </div>
-<p class="muted">v{{ a.version }} ({{ a.created_at|dt }}) → v{{ b.version }} ({{ b.created_at|dt }}) ·
+<p class="doc-meta">v{{ a.version }} ({{ a.created_at|dt }}) → v{{ b.version }} ({{ b.created_at|dt }}) ·
   <a href="/doc/{{ path|urlpath }}/history">이력으로</a></p>
 {% if not diff %}
   <p class="muted">두 버전의 내용이 동일합니다.</p>

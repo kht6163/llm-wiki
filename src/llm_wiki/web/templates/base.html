@@ -89,7 +89,7 @@
       <div class="sb-panel" data-panel="tags" id="sb-panel-tags" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-tags" hidden>
         <ul class="sb-taglist">
           {% for t in nav_tags %}
-          <li><a href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }} <span class="muted">{{ t.count }}</span></a></li>
+          <li><a href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }} <span class="muted count">{{ t.count }}</span></a></li>
           {% else %}
           <li class="muted">태그 없음</li>
           {% endfor %}

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ rev.title }} v{{ rev.version }}{% endblock %}
 {% block content %}
-<h1>{{ rev.title }} <span class="muted">· v{{ rev.version }}</span></h1>
+<h1>{{ rev.title }} <span class="muted">· <span class="version">v{{ rev.version }}</span></span></h1>
 <div class="doc-meta">
   {{ rev.op }} · {{ rev.author or '—' }} · {{ rev.created_at|dt }} ·
   <a href="/doc/{{ rev.path|urlpath }}/history">이력으로</a> ·

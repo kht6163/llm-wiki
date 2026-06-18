@@ -3,13 +3,13 @@
 {% block title %}이력 · {{ path }}{% endblock %}
 {% block content %}
 <h1>이력 · <a href="/doc/{{ path|urlpath }}">{{ path }}</a></h1>
-<p class="muted">현재 버전 v{{ current_version }}</p>
+<p class="muted">현재 버전 <span class="version">v{{ current_version }}</span></p>
 <table class="revtable">
   <thead><tr><th scope="col">버전</th><th scope="col">작업</th><th scope="col">출처</th><th scope="col">작성자</th><th scope="col">시각</th><th scope="col">동작</th></tr></thead>
   <tbody>
   {% for r in revisions %}
     <tr>
-      <td data-label="버전">v{{ r.version }}</td>
+      <td data-label="버전"><span class="version">v{{ r.version }}</span></td>
       <td data-label="작업">{{ r.op }}</td>
       <td data-label="출처">{{ via_badge(r.via) }}</td>
       <td data-label="작성자">{{ r.author or '—' }}</td>

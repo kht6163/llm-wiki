@@ -12,7 +12,7 @@
 {% endif %}
 <ul class="taglist">
   {% for t in tags %}
-    <li><a class="tag" href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }}</a> <span class="muted">{{ t.count }}</span></li>
+    <li><a class="tag" href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }}</a> <span class="muted count">{{ t.count }}</span></li>
   {% endfor %}
 </ul>
 {% endblock %}

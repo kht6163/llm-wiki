@@ -2,7 +2,7 @@
 {% from "_icons.html" import icon %}
 {% block title %}깨진 링크{% endblock %}
 {% block content %}
-<h1>깨진 링크 <span class="muted">{{ count }}건</span></h1>
+<h1>깨진 링크 <span class="muted"><span class="count">{{ count }}</span>건</span></h1>
 <p class="muted">존재하지 않는 문서를 가리키는 위키링크/마크다운 링크입니다. 이름 변경·삭제 후 정리에 사용하세요.</p>
 {% if not links %}
   <div class="empty-state">

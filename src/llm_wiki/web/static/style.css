@@ -124,6 +124,13 @@ h1 { font-size: 1.6em; }
   min-width: 0; overflow-wrap: anywhere; }
 .meta { color: var(--fg-muted); font-size: 0.76em; margin-left: auto; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* Mechanical-data signature applied at the token level: timestamps (the |dt
+   filter emits <time class="dt">), version numbers, and integer counts read as
+   machine data — monospace + tabular figures so they align and scan. Colour is
+   left to whatever context they sit in (usually .muted); these add no decoration
+   and are idempotent where they already nest inside .meta/.doc-meta (also mono). */
+.dt { font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.version, .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .tag { font-size: 0.74em; font-family: var(--font-mono); background: var(--inset);
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 7px; color: var(--fg-muted); }
 .tag:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
@@ -288,7 +295,7 @@ button.primary {
   border-color: color-mix(in srgb, var(--accent) 46%, var(--line));
   color: var(--accent);
 }
-button.primary:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+button.primary:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); }
 button.primary:active { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 
 /* Destructive — red outline; fills a restrained red tint on hover. */
@@ -296,7 +303,7 @@ button.danger {
   border-color: color-mix(in srgb, var(--danger) 44%, var(--line));
   color: var(--danger);
 }
-button.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+button.danger:hover { background: var(--danger-soft); border-color: var(--danger); color: color-mix(in srgb, var(--danger) 80%, var(--fg)); }
 button.danger:active { background: color-mix(in srgb, var(--danger) 18%, transparent); }
 
 .inline { display: inline; }
@@ -306,7 +313,7 @@ button.danger:active { background: color-mix(in srgb, var(--danger) 18%, transpa
   border: 1px solid color-mix(in srgb, var(--accent) 46%, var(--line));
   transition: background-color var(--t-fast) var(--ease), border-color var(--t-fast) var(--ease),
     color var(--t-fast) var(--ease); }
-.btn:hover { background: var(--accent-soft); border-color: var(--accent); text-decoration: none; }
+.btn:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--accent-hover); text-decoration: none; }
 .btn:active { background: color-mix(in srgb, var(--accent) 20%, transparent); }
 
 /* The full-width auth CTA reads as the page's one primary, so it rests with a
@@ -314,7 +321,7 @@ button.danger:active { background: color-mix(in srgb, var(--danger) 18%, transpa
 .login button.primary, .login button {
   padding: 9px 14px; font-size: 0.95em;
   background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line)); color: var(--accent-hover);
 }
 .login button:hover { background: color-mix(in srgb, var(--accent) 20%, transparent); border-color: var(--accent); }
 /* Disabled wins over the colour variants (defined last so it overrides them). */
@@ -501,6 +508,9 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
 .broken th, .broken td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line);
   vertical-align: top; }
 .broken th { color: var(--muted); font-weight: 600; }
+/* Body cells are mechanical link data (source/target paths, link type, raw
+   syntax) — monospace them to match the .path signature; headers stay UI font. */
+.broken td { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .broken code { background: var(--soft); padding: 1px 5px; border-radius: 4px; }
 
 /* Dark theme — variable-driven, so only the base tokens swap (the -soft mixes,
