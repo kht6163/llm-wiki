@@ -32,6 +32,22 @@
       .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, data: d }; }); });
   }
 
+  // ---- CSP-safe form handlers ------------------------------------------
+  // The CSP drops script-src 'unsafe-inline', so the former inline on* attributes are
+  // delegated here. `data-confirm` guards a destructive submit (cancel = no submit);
+  // `data-autosubmit` submits a filter/sort form when its control changes. Behaviour is
+  // identical to the old onsubmit=confirm() / onchange=this.form.submit() handlers.
+  document.addEventListener("submit", function (e) {
+    var f = e.target;
+    if (f && f.dataset && f.dataset.confirm && !window.confirm(f.dataset.confirm)) {
+      e.preventDefault();
+    }
+  });
+  document.addEventListener("change", function (e) {
+    var el = e.target;
+    if (el && el.dataset && "autosubmit" in el.dataset && el.form) el.form.submit();
+  });
+
   // ---- sidebar collapse ------------------------------------------------
   // On narrow viewports the sidebars are fixed overlays over the content. They
   // must default closed (else they cover the page on load) and their open state

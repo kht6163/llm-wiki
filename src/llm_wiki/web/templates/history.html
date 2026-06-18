@@ -21,7 +21,7 @@
         {% endif %}
         {% if user.can_write and r.version != current_version %}
           · <form method="post" action="/doc/{{ path|urlpath }}/rev/{{ r.version }}/restore" class="inline"
-                  onsubmit="return confirm('v{{ r.version }} 내용으로 되돌릴까요? (새 버전으로 기록됩니다)')">
+                  data-confirm="v{{ r.version }} 내용으로 되돌릴까요? (새 버전으로 기록됩니다)">
               <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
               <button class="primary">되돌리기</button>
             </form>

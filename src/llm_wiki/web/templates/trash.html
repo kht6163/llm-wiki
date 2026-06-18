@@ -27,7 +27,7 @@
         </form>
         {% if is_admin %}
         <form method="post" action="/trash/{{ d.path|urlpath }}/purge" class="inline"
-              onsubmit="return confirm('완전히 삭제하면 되돌릴 수 없습니다. 계속할까요?')">
+              data-confirm="완전히 삭제하면 되돌릴 수 없습니다. 계속할까요?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="danger">{{ icon("trash") }} 완전 삭제</button>
         </form>

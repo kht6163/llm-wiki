@@ -9,6 +9,7 @@ import asyncio
 import difflib
 import logging
 import re
+import secrets
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote, urlsplit
@@ -69,6 +70,7 @@ from .security import (
     RateLimiter,
     RequestIdMiddleware,
     SecurityHeadersMiddleware,
+    build_csp,
     enforce_csrf,
     get_csrf_token,
 )
@@ -229,6 +231,11 @@ def create_web_app(app: AppContext) -> FastAPI:
     # Cap API-key minting per user so a hijacked session can't fan out a pile of
     # long-lived keys (which, by policy, only password-change/deactivation revokes).
     key_limiter = RateLimiter(max_attempts=10, window_s=300.0)
+    # Bound per-user query-embedding searches. The query encoder runs under a process-wide
+    # lock in this single server process, so a flood of distinct queries serializes CPU and
+    # starves other searches + the post-write embed worker. Generous for humans (60/min),
+    # caps a runaway client. (Mirrors the MCP read throttle on the agent surface.)
+    read_limiter = RateLimiter(max_attempts=60, window_s=60.0)
 
     def user(request: Request) -> Principal | None:
         return principal_from_session(db, request.session.get("sid"))
@@ -236,7 +243,12 @@ def create_web_app(app: AppContext) -> FastAPI:
     def render(name: str, request: Request, status: int = 200, **kw) -> HTMLResponse:
         flash = request.session.pop("flash", None)
         p = user(request)
-        ctx: dict = {"user": p, "flash": flash, "csrf_token": get_csrf_token(request)}
+        # Per-request nonce: the few inline <script> blocks carry it (script-src drops
+        # 'unsafe-inline'), so a sanitizer/template slip can't get injected inline script
+        # to run. render() is the single HTML hook, so this also stamps the page's CSP.
+        nonce = secrets.token_urlsafe(16)
+        ctx: dict = {"user": p, "flash": flash, "csrf_token": get_csrf_token(request),
+                     "csp_nonce": nonce}
         # The app shell (left file tree + tag list) renders on every authenticated
         # page, so the navigation tree is a common context entry. Anonymous pages
         # (login/error before auth) skip the DB work.
@@ -249,7 +261,10 @@ def create_web_app(app: AppContext) -> FastAPI:
             # per request — a small indexed lookup keyed by user_id.
             ctx.setdefault("nav_favorites", docs.list_favorites(p.user_id))
         ctx.update(kw)
-        return templates.TemplateResponse(request, name, ctx, status_code=status)
+        resp = templates.TemplateResponse(request, name, ctx, status_code=status)
+        # Stamp this page's CSP with the nonce (overrides the middleware's strict default).
+        resp.headers["Content-Security-Policy"] = build_csp(nonce)
+        return resp
 
     def embed_resolver(from_path: str):
         """A render_markdown embed resolver bound to a document's folder: resolves an
@@ -455,6 +470,15 @@ def create_web_app(app: AppContext) -> FastAPI:
         results = []
         truncated = False
         if q.strip():
+            rkey = f"read:{_p.user_id}"
+            if not read_limiter.allowed(rkey):
+                return render("search.html", request, status=429, q=q, mode=mode, top_k=top_k,
+                              folder=folder or "", tag=tag or "", results=[], truncated=False,
+                              folders=docs.folders(),
+                              error="검색 요청이 너무 잦습니다. 잠시 후 다시 시도하세요.")
+            if read_limiter.record_failure(rkey):
+                audit.record_tx(db, actor=_p.username, via="web", action="read_rate_limited",
+                                outcome="blocked", detail="search")
             hits, truncated = docs.search_page(
                 q, mode=mode, top_k=top_k, folder=folder or None, tags=tags)
             results = [r.to_dict() for r in hits]
@@ -618,8 +642,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         # Serve with an explicit, known Content-Type so nosniff has a correct type to
         # pin (unknown -> octet-stream, never a guessed renderable type).
         media = _ATTACH_MIME.get(target.suffix.lower(), "application/octet-stream")
-        # Hardened CSP overrides the site default (which permits inline scripts):
-        # an SVG opened directly as a document must not execute scripts. The explicit
+        # Hardened CSP overrides the site default for this resource: an SVG opened
+        # directly as a document must not execute scripts at all. The explicit
         # script-src 'none' is unambiguous, sandbox strips same-origin/JS as defense
         # in depth, and Content-Disposition: inline keeps it from being treated as a
         # download. <img> embedding is governed by the embedding page's CSP (the
@@ -761,7 +785,7 @@ def create_web_app(app: AppContext) -> FastAPI:
             return render("missing.html", request, path=path)
         html = render_markdown(doc["content"], doc["path"],
                                resolve_embed=embed_resolver(doc["path"]))
-        backlinks = docs.backlinks(doc["path"])["backlinks"]
+        backlinks = docs.backlinks(doc["path"], with_context=True)["backlinks"]
         outgoing = docs.links(doc["path"])["links"]
         stats = word_count(doc["content"])
         properties = document_properties(doc["content"])

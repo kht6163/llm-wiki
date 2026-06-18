@@ -868,3 +868,36 @@ def test_user_mod_failure_is_audited(client, ctx):
     assert r.status_code == 303
     rows = audit.recent(ctx.db, action="role_change")
     assert any(x["outcome"] == "error" for x in rows)
+
+
+def test_csp_uses_script_nonce_not_unsafe_inline(client):
+    # script-src is nonce-based (no 'unsafe-inline'); the inline <script> blocks carry the
+    # same per-request nonce; style-src keeps 'unsafe-inline' (editor injects styles).
+    login(client, "admin")
+    r = client.get("/")
+    csp = r.headers.get("content-security-policy", "")
+    m = re.search(r"script-src ([^;]+)", csp)
+    assert m, csp
+    script_src = m.group(1)
+    assert "'unsafe-inline'" not in script_src and "'nonce-" in script_src
+    assert "style-src 'self' 'unsafe-inline'" in csp
+    nonce = re.search(r"'nonce-([^']+)'", script_src).group(1)
+    assert f'<script nonce="{nonce}">' in r.text
+
+
+def test_destructive_forms_use_delegated_handlers(client):
+    # CSP refactor: former inline on* handlers became data-confirm / data-autosubmit.
+    login(client, "admin")
+    create_doc(client, "delme.md", "# D\n\nbody")
+    view = client.get("/doc/delme.md").text
+    assert "data-confirm=" in view and "onsubmit=" not in view
+    home = client.get("/").text
+    assert "data-autosubmit" in home and "onchange=" not in home
+
+
+def test_search_rate_limited_per_user(client):
+    # The embedding-bearing search is bounded per principal; over the window it 429s.
+    login(client, "admin")
+    statuses = [client.get("/search", params={"q": "apple", "mode": "bm25"}).status_code
+                for _ in range(61)]
+    assert statuses[:60] == [200] * 60 and statuses[60] == 429

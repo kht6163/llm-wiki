@@ -6,7 +6,7 @@
   {% if user.can_write and a.version != current_version %}
   <div class="doc-actions">
     <form method="post" action="/doc/{{ path|urlpath }}/rev/{{ a.version }}/restore" class="inline"
-          onsubmit="return confirm('v{{ a.version }} 내용으로 되돌릴까요? (현재 v{{ current_version }} → 새 버전으로 기록됩니다)')">
+          data-confirm="v{{ a.version }} 내용으로 되돌릴까요? (현재 v{{ current_version }} → 새 버전으로 기록됩니다)">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="primary">v{{ a.version }}로 되돌리기</button>
     </form>

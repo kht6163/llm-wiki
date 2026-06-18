@@ -25,6 +25,7 @@ from .services.auth import Principal, principal_from_api_key
 from .services.errors import (
     ConflictError,
     ForbiddenError,
+    RateLimitedError,
     UnauthorizedError,
     ValidationError,
     WikiError,
@@ -114,6 +115,26 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     # Throttle Bearer-auth failures per client IP so a leaked endpoint can't be
     # used to brute-force API keys (the web login is limited separately).
     auth_limiter = RateLimiter(max_attempts=10, window_s=300.0)
+    # Bound per-principal embedding-bearing reads (search / assemble_context). model.encode()
+    # runs under a process-wide lock in this single server process, so a runaway agent or
+    # leaked key issuing distinct queries would serialize CPU and starve other reads + the
+    # post-write embed worker. Generous burst, then 'rate_limited'.
+    read_limiter = RateLimiter(max_attempts=60, window_s=60.0)
+
+    def _throttle_read(principal: Principal, tool: str) -> None:
+        key = f"read:{principal.user_id}"
+        if not read_limiter.allowed(key):
+            raise RateLimitedError(
+                "Read rate limit exceeded for this principal; pause and retry shortly.")
+        if read_limiter.record_failure(key):
+            # The request that just saturated the window — record one audit row (subsequent
+            # over-limit calls short-circuit at allowed() above) so abuse surfaces without
+            # write-amplifying. Never let an audit failure mask the read.
+            try:
+                audit.record_tx(db, actor=principal.username, via="mcp",
+                                action="read_rate_limited", outcome="blocked", detail=f"tool={tool}")
+            except Exception:
+                log.exception("failed to audit read rate limit")
 
     def _principal(token: str | None) -> Principal:
         p = principal_from_api_key(db, token)
@@ -211,9 +232,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         until: Annotated[str | None,
                          Field(description="ISO-8601 upper bound on updated_at.")] = None,
     ) -> dict:
-        def fn(_p: Principal) -> dict:
+        def fn(p: Principal) -> dict:
             if not query or not query.strip():
                 raise ValidationError("query must not be empty.")
+            _throttle_read(p, "search_documents")
             results, truncated = docs.search_page(query, mode=mode, top_k=top_k,
                                                   folder=folder, tags=tags, since=since, until=until)
             capped = clamp_int(top_k, 1, 50)
@@ -243,7 +265,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         folder: Annotated[str | None, Field(description="Restrict to this folder subtree.")] = None,
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
     ) -> dict:
-        def fn(_p: Principal) -> dict:
+        def fn(p: Principal) -> dict:
+            _throttle_read(p, "assemble_context")
             return {"ok": True, **docs.assemble_context(
                 question, max_chars=max_chars, max_sources=max_sources,
                 mode=mode, folder=folder, tags=tags)}
@@ -399,9 +422,19 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def get_links(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.links(path)}, "get_links")
 
-    @mcp.tool(description="Documents that link TO this document (backlinks).")
-    async def get_backlinks(ctx: Context, path: str) -> dict:
-        return await _call(ctx, lambda _p: {"ok": True, **docs.backlinks(path)}, "get_backlinks")
+    @mcp.tool(description="Documents that link TO this document (backlinks): each carries "
+                          "src_path, src_title, alias, anchor, link_type. Pass with_context=true "
+                          "to also include a 'context' snippet — the sentence around each inbound "
+                          "link — so you learn WHY each document links here in ONE call instead of "
+                          "N read_document round-trips (omitted for links with no recorded offset).")
+    async def get_backlinks(
+        ctx: Context, path: str,
+        with_context: Annotated[bool, Field(description="Include a 'context' snippet (the "
+                                "surrounding sentence) for each inbound link.")] = False,
+    ) -> dict:
+        return await _call(
+            ctx, lambda _p: {"ok": True, **docs.backlinks(path, with_context=with_context)},
+            "get_backlinks")
 
     @mcp.tool(description="Resolve wikilink/markdown targets to existing document paths BEFORE you "
                           "write them — a dry run using the same resolver as the live graph (bare "

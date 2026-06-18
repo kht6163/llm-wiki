@@ -3,6 +3,7 @@
 {% block title %}검색{% endblock %}
 {% block content %}
 <h1>검색</h1>
+{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
 <form action="/search" method="get" class="searchform" role="search">
   <input type="search" name="q" value="{{ q }}" placeholder="검색어" aria-label="검색어" autofocus>
   <select name="mode" aria-label="검색 방식">

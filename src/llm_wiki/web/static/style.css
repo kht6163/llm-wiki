@@ -752,6 +752,12 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .rp-list.related li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
 .rp-list a, .rp-list .broken { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rp-list.related li > a { min-width: 0; }
+/* Backlink context: the sentence around an inbound link, under its title. Muted +
+   small, clamped to two lines so the panel stays scannable for densely-linked docs. */
+.rp-list .bl-context {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+  overflow: hidden; color: var(--fg-muted); font-size: 0.82em; line-height: 1.45; margin: 1px 0 3px;
+}
 
 /* outline (table of contents) */
 .outline-list { list-style: none; padding: 0; margin: 0; font-size: 0.85em; }

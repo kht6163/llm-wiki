@@ -132,14 +132,71 @@ def unresolve_incoming(conn: sqlite3.Connection, doc_id: int) -> None:
     )
 
 
-def get_backlinks(conn: sqlite3.Connection, doc_id: int) -> list[dict]:
+def _latest_bodies(conn: sqlite3.Connection, doc_ids: list[int]) -> dict[int, str]:
+    """Latest-revision body text per doc id, in batched IN(...) queries (chunked under
+    SQLite's bound-parameter limit). This stored body is the SAME coordinate space that
+    ``links.char_start`` indexes into — ``extract_links`` masks frontmatter/code to
+    equal-length spaces, so a link offset maps straight onto the raw body."""
+    out: dict[int, str] = {}
+    chunk = 400
+    for i in range(0, len(doc_ids), chunk):
+        part = doc_ids[i:i + chunk]
+        placeholders = ",".join("?" * len(part))
+        rows = conn.execute(
+            f"SELECT r.doc_id AS doc_id, r.body AS body FROM revisions r "
+            f"JOIN (SELECT doc_id, MAX(version) AS v FROM revisions "
+            f"      WHERE doc_id IN ({placeholders}) GROUP BY doc_id) m "
+            f"ON m.doc_id=r.doc_id AND m.v=r.version",
+            part,
+        ).fetchall()
+        for r in rows:
+            out[r["doc_id"]] = r["body"] or ""
+    return out
+
+
+def _link_context(body: str, char_start: int | None, radius: int = 120) -> str | None:
+    """A one-line snippet of ``body`` around ``char_start`` (a link's offset), expanded to
+    whitespace boundaries and whitespace-collapsed, with … where it was clipped. Returns
+    None when there's no usable offset (legacy/NULL char_start) so the caller omits it."""
+    if char_start is None or not body:
+        return None
+    n = len(body)
+    if char_start < 0 or char_start > n:
+        return None
+    lo, hi = max(0, char_start - radius), min(n, char_start + radius)
+    while lo > 0 and not body[lo - 1].isspace():
+        lo -= 1
+    while hi < n and not body[hi].isspace():
+        hi += 1
+    snippet = " ".join(body[lo:hi].split())
+    if not snippet:
+        return None
+    return ("… " if lo > 0 else "") + snippet + (" …" if hi < n else "")
+
+
+def get_backlinks(conn: sqlite3.Connection, doc_id: int, *,
+                  with_context: bool = False, context_radius: int = 120) -> list[dict]:
+    """Documents linking to ``doc_id``. With ``with_context`` each backlink also carries a
+    ``context`` snippet (the surrounding sentence of the inbound link) so a caller learns
+    WHY each doc links here without one read per source — the bodies are loaded in a single
+    batched query and sliced at the link offset."""
     rows = conn.execute(
-        "SELECT d.path AS src_path, d.title AS src_title, l.alias, l.anchor, l.link_type "
+        "SELECT d.id AS src_id, d.path AS src_path, d.title AS src_title, "
+        "l.alias, l.anchor, l.link_type, l.char_start "
         "FROM links l JOIN documents d ON d.id=l.src_doc_id "
-        "WHERE l.dst_doc_id=? AND d.is_deleted=0 ORDER BY d.path",
+        "WHERE l.dst_doc_id=? AND d.is_deleted=0 ORDER BY d.path, l.char_start",
         (doc_id,),
     ).fetchall()
-    return [dict(r) for r in rows]
+    out = [{"src_path": r["src_path"], "src_title": r["src_title"],
+            "alias": r["alias"], "anchor": r["anchor"], "link_type": r["link_type"]}
+           for r in rows]
+    if with_context and rows:
+        bodies = _latest_bodies(conn, sorted({r["src_id"] for r in rows}))
+        for o, r in zip(out, rows, strict=True):
+            ctx = _link_context(bodies.get(r["src_id"], ""), r["char_start"], context_radius)
+            if ctx:
+                o["context"] = ctx
+    return out
 
 
 def list_broken_links(conn: sqlite3.Connection, limit: int = 200) -> list[dict]:

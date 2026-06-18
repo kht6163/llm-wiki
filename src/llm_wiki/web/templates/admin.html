@@ -45,7 +45,7 @@
         </form>
       </td>
       <td>
-        <form method="post" action="/admin/users/{{ u.id }}/delete" class="inline" onsubmit="return confirm('삭제할까요?')">
+        <form method="post" action="/admin/users/{{ u.id }}/delete" class="inline" data-confirm="삭제할까요?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="danger">삭제</button>
         </form>

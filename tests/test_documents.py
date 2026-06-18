@@ -184,3 +184,18 @@ def test_property_edit_conflicts_on_stale_base_version(ctx, principals):
     docs.update(p, "p.md", base_version=1, content="# P\n\nchanged")  # v2
     with pytest.raises(ConflictError):
         docs.set_property(p, "p.md", "status", "draft", base_version=1)
+
+
+def test_backlink_context_snippet(ctx, principals):
+    # with_context adds a 'context' snippet sliced from the source body at the link
+    # offset (links.char_start indexes the full stored body), so a caller sees WHY a
+    # doc links here without re-reading it; default omits it.
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "target.md", "# Target\n\nbody")
+    docs.create(p, "src.md",
+                "# Src\n\nIntro sentence. See [[target]] for the full story. Trailing text.")
+    plain = docs.backlinks("target.md")["backlinks"]
+    assert plain and "context" not in plain[0]
+    withctx = docs.backlinks("target.md", with_context=True)["backlinks"]
+    b = next(x for x in withctx if x["src_path"] == "src.md")
+    assert "target" in b["context"] and "full story" in b["context"]

@@ -18,7 +18,7 @@ from ..ratelimit import RateLimiter
 
 # Re-exported for callers that still import RateLimiter from this module.
 __all__ = ["RateLimiter", "RequestIdMiddleware", "SecurityHeadersMiddleware",
-           "enforce_csrf", "get_csrf_token"]
+           "build_csp", "enforce_csrf", "get_csrf_token"]
 
 _log = logging.getLogger("llm_wiki.web")
 
@@ -32,18 +32,24 @@ CSRF_EXEMPT_PATHS = frozenset({"/api/preview"})
 
 # Images may be embedded by rendered markdown over HTTPS (or inline data: URIs);
 # plain http: is excluded so a document can't pull insecure/mixed-content images.
-# Scripts/styles are same-origin only ('unsafe-inline' is still required by the few
-# inline handlers/blocks in the templates — tighten with nonces later).
-CSP = (
-    "default-src 'self'; "
-    "img-src 'self' data: https:; "
-    "script-src 'self' 'unsafe-inline'; "
-    "style-src 'self' 'unsafe-inline'; "
-    "connect-src 'self'; "  # same-origin fetch + WebSocket (live change stream)
-    "base-uri 'self'; "
-    "frame-ancestors 'none'; "
-    "object-src 'none'"
-)
+def build_csp(nonce: str | None = None) -> str:
+    """The site Content-Security-Policy. ``script-src`` is same-origin only — NO
+    'unsafe-inline'; the handful of inline <script> blocks instead carry a per-request
+    nonce (rendered pages pass ``nonce`` here), and inline on* handlers were refactored
+    to addEventListener so none remain. ``style-src`` keeps 'unsafe-inline' because the
+    vendored editor bundle injects <style> at runtime. A response with no nonce (JSON
+    APIs, static files) gets the strict no-inline form."""
+    script_src = "script-src 'self'" + (f" 'nonce-{nonce}'" if nonce else "")
+    return (
+        "default-src 'self'; "
+        "img-src 'self' data: https:; "
+        f"{script_src}; "
+        "style-src 'self' 'unsafe-inline'; "
+        "connect-src 'self'; "  # same-origin fetch + WebSocket (live change stream)
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "object-src 'none'"
+    )
 
 
 # -- CSRF ------------------------------------------------------------------
@@ -152,7 +158,10 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("Referrer-Policy", "same-origin")
-        resp.headers.setdefault("Content-Security-Policy", CSP)
+        # Strict default (no inline) for responses that didn't set their own — JSON APIs,
+        # static files. Rendered HTML pages set a nonce'd CSP in render() before this runs,
+        # and setdefault leaves that intact.
+        resp.headers.setdefault("Content-Security-Policy", build_csp())
         if self.hsts:
             # 1 year, include subdomains. Only sent when serving over HTTPS so it can't
             # strand a plain-HTTP host. (Add 'preload' only if you submit to the list.)

@@ -5,7 +5,7 @@
 <div class="graph-controls">
   <label>중심 문서 <input id="root" value="{{ root }}" placeholder="(비우면 전체)" size="36"></label>
   <label>깊이 <input id="depth" type="number" value="1" min="1" max="3"></label>
-  <button class="primary" onclick="reloadGraph()">적용</button>
+  <button class="primary" id="graph-apply" type="button">적용</button>
   <span id="ginfo" class="muted" role="status" aria-live="polite"></span>
 </div>
 <div id="cy" tabindex="0" role="application"
@@ -13,7 +13,7 @@
 <span id="gkb" class="visually-hidden" aria-live="polite"></span>
 <p id="gempty" class="muted" hidden>표시할 노드가 없습니다. 중심 문서 경로를 확인하거나, 문서 사이에 <code>[[위키링크]]</code>를 추가해 보세요.</p>
 <script src="{{ static('vendor/cytoscape.min.js') }}"></script>
-<script>
+<script nonce="{{ csp_nonce }}">
 let cy = null;
 
 // Pull live theme colours from the CSS tokens so the graph tracks light/dark and
@@ -166,7 +166,8 @@ document.getElementById('cy').addEventListener('keydown', function (e) {
   }
 });
 
-// Enter in the root/depth fields applies the graph (keyboard parity with the button).
+// Apply button + Enter in the root/depth fields apply the graph (keyboard parity).
+document.getElementById('graph-apply').addEventListener('click', reloadGraph);
 ['root', 'depth'].forEach(function (id) {
   document.getElementById(id).addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); reloadGraph(); }

@@ -19,7 +19,7 @@
       {% if user.can_write %}
         <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
         <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
-              onsubmit="return confirm('이 문서를 삭제할까요?')">
+              data-confirm="이 문서를 삭제할까요?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="base_version" value="{{ doc.version }}">
           <button type="submit" class="danger">삭제</button>
@@ -78,7 +78,7 @@
   <div class="rp-panel" data-rp-panel="links" id="rp-panel-links" role="tabpanel" tabindex="0" aria-labelledby="rp-tab-links" hidden>
     <h3>백링크 ({{ backlinks|length }})</h3>
     <ul class="rp-list">
-      {% for b in backlinks %}<li><a href="/doc/{{ b.src_path|urlpath }}">{{ b.src_title or b.src_path }}</a></li>
+      {% for b in backlinks %}<li><a href="/doc/{{ b.src_path|urlpath }}">{{ b.src_title or b.src_path }}</a>{% if b.context %}<span class="bl-context">{{ b.context }}</span>{% endif %}</li>
       {% else %}<li class="muted">없음</li>{% endfor %}
     </ul>
     <h3>나가는 링크</h3>

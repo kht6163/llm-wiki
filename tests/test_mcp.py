@@ -769,3 +769,28 @@ async def test_rename_tag_forbidden_for_viewer(ctx, principals, monkeypatch):
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("rename_tag", {"old": "a", "new": "b"}))
     assert d["ok"] is False and d["error"]["code"] == "forbidden"
+
+
+async def test_get_backlinks_with_context(editor_mcp):
+    # with_context=true returns a 'context' snippet per inbound link (one call instead of
+    # N read_document round-trips); without it the shape stays lean.
+    await editor_mcp.call_tool("create_document", {"path": "t.md", "content": "# T\n\nbody"})
+    await editor_mcp.call_tool(
+        "create_document", {"path": "s.md", "content": "# S\n\nA line that mentions [[t]] here."})
+    plain = _payload(await editor_mcp.call_tool("get_backlinks", {"path": "t.md"}))
+    assert plain["ok"] and all("context" not in b for b in plain["backlinks"])
+    withctx = _payload(await editor_mcp.call_tool(
+        "get_backlinks", {"path": "t.md", "with_context": True}))
+    b = next(x for x in withctx["backlinks"] if x["src_path"] == "s.md")
+    assert "context" in b and "mentions" in b["context"]
+
+
+async def test_mcp_read_rate_limited_per_principal(editor_mcp):
+    # Embedding-bearing reads are bounded per principal: past the window the agent gets a
+    # structured 'rate_limited' envelope, protecting the single-process encoder from a flood.
+    await editor_mcp.call_tool("create_document", {"path": "r.md", "content": "# R\n\napple"})
+    last = None
+    for _ in range(61):
+        last = _payload(await editor_mcp.call_tool(
+            "search_documents", {"query": "apple", "mode": "bm25"}))
+    assert last["ok"] is False and last["error"]["code"] == "rate_limited"

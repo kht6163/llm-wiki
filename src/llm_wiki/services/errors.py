@@ -39,3 +39,8 @@ class ValidationError(WikiError):
 class ConflictError(WikiError):
     code = "conflict"
     http_status = 409
+
+
+class RateLimitedError(WikiError):
+    code = "rate_limited"
+    http_status = 429

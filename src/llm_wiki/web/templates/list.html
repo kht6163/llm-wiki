@@ -9,7 +9,7 @@
   <form class="listsort" method="get" action="/">
     {% if folder %}<input type="hidden" name="folder" value="{{ folder }}">{% endif %}
     {% if tag %}<input type="hidden" name="tag" value="{{ tag }}">{% endif %}
-    <select name="sort" onchange="this.form.submit()">
+    <select name="sort" data-autosubmit>
       <option value="updated_at" {{ 'selected' if sort=='updated_at' }}>최근 수정순</option>
       <option value="title" {{ 'selected' if sort=='title' }}>제목순</option>
       <option value="path" {{ 'selected' if sort=='path' }}>경로순</option>

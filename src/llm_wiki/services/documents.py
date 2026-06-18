@@ -793,14 +793,15 @@ class DocumentService:
                 "from_title": fr["title"], "to_title": to["title"], "diff": diff,
                 "summary": {"lines_added": added, "lines_deleted": deleted}}
 
-    def backlinks(self, path: str) -> dict:
+    def backlinks(self, path: str, *, with_context: bool = False) -> dict:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.reader() as conn:
             d = conn.execute("SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
-            return {"path": rel, "backlinks": graph.get_backlinks(conn, d["id"])}
+            return {"path": rel,
+                    "backlinks": graph.get_backlinks(conn, d["id"], with_context=with_context)}
 
     def links(self, path: str) -> dict:
         rel = normalize_rel_path(path)
