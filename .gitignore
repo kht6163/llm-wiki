@@ -26,3 +26,9 @@ __pycache__/
 /PRODUCT.md
 /DESIGN.md
 /.impeccable/
+
+# coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml

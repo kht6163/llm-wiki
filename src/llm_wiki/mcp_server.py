@@ -5,6 +5,8 @@ blocked by SQLite / embedding work.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import time
 from collections.abc import Callable
@@ -725,6 +727,66 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "delete those first); 'not_found' if there is no such folder.")
     async def delete_folder(ctx: Context, path: str) -> dict:
         return await _call(ctx, lambda p: docs.delete_folder(p, path), "delete_folder")
+
+    @mcp.tool(description="List the documents YOU (this API key's user) have pinned as "
+                          "favourites, title-sorted. Favourites are per-user. Pair with "
+                          "set_favorite to manage them.")
+    async def list_favorites(ctx: Context) -> dict:
+        def fn(p: Principal) -> dict:
+            items = docs.list_favorites(p.user_id)
+            return {"ok": True, "count": len(items), "documents": items}
+        return await _call(ctx, fn, "list_favorites")
+
+    @mcp.tool(description="Pin or unpin a document as one of YOUR favourites (per-user; any "
+                          "role — favouriting is read-side, not a document edit). Idempotent: "
+                          "'favorite' is the resulting state, not a flip. Fails 'not_found' if "
+                          "there's no such document.")
+    async def set_favorite(
+        ctx: Context, path: str,
+        favorite: Annotated[bool, Field(description="True to pin, False to unpin.")] = True,
+    ) -> dict:
+        return await _call(ctx, lambda p: docs.set_favorite(p, path, favorite), "set_favorite")
+
+    @mcp.tool(description="Upload a binary attachment (image/PDF) and get a markdown embed "
+                          "snippet back (editor/admin only). 'content_base64' is the file bytes "
+                          "base64-encoded; allowed types: png/jpg/jpeg/gif/svg/webp/bmp/pdf, max "
+                          "10 MiB. Content-addressed (identical bytes dedupe). Returns {path, url, "
+                          "markdown} — paste 'markdown' into a document to embed it. Fails "
+                          "'validation' on bad base64, an unsupported type, or an oversize file.")
+    async def upload_attachment(
+        ctx: Context,
+        filename: Annotated[str, Field(description="Original filename (its extension picks the type).")],
+        content_base64: Annotated[str, Field(description="File bytes, base64-encoded.")],
+    ) -> dict:
+        def fn(p: Principal) -> dict:
+            try:
+                data = base64.b64decode(content_base64, validate=True)
+            except (binascii.Error, ValueError) as e:
+                raise ValidationError("content_base64 is not valid base64.") from e
+            res = docs.save_attachment(p, filename, data)
+            audit.record_tx(db, actor=p.username, via="mcp", action="attachment_upload",
+                            target=res["path"])
+            return {"ok": True, **res}
+        return await _call(ctx, fn, "upload_attachment")
+
+    @mcp.tool(description="Rename one frontmatter tag across the WHOLE vault (editor/admin only): "
+                          "every document tagged 'old' is retagged 'new'. Each document is its own "
+                          "CAS revision (not one transaction). NOTE: only the frontmatter 'tags' "
+                          "list is rewritten — tags written inline as #hashtags in the body are "
+                          "left as-is. Returns {dest, sources, docs_affected, docs_changed}.")
+    async def rename_tag(ctx: Context, old: str, new: str) -> dict:
+        return await _call(ctx, lambda p: docs.rename_tag(p, old, new), "rename_tag")
+
+    @mcp.tool(description="Merge several frontmatter tags into one across the whole vault "
+                          "(editor/admin only): every document tagged with any of 'sources' is "
+                          "retagged 'dest'. Same per-document CAS + inline-hashtag caveat as "
+                          "rename_tag. Returns {dest, sources, docs_affected, docs_changed}.")
+    async def merge_tags(
+        ctx: Context,
+        sources: Annotated[list[str], Field(description="Tags to fold into 'dest'.")],
+        dest: Annotated[str, Field(description="The surviving tag.")],
+    ) -> dict:
+        return await _call(ctx, lambda p: docs.merge_tags(p, sources, dest), "merge_tags")
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
                           "re-resolving links (editor/admin only). Fails 'conflict' if the "

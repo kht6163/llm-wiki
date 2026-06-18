@@ -77,6 +77,15 @@ _HERE = Path(__file__).parent
 _UPLOAD_CHUNK = 64 * 1024
 log = logging.getLogger("llm_wiki.web")
 
+# Explicit Content-Type for the (fixed, safe) attachment extension set so a served
+# file is never sniffed into a different type. Anything unexpected falls back to a
+# non-renderable octet-stream rather than letting the browser guess.
+_ATTACH_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
+    ".bmp": "image/bmp", ".pdf": "application/pdf",
+}
+
 
 class _AuthRequired(Exception):
     """Raised by the ``require_*`` route dependencies when there's no valid session.
@@ -606,13 +615,16 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.get("/attachments/{subpath:path}")
     def attachment(subpath: str, request: Request, _p: Principal = Depends(require_user)):
         target = docs.attachment_file(subpath)
+        # Serve with an explicit, known Content-Type so nosniff has a correct type to
+        # pin (unknown -> octet-stream, never a guessed renderable type).
+        media = _ATTACH_MIME.get(target.suffix.lower(), "application/octet-stream")
         # Hardened CSP overrides the site default (which permits inline scripts):
         # an SVG opened directly as a document must not execute scripts. The explicit
         # script-src 'none' is unambiguous, sandbox strips same-origin/JS as defense
         # in depth, and Content-Disposition: inline keeps it from being treated as a
         # download. <img> embedding is governed by the embedding page's CSP (the
         # resource's own CSP is ignored for subresource loads), so images still render.
-        return FileResponse(target, headers={
+        return FileResponse(target, media_type=media, headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; sandbox",
             "X-Content-Type-Options": "nosniff",
         })

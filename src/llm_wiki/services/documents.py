@@ -1222,6 +1222,41 @@ class DocumentService:
         updated = self.update(principal, doc["path"], doc["version"], new_content)
         return {"path": updated["path"], "version": updated["version"], "tags": updated["tags"]}
 
+    def merge_tags(self, principal: Principal, sources: list[str], dest: str) -> dict:
+        """Vault-wide tag cleanup (editor/admin only): rewrite every document's frontmatter
+        ``tags`` so each of ``sources`` becomes ``dest``. Each affected document is updated
+        through patch_tags (its own CAS revision), so this is not one transaction. Tags
+        written inline as ``#hashtags`` in the body are NOT rewritten (patch_tags only
+        manages the frontmatter list) — edit the body for those. Returns the dest, the
+        normalized sources, and how many documents were touched."""
+        if not principal.can_write:
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot rewrite tags (read/search only).")
+        dest = str(dest or "").strip().lstrip("#")
+        if not dest:
+            raise ValidationError("dest tag must not be empty.")
+        src = sorted({str(s).strip().lstrip("#") for s in (sources or []) if str(s).strip()} - {dest})
+        if not src:
+            raise ValidationError("no source tags to merge (after removing the dest tag).")
+        ph = ",".join("?" * len(src))
+        with self.db.reader() as conn:
+            paths = [r["path"] for r in conn.execute(
+                f"SELECT DISTINCT d.path FROM tags t JOIN documents d ON d.id=t.doc_id "
+                f"WHERE t.tag IN ({ph}) AND d.is_deleted=0 ORDER BY d.path", src)]
+        changed = 0
+        for p in paths:
+            before = self.get(p)["version"]
+            after = self.patch_tags(principal, p, add=[dest], remove=src)
+            if after["version"] != before:  # patch_tags is a no-op (no version bump) when there's no net change
+                changed += 1
+        return {"ok": True, "dest": dest, "sources": src,
+                "docs_affected": len(paths), "docs_changed": changed}
+
+    def rename_tag(self, principal: Principal, old: str, new: str) -> dict:
+        """Rename one frontmatter tag across the whole vault (editor/admin only) — a
+        single-source merge_tags. See merge_tags for the inline-hashtag caveat."""
+        return self.merge_tags(principal, [old], new)
+
     # ``title``/``tags`` are surfaced and edited through dedicated paths (the heading and
     # the tag list), so the generic property editor leaves them alone to avoid two ways
     # to write the same field.
@@ -1655,6 +1690,26 @@ class DocumentService:
                     (principal.user_id, d["id"], now_iso()))
                 fav = True
         return {"ok": True, "path": rel, "favorite": fav}
+
+    def set_favorite(self, principal: Principal, path: str, favorite: bool) -> dict:
+        """Idempotently set whether the current user has pinned this document (unlike
+        toggle_favorite, the resulting state is the one you asked for — friendlier for an
+        agent than a flip). Per-user, content-neutral, no write permission required."""
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.writer() as conn:
+            d = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+            if not d:
+                raise NotFoundError("No document at this path.", path=rel)
+            if favorite:
+                conn.execute(
+                    "INSERT OR IGNORE INTO favorites(user_id, doc_id, created_at) VALUES(?,?,?)",
+                    (principal.user_id, d["id"], now_iso()))
+            else:
+                conn.execute("DELETE FROM favorites WHERE user_id=? AND doc_id=?",
+                             (principal.user_id, d["id"]))
+        return {"ok": True, "path": rel, "favorite": favorite}
 
     def is_favorite(self, user_id: int, path: str) -> bool:
         norm = path_norm(normalize_rel_path(path))

@@ -150,3 +150,13 @@ def test_admin_role_form_has_no_oninput_autosubmit(client):
     html = client.get("/admin/users").text
     assert 'onchange="this.form.submit()"' not in html  # WCAG 3.2.2: explicit apply
     assert "적용" in html
+
+
+def test_attachment_served_with_explicit_media_type(ctx, principals, client):
+    # Uploaded attachments are served with an explicit Content-Type (no sniffing).
+    res = ctx.docs.save_attachment(principals["editor"], "pic.png", b"\x89PNG\r\n\x1a\nfake")
+    _login(client)
+    r = client.get(res["url"])
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("image/png")
+    assert r.headers.get("x-content-type-options") == "nosniff"

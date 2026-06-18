@@ -50,6 +50,7 @@ async def test_tools_registered(ctx):
         "list_folders", "create_folder", "delete_folder", "toggle_task",
         "set_document_properties",
         "get_or_create_daily_note", "list_trash", "restore_document", "purge_document",
+        "list_favorites", "set_favorite", "upload_attachment", "rename_tag", "merge_tags",
     }
     assert expected <= names, names
 
@@ -689,3 +690,82 @@ async def test_search_results_carry_link_counts_and_recency(editor_mcp):
     past = _payload(await editor_mcp.call_tool(
         "search_documents", {"query": "zymurgy", "mode": "bm25", "since": "2000-01-01"}))
     assert any(r["path"] == "kw.md" for r in past["results"])
+
+
+# -- MCP parity finish: favourites, attachment upload, tag rename/merge ----
+async def test_favorite_set_and_list(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "fav.md", "content": "# F\n\nx"}))
+    assert _payload(await editor_mcp.call_tool("list_favorites", {}))["count"] == 0
+    r = _payload(await editor_mcp.call_tool("set_favorite", {"path": "fav.md", "favorite": True}))
+    assert r["ok"] and r["favorite"] is True
+    listed = _payload(await editor_mcp.call_tool("list_favorites", {}))
+    assert listed["count"] == 1 and listed["documents"][0]["path"] == "fav.md"
+    # idempotent set True again — still one
+    _payload(await editor_mcp.call_tool("set_favorite", {"path": "fav.md", "favorite": True}))
+    assert _payload(await editor_mcp.call_tool("list_favorites", {}))["count"] == 1
+    # unpin
+    assert _payload(await editor_mcp.call_tool(
+        "set_favorite", {"path": "fav.md", "favorite": False}))["favorite"] is False
+    assert _payload(await editor_mcp.call_tool("list_favorites", {}))["count"] == 0
+
+
+async def test_set_favorite_missing_doc(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("set_favorite", {"path": "ghost.md"}))
+    assert d["ok"] is False and d["error"]["code"] == "not_found"
+
+
+async def test_upload_attachment_roundtrip(editor_mcp):
+    import base64
+    b64 = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-bytes").decode()
+    d = _payload(await editor_mcp.call_tool(
+        "upload_attachment", {"filename": "shot.png", "content_base64": b64}))
+    assert d["ok"] and d["url"].startswith("/attachments/") and d["markdown"].startswith("![")
+    assert d["path"].startswith("_attachments/")
+
+
+async def test_upload_attachment_rejects_bad_base64(editor_mcp):
+    d = _payload(await editor_mcp.call_tool(
+        "upload_attachment", {"filename": "x.png", "content_base64": "not!!base64"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_upload_attachment_forbidden_for_viewer(ctx, principals, monkeypatch):
+    import base64
+    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
+    mcp = create_mcp_server(ctx)
+    d = _payload(await mcp.call_tool("upload_attachment",
+                 {"filename": "x.png", "content_base64": base64.b64encode(b"x").decode()}))
+    assert d["ok"] is False and d["error"]["code"] == "forbidden"
+
+
+async def test_rename_tag_across_vault(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "a.md", "content": "# A", "tags": ["proj-x", "keep"]}))
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "b.md", "content": "# B", "tags": ["proj-x"]}))
+    d = _payload(await editor_mcp.call_tool("rename_tag", {"old": "proj-x", "new": "project-x"}))
+    assert d["ok"] and d["docs_affected"] == 2 and d["docs_changed"] == 2
+    a = _payload(await editor_mcp.call_tool("read_document", {"path": "a.md"}))
+    assert "project-x" in a["tags"] and "proj-x" not in a["tags"] and "keep" in a["tags"]
+
+
+async def test_merge_tags_folds_sources(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "m1.md", "content": "# M1", "tags": ["draft"]}))
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "m2.md", "content": "# M2", "tags": ["wip"]}))
+    d = _payload(await editor_mcp.call_tool(
+        "merge_tags", {"sources": ["draft", "wip"], "dest": "in-progress"}))
+    assert d["ok"] and d["docs_affected"] == 2
+    for path in ("m1.md", "m2.md"):
+        tags = _payload(await editor_mcp.call_tool("read_document", {"path": path}))["tags"]
+        assert "in-progress" in tags and "draft" not in tags and "wip" not in tags
+
+
+async def test_rename_tag_forbidden_for_viewer(ctx, principals, monkeypatch):
+    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
+    mcp = create_mcp_server(ctx)
+    d = _payload(await mcp.call_tool("rename_tag", {"old": "a", "new": "b"}))
+    assert d["ok"] is False and d["error"]["code"] == "forbidden"
