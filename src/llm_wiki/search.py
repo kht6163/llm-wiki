@@ -52,9 +52,123 @@ class SearchResult:
     updated_at: str | None = None     # last-modified timestamp, for recency sort/filter
     backlinks_count: int | None = None   # how many docs link TO this hit (popularity signal)
     outlinks_count: int | None = None    # how many links this hit points OUT to
+    content_length: int | None = None    # char length of the doc's latest body (triage short vs long)
+    section_depth: int | None = None     # nesting depth of the matched heading (1=top-level; None if none)
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class QueryFilters:
+    """In-query operators parsed out of a search string by ``parse_query_filters``.
+    ``title_contains`` each must be a (case-insensitive) substring of the title;
+    ``path_specs`` each is ``(pattern, is_glob)`` matched against the path (glob when it
+    holds ``*``/``?``, else a substring); ``has`` are structural predicates
+    (link/backlink/tag). Empty everywhere = no refinement (the default)."""
+    title_contains: tuple[str, ...] = ()
+    path_specs: tuple[tuple[str, bool], ...] = ()
+    has: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return bool(self.title_contains or self.path_specs or self.has)
+
+
+_NO_FILTERS = QueryFilters()
+_HAS_VALUES = ("link", "backlink", "tag")
+# title:/path:/has: operator + its value (a "quoted phrase" or a single bareword).
+_OP_RE = re.compile(r'\b(title|path|has):("(?:[^"\\]|\\.)*"|\S+)')
+
+
+def parse_query_filters(query: str) -> tuple[str, QueryFilters]:
+    """Split a raw search string into ``(free_text, QueryFilters)`` by lifting out the
+    ``title:`` / ``path:`` / ``has:`` operators so an agent can express a precise query
+    in ONE call instead of post-filtering a broad result set. ``title:`` and ``path:``
+    take a value (quote it for spaces: ``title:"design system"``); a ``path:`` value with
+    ``*``/``?`` is a glob, otherwise a substring. ``has:`` takes one of link|backlink|tag.
+    Raises ``ValidationError`` on an unknown ``has:`` value so the vocabulary is learnable.
+    The returned free text is what feeds FTS/vector retrieval (operators removed)."""
+    from .services.errors import ValidationError  # local import: avoid services<->search cycle
+
+    titles: list[str] = []
+    paths: list[tuple[str, bool]] = []
+    has: list[str] = []
+
+    def _take(m: re.Match) -> str:
+        key, raw = m.group(1), m.group(2)
+        val = (raw[1:-1].replace('\\"', '"') if raw.startswith('"') else raw).strip()
+        if not val:
+            return ""
+        if key == "title":
+            titles.append(val)
+        elif key == "path":
+            paths.append((val, any(c in val for c in "*?")))
+        else:  # has:
+            v = val.lower()
+            if v not in _HAS_VALUES:
+                raise ValidationError(
+                    f"has: must be one of {list(_HAS_VALUES)} (got {val!r}).")
+            has.append(v)
+        return " "
+
+    cleaned = " ".join(_OP_RE.sub(_take, query or "").split())
+    return cleaned, QueryFilters(tuple(titles), tuple(paths), tuple(has))
+
+
+def _like_escape(s: str) -> str:
+    """Escape LIKE wildcards in a literal so it matches verbatim (with ESCAPE '\\')."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _glob_to_like(s: str) -> str:
+    """Translate a user glob to a LIKE pattern: literal LIKE-specials are escaped first,
+    then ``*`` -> ``%`` and ``?`` -> ``_`` (anchored, since the user used wildcards)."""
+    return _like_escape(s).replace("*", "%").replace("?", "_")
+
+
+def _filter_sql(f: QueryFilters) -> tuple[str, list]:
+    """SQL WHERE fragment (+params) for the in-query operators, referencing the ``d``
+    (documents) alias. The SINGLE source of truth for the predicate: used both to
+    pre-filter the BM25 candidate window (recall — so the LIMIT picks docs that already
+    satisfy the operators) and to compute the authoritative allowed-id set that
+    re-filters the vector leg, so the two legs can't diverge."""
+    sql: list[str] = []
+    params: list = []
+    for term in f.title_contains:
+        sql.append(" AND LOWER(COALESCE(d.title,'')) LIKE ? ESCAPE '\\'")
+        params.append("%" + _like_escape(term.lower()) + "%")
+    for pat, is_glob in f.path_specs:
+        sql.append(" AND LOWER(d.path) LIKE ? ESCAPE '\\'")
+        params.append(_glob_to_like(pat.lower()) if is_glob
+                      else "%" + _like_escape(pat.lower()) + "%")
+    for h in f.has:
+        if h == "link":
+            sql.append(" AND d.id IN (SELECT src_doc_id FROM links)")
+        elif h == "backlink":
+            sql.append(" AND d.id IN (SELECT dst_doc_id FROM links WHERE is_resolved=1)")
+        elif h == "tag":
+            sql.append(" AND d.id IN (SELECT doc_id FROM tags)")
+    return "".join(sql), params
+
+
+def _filtered_ids(conn, ids: list[int], f: QueryFilters) -> set[int] | None:
+    """The subset of ``ids`` satisfying the in-query operators, in one batched query
+    (None when no operators are active — the caller then skips the membership check).
+    Re-applies the same ``_filter_sql`` predicate to BOTH legs' candidates so the vector
+    leg (which can't pre-filter in SQL) is held to the operators just like BM25."""
+    if not ids or not f.active:
+        return None
+    frag, fparams = _filter_sql(f)
+    out: set[int] = set()
+    for i in range(0, len(ids), 400):
+        batch = ids[i:i + 400]
+        ph = ",".join("?" * len(batch))
+        for r in conn.execute(
+            f"SELECT d.id FROM documents d WHERE d.id IN ({ph}){frag}", list(batch) + fparams
+        ):
+            out.add(r["id"])
+    return out
 
 
 def _fts_match(query: str) -> str | None:
@@ -67,7 +181,8 @@ def _fts_match(query: str) -> str | None:
 
 
 def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
-         tags: list[str] | None = None) -> list[tuple[int, float]]:
+         tags: list[str] | None = None, filters: QueryFilters = _NO_FILTERS,
+         ) -> list[tuple[int, float]]:
     # Push folder/tag/is_deleted filtering into the query so the LIMIT picks k docs
     # that ALREADY satisfy the filter. Filtering *after* a fixed top-k (the old
     # behavior) silently dropped a folder's matches whenever they ranked below the
@@ -83,6 +198,12 @@ def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
     for t in tags or []:
         sql.append(" AND d.id IN (SELECT doc_id FROM tags WHERE tag=?)")
         params.append(t)
+    # In-query operators (title:/path:/has:) ride the same push-down so a selective
+    # operator can't fall out of the BM25 window on a large corpus.
+    if filters.active:
+        frag, fparams = _filter_sql(filters)
+        sql.append(frag)
+        params += fparams
     sql.append(" ORDER BY rank LIMIT ?")
     params.append(limit)
     rows = conn.execute("".join(sql), params).fetchall()
@@ -150,6 +271,7 @@ def _rerank_boost(title: str | None, vi: dict | None, q_norm: str,
 
 def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
           folder: str | None, tags: list[str] | None,
+          filters: QueryFilters = _NO_FILTERS,
           params: FusionParams = DEFAULT_FUSION):
     """Core retrieval+RRF fusion shared by ``search_page`` and ``assemble_context``.
 
@@ -160,7 +282,7 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     BM25 pre-filters folder/tags in SQL; the vector leg can't, so callers still re-filter.
     """
     match = _fts_match(query) if mode in ("hybrid", "bm25") else None
-    bm_list = _bm25(conn, match, k, folder=folder, tags=tags) if match else []
+    bm_list = _bm25(conn, match, k, folder=folder, tags=tags, filters=filters) if match else []
     # vec0 KNN can't pre-filter by folder/tag, and collapsing chunk hits to docs
     # yields fewer distinct docs than chunks fetched. Over-fetch chunks so the
     # post-dedup/post-filter set still holds ~k distinct docs.
@@ -246,6 +368,27 @@ def _docs_meta_for_ids(conn, ids: list[int]) -> dict[int, dict]:
         f"FROM documents WHERE id IN ({ph})", ids)}
 
 
+def _doc_lengths_for_ids(conn, ids: list[int]) -> dict[int, int]:
+    """Character length of each document's latest-revision body, in ONE batched query
+    (doc_id -> length). ``LENGTH()`` is evaluated in SQLite so the body text never
+    crosses into Python — only the integer count does. Lets a search caller tell a short
+    overview note from a long reference doc (triage which hit to read first) without a
+    follow-up read per result. Works for unembedded docs too (revisions, not chunks)."""
+    if not ids:
+        return {}
+    out: dict[int, int] = {}
+    for i in range(0, len(ids), 400):
+        batch = ids[i:i + 400]
+        ph = ",".join("?" * len(batch))
+        for r in conn.execute(
+            f"SELECT r.doc_id AS doc_id, LENGTH(r.body) AS n FROM revisions r "
+            f"JOIN (SELECT doc_id, MAX(version) AS v FROM revisions WHERE doc_id IN ({ph}) "
+            f"GROUP BY doc_id) m ON m.doc_id=r.doc_id AND m.v=r.version", batch
+        ):
+            out[r["doc_id"]] = r["n"]
+    return out
+
+
 def _link_counts_for_ids(conn, ids: list[int]) -> dict[int, tuple[int, int]]:
     """(backlinks, outlinks) counts for many docs in two grouped queries — backlinks =
     resolved links pointing AT the doc, outlinks = links it points OUT to. doc_id ->
@@ -291,7 +434,10 @@ def search_page(
     ``truncated`` is True only when at least one more qualifying document existed
     beyond ``top_k`` — so a corpus of exactly ``top_k`` matches reports False (no
     misleading 'raise top_k' signal). ``results`` is capped at ``top_k``.
-    ``since``/``until`` (ISO-8601) bound the hits by ``updated_at`` (recency filter)."""
+    ``since``/``until`` (ISO-8601) bound the hits by ``updated_at`` (recency filter).
+    The query may carry ``title:``/``path:``/``has:`` operators (see ``parse_query_filters``)
+    which refine the text search in one call; an operator-only query (no search terms left)
+    is rejected with ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     SEARCH_QUERIES.labels(mode).inc()
@@ -299,11 +445,16 @@ def search_page(
     top_k = clamp_int(top_k, 1, 50)
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
     k = max(top_k * params.candidate_factor, params.candidate_min)
-    q_tokens = [t.lower() for t in _TOKEN_RE.findall(query or "")]
+    text, filters = parse_query_filters(query)
+    if not text:
+        from .services.errors import ValidationError  # local: avoid services<->search cycle
+        raise ValidationError(
+            "Provide search terms; operators (title:/path:/has:) only refine a text query.")
+    q_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
 
     with db.reader() as conn:
-        scored, vec_info, match = _rank(conn, embedder, query, mode=mode, k=k,
-                                        folder=folder, tags=tags, params=params)
+        scored, vec_info, match = _rank(conn, embedder, text, mode=mode, k=k,
+                                        folder=folder, tags=tags, filters=filters, params=params)
 
         # Batch-load the candidates' metadata (and, when a tag filter is active, their
         # tags) once up front instead of one SELECT per doc inside the loop — the loop
@@ -311,12 +462,17 @@ def search_page(
         scored_ids = [d for d, _ in scored]
         doc_meta = _docs_meta_for_ids(conn, scored_ids)
         filter_tags = _tags_for_doc_ids(conn, scored_ids) if tags else None
+        # The vector leg can't push title:/path:/has: into SQL, so compute the operator-
+        # satisfying id set once (None when no operators) and gate both legs on it.
+        allowed = _filtered_ids(conn, scored_ids, filters)
 
         results: list[SearchResult] = []
         result_ids: list[int] = []
         for did, score in scored:
             d = doc_meta.get(did)
             if not d or d["is_deleted"]:
+                continue
+            if allowed is not None and did not in allowed:
                 continue
             if not _passes_filters(d, folder, tags, conn, filter_tags):
                 continue
@@ -358,19 +514,22 @@ def search_page(
                 chunk_id=vi["chunk_id"] if vi is not None else None,
                 folder=d["folder"] or "",
                 updated_at=d["updated_at"],
+                section_depth=(heading_path.count(" > ") + 1) if heading_path else None,
             ))
             result_ids.append(did)
             if len(results) >= want:
                 break
 
-        # Attach each result's tags (one batched query) so an agent can group/filter
-        # the page without a follow-up read per hit.
+        # Attach each result's tags, link counts, and body length (one batched query each)
+        # so an agent can group/filter and triage short-vs-long without a follow-up read.
         if result_ids:
             tagmap = _tags_for_doc_ids(conn, result_ids)
             linkmap = _link_counts_for_ids(conn, result_ids)
+            lenmap = _doc_lengths_for_ids(conn, result_ids)
             for r, did in zip(results, result_ids, strict=True):
                 r.tags = tagmap.get(did, [])
                 r.backlinks_count, r.outlinks_count = linkmap.get(did, (0, 0))
+                r.content_length = lenmap.get(did)
     SEARCH_LATENCY.labels(mode).observe(time.perf_counter() - t0)
     return results[:top_k], len(results) > top_k
 
@@ -544,31 +703,42 @@ def assemble_context(
     expanded to neighbouring chunks while the budget allows and boundary-trimmed (never
     mid-word or mid-code-fence), in rank order until ``max_chars`` or ``max_sources``.
     Returns ``context`` (assembled text with ``[n]`` markers), the ``sources`` those
-    markers cite, and ``truncated`` (more relevant content existed beyond the budget)."""
+    markers cite, and ``truncated`` (more relevant content existed beyond the budget).
+    The question may carry the same ``title:``/``path:``/``has:`` operators as search
+    (see ``parse_query_filters``); an operator-only question is rejected with
+    ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     max_chars = clamp_int(max_chars, 200, 24000)
     max_sources = clamp_int(max_sources, 1, 20)
     k = max(max_sources * params.candidate_factor, params.candidate_min)
-    q_tokens = [t.lower() for t in _TOKEN_RE.findall(question or "")]
+    text, filters = parse_query_filters(question)
+    if not text:
+        from .services.errors import ValidationError  # local: avoid services<->search cycle
+        raise ValidationError(
+            "Provide a question; operators (title:/path:/has:) only refine a text query.")
+    q_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
 
     sources: list[dict] = []
     parts: list[str] = []
     total = 0
     truncated = False
     with db.reader() as conn:
-        scored, vec_info, _match = _rank(conn, embedder, question, mode=mode, k=k,
-                                         folder=folder, tags=tags, params=params)
+        scored, vec_info, _match = _rank(conn, embedder, text, mode=mode, k=k,
+                                         folder=folder, tags=tags, filters=filters, params=params)
         # One batched metadata (and tag) load for all candidates, not a SELECT per doc.
         scored_ids = [d for d, _ in scored]
         doc_meta = _docs_meta_for_ids(conn, scored_ids)
         filter_tags = _tags_for_doc_ids(conn, scored_ids) if tags else None
+        allowed = _filtered_ids(conn, scored_ids, filters)  # gate the vector leg on operators
         for did, score in scored:
             if len(sources) >= max_sources:
                 truncated = True
                 break
             d = doc_meta.get(did)
             if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn, filter_tags):
+                continue
+            if allowed is not None and did not in allowed:
                 continue
 
             remaining = max_chars - total

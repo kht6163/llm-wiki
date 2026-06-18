@@ -103,6 +103,34 @@ async def test_search_rejects_empty_query(editor_mcp):
     assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
+async def test_search_path_operator_and_triage_metadata(editor_mcp):
+    # An agent narrows by path in ONE call (no post-filtering) and reads content_length/
+    # section_depth off each hit to triage which to open without a follow-up read.
+    await editor_mcp.call_tool("create_document", {
+        "path": "guide/intro.md", "content": "# Intro Guide\n\n## Setup\n\nwidget install steps " + "x " * 40})
+    await editor_mcp.call_tool("create_document", {
+        "path": "notes/misc.md", "content": "# Misc\n\nwidget mention only"})
+    d = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "widget path:guide/*", "mode": "bm25"}))
+    assert d["ok"]
+    paths = {r["path"] for r in d["results"]}
+    assert "guide/intro.md" in paths and "notes/misc.md" not in paths
+    hit = next(r for r in d["results"] if r["path"] == "guide/intro.md")
+    assert isinstance(hit["content_length"], int) and hit["content_length"] > 0
+    assert hit["section_depth"] is None or hit["section_depth"] >= 1
+
+
+async def test_search_operator_only_query_is_validation(editor_mcp):
+    await editor_mcp.call_tool("create_document", {"path": "x.md", "content": "# X\n\nbody"})
+    d = _payload(await editor_mcp.call_tool("search_documents", {"query": "title:X"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_search_unknown_has_is_validation(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("search_documents", {"query": "widget has:bogus"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
 async def test_create_then_read_roundtrip(editor_mcp):
     created = _payload(await editor_mcp.call_tool("create_document", {"path": "m.md", "content": "# M\n\nbody"}))
     assert created["ok"] and created["version"] == 1

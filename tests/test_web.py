@@ -71,6 +71,26 @@ def test_search_no_results_shows_empty_state(client):
     assert "검색 결과가 없습니다" in body
 
 
+def test_search_operator_filters_by_path(client):
+    login(client, "alice")
+    create_doc(client, "ml/intro.md", "# Intro\n\ngradient descent method")
+    create_doc(client, "ops/intro.md", "# Intro\n\ngradient descent method")
+    body = client.get("/search?q=" + quote("gradient path:ml/*") + "&mode=bm25").text
+    # The sidebar tree lists every doc, so scope the assertion to the results list.
+    results = body.split('<ul class="results">')[1].split("</ul>")[0]
+    assert "ml/intro.md" in results and "ops/intro.md" not in results
+
+
+def test_search_operator_only_query_renders_inline_error(client):
+    # An operator-only query is a client error; the form re-renders with the message
+    # at 400 instead of the full error page.
+    login(client, "alice")
+    r = client.get("/search?q=" + quote("title:X"))
+    assert r.status_code == 400
+    assert "error" in r.text  # the search form's inline error block
+    assert "<form" in r.text  # still the search page, not the bare error template
+
+
 def test_view_renders_frontmatter_as_properties_panel(client):
     # Frontmatter must not leak as a setext heading; extra keys (not title/tags)
     # surface as the monospace Properties panel instead.

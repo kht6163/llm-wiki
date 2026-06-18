@@ -479,9 +479,16 @@ def create_web_app(app: AppContext) -> FastAPI:
             if read_limiter.record_failure(rkey):
                 audit.record_tx(db, actor=_p.username, via="web", action="read_rate_limited",
                                 outcome="blocked", detail="search")
-            hits, truncated = docs.search_page(
-                q, mode=mode, top_k=top_k, folder=folder or None, tags=tags)
-            results = [r.to_dict() for r in hits]
+            try:
+                hits, truncated = docs.search_page(
+                    q, mode=mode, top_k=top_k, folder=folder or None, tags=tags)
+                results = [r.to_dict() for r in hits]
+            except ValidationError as e:
+                # A malformed query (e.g. operator-only, or has:<unknown>) is a client
+                # error — re-render the form inline with the message, not the error page.
+                return render("search.html", request, status=400, q=q, mode=mode, top_k=top_k,
+                              folder=folder or "", tag=tag or "", results=[], truncated=False,
+                              folders=docs.folders(), error=e.message)
         return render("search.html", request, q=q, mode=mode, top_k=top_k,
                       folder=folder or "", tag=tag or "", results=results,
                       truncated=truncated, folders=docs.folders())

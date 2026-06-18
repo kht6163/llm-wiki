@@ -20,6 +20,7 @@ from .config import ConfigError, get_settings
 from .db import SCHEMA_VERSION, get_meta
 from .mcp_server import create_mcp_server
 from .runtime import build_context
+from .services import audit
 from .services import users as users_svc
 from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
@@ -159,6 +160,16 @@ def _init_db() -> int:
     return 0
 
 
+def _os_actor() -> str:
+    """Best-effort OS login name to attribute a CLI credential action to. The audit
+    row also records via='cli', so this just answers 'which operator on the host ran
+    it'. Falls back to '-' when the login name can't be resolved."""
+    try:
+        return f"cli:{getpass.getuser()}"
+    except Exception:
+        return "-"
+
+
 def _create_admin(args) -> int:
     ctx = build_context(full=False)
     if users_svc.count_admins(ctx.db) > 0 and not args.force:
@@ -167,6 +178,11 @@ def _create_admin(args) -> int:
     username = args.username or input("Admin username: ").strip()
     password = args.password or getpass.getpass("Password: ")
     uid = create_user(ctx.db, username, password, "admin")
+    # Mirror the web admin path's audit trail (action=user_create) so account creation
+    # is traceable on EVERY surface, not just the UI — credential changes are the most
+    # security-sensitive thing the CLI does.
+    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="user_create",
+                    target=username, detail="role=admin")
     print(f"Created admin '{username}' (id={uid}).")
     return 0
 
@@ -176,6 +192,8 @@ def _create_user(args) -> int:
     username = args.username or input("Username: ").strip()
     password = args.password or getpass.getpass("Password: ")
     uid = create_user(ctx.db, username, password, args.role)
+    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="user_create",
+                    target=username, detail=f"role={args.role}")
     print(f"Created user '{username}' (id={uid}, role={args.role}).")
     return 0
 
@@ -188,6 +206,10 @@ def _create_api_key(args) -> int:
         print(f"No such user: {args.username}")
         return 1
     token = create_api_key(ctx.db, row["id"], args.name)
+    # Minting a key is a credential event the web path audits (action=key_mint); record
+    # it from the CLI too so a leaked-key investigation can see CLI-minted keys.
+    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="key_mint",
+                    target=args.name, detail=f"user={args.username}")
     print(token)
     print("(store this now — it is not shown again)", flush=True)
     return 0
@@ -319,8 +341,6 @@ def _print_import_report(report: dict, src: Path, into: str, dry_run: bool,
 
 
 def _prune(args) -> int:
-    from .services import audit
-
     ctx = build_context(full=False)
     apply = args.force
     rev = ctx.docs.prune_revisions(keep=args.keep, apply=apply)

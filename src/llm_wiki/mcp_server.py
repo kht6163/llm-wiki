@@ -214,11 +214,21 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "(its breadcrumb); pass 'heading' to read_document(section=) to read just "
                           "that section, or feed a hit's 'chunk_ordinal' to read_chunk to pull that "
                           "exact passage (plus neighbours) token-cheaply. Each hit also carries "
-                          "'updated_at' and 'backlinks_count'/'outlinks_count' (how many docs link "
-                          "to/from it — a popularity/connectedness signal to rank or triage by). "
-                          "'since'/'until' (ISO-8601) bound hits to an updated_at window (recency "
-                          "filter). Rejects an empty query with code 'validation' (so 0 results "
-                          "means 'no matches', never 'bad query').")
+                          "'updated_at', 'backlinks_count'/'outlinks_count' (how many docs link "
+                          "to/from it — a popularity/connectedness signal to rank or triage by), "
+                          "'content_length' (the doc's body length in chars — triage a short "
+                          "overview from a long reference without reading it) and 'section_depth' "
+                          "(nesting depth of the matched heading, 1=top-level; null if none). "
+                          "The query itself supports inline operators to refine in ONE call instead "
+                          "of post-filtering: title:WORD (or title:\"a phrase\") requires WORD in the "
+                          "title; path:GLOB restricts by path (path:docs/* glob, or path:guide "
+                          "substring); has: one of link|backlink|tag requires that structure (an "
+                          "unknown has: value is rejected with code 'validation', not silently "
+                          "empty). Operators must accompany search terms (an operator-only query is "
+                          "also rejected with 'validation'). "
+                          "'folder'/'tags'/'since'/'until' (ISO-8601 updated_at window) are the "
+                          "structured equivalents. Rejects an empty query with code 'validation' (so "
+                          "0 results means 'no matches', never 'bad query').")
     async def search_documents(
         ctx: Context,
         query: str,
@@ -246,13 +256,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     @mcp.tool(description="Retrieve and assemble citation-tagged context for a question — a "
                           "one-call RAG primitive. Ranks documents with the same hybrid "
-                          "retriever as search, then concatenates each top document's most "
+                          "retriever (and the same in-query title:/path:/has: operators) as "
+                          "search, then concatenates each top document's most "
                           "relevant passage (in rank order) up to 'max_chars'/'max_sources'. "
                           "Returns 'context' (assembled text with [n] markers), 'sources' (what "
                           "each [n] cites: path, heading, version, score), and 'truncated' (more "
                           "relevant content existed beyond the budget). Prefer this over "
                           "search+read round-trips when you just need grounded context to answer. "
-                          "Rejects an empty question with code 'validation'.")
+                          "Rejects an empty or operator-only question with code 'validation'.")
     async def assemble_context(
         ctx: Context,
         question: str,

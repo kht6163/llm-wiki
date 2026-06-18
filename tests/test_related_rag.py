@@ -85,6 +85,24 @@ def test_assemble_context_rejects_empty_question(ctx):
         ctx.docs.assemble_context("   ")
 
 
+def test_assemble_context_honors_path_operator(ctx, principals):
+    # The RAG primitive accepts the same title:/path:/has: operators as search, so an
+    # agent can scope grounded context in one call (parity with search_documents).
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "work/report.md", "quarterly sales report figures revenue")
+    docs.create(p, "home/report.md", "home renovation report budget plan")
+    res = docs.assemble_context("report path:work/*", mode="bm25", max_sources=5)
+    assert res["count"] >= 1
+    assert all(s["path"].startswith("work/") for s in res["sources"])
+
+
+def test_assemble_context_rejects_operator_only_question(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "x.md", "# X\n\nbody text here")
+    with pytest.raises(ValidationError):
+        docs.assemble_context("path:work/*", mode="bm25")
+
+
 def test_assemble_context_expands_to_neighbour_chunks(ctx, principals):
     # A generous budget should pull neighbouring chunks around the matched one, so a
     # passage straddling a chunk boundary isn't cut in half (read_chunk-style expansion).
