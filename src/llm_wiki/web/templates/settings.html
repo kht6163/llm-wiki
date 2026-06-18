@@ -3,6 +3,7 @@
 {% block title %}API 키{% endblock %}
 {% block content %}
 <h1>API 키 (MCP 접속용)</h1>
+{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
 {% if new_key %}
 <div class="newkey">
   <strong>새 키 (이번 한 번만 표시됩니다):</strong>

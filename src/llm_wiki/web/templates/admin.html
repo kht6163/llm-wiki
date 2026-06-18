@@ -22,9 +22,11 @@
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/role" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-          <select name="role" onchange="this.form.submit()">
+          <label class="visually-hidden" for="role-{{ u.id }}">{{ u.username }} 역할</label>
+          <select name="role" id="role-{{ u.id }}">
             {% for r in ['admin','editor','viewer'] %}<option value="{{ r }}" {{ 'selected' if u.role==r }}>{{ r }}</option>{% endfor %}
           </select>
+          <button class="ghost">적용</button>
         </form>
       </td>
       <td>

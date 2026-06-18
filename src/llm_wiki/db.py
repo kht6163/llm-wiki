@@ -100,6 +100,16 @@ CREATE TABLE IF NOT EXISTS tags (
 -- subquery (search + listing) is covered/index-only instead of fetching each row.
 CREATE INDEX IF NOT EXISTS idx_tags_tag_doc ON tags(tag, doc_id);
 
+-- Per-user favourites (pinned documents), surfaced at the top of the sidebar. A new
+-- IF-NOT-EXISTS table, so it lands on existing DBs via ensure_schema without a numbered
+-- migration. Both FKs cascade, so deleting a user or hard-purging a doc clears its pins.
+CREATE TABLE IF NOT EXISTS favorites (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, doc_id)
+);
+
 CREATE TABLE IF NOT EXISTS revisions (
   id           INTEGER PRIMARY KEY,
   doc_id       INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,

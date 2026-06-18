@@ -138,7 +138,14 @@ class RequestIdMiddleware:
 
 # -- response headers ------------------------------------------------------
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    """Add baseline security response headers to every response."""
+    """Add baseline security response headers to every response. Pass ``hsts=True``
+    (wired to ``cookie_secure``, i.e. an HTTPS deployment) to also emit
+    Strict-Transport-Security; it is omitted on plain HTTP, where a browser would
+    ignore it anyway and where pinning a host with no TLS would be a footgun."""
+
+    def __init__(self, app, hsts: bool = False) -> None:
+        super().__init__(app)
+        self.hsts = hsts
 
     async def dispatch(self, request: Request, call_next):
         resp = await call_next(request)
@@ -146,4 +153,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         resp.headers.setdefault("X-Frame-Options", "DENY")
         resp.headers.setdefault("Referrer-Policy", "same-origin")
         resp.headers.setdefault("Content-Security-Policy", CSP)
+        if self.hsts:
+            # 1 year, include subdomains. Only sent when serving over HTTPS so it can't
+            # strand a plain-HTTP host. (Add 'preload' only if you submit to the list.)
+            resp.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         return resp

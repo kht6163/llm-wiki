@@ -20,7 +20,13 @@ from .ratelimit import RateLimiter
 from .runtime import AppContext
 from .services import audit
 from .services.auth import Principal, principal_from_api_key
-from .services.errors import ForbiddenError, UnauthorizedError, ValidationError, WikiError
+from .services.errors import (
+    ConflictError,
+    ForbiddenError,
+    UnauthorizedError,
+    ValidationError,
+    WikiError,
+)
 from .util import clamp_int, normalize_client_ip
 
 log = logging.getLogger("llm_wiki.mcp")
@@ -184,9 +190,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "Each hit may include 'heading' (the matched section) and 'heading_path' "
                           "(its breadcrumb); pass 'heading' to read_document(section=) to read just "
                           "that section, or feed a hit's 'chunk_ordinal' to read_chunk to pull that "
-                          "exact passage (plus neighbours) token-cheaply. Rejects an empty query "
-                          "with code 'validation' (so 0 results means 'no matches', never 'bad "
-                          "query').")
+                          "exact passage (plus neighbours) token-cheaply. Each hit also carries "
+                          "'updated_at' and 'backlinks_count'/'outlinks_count' (how many docs link "
+                          "to/from it — a popularity/connectedness signal to rank or triage by). "
+                          "'since'/'until' (ISO-8601) bound hits to an updated_at window (recency "
+                          "filter). Rejects an empty query with code 'validation' (so 0 results "
+                          "means 'no matches', never 'bad query').")
     async def search_documents(
         ctx: Context,
         query: str,
@@ -195,12 +204,16 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         top_k: Annotated[int, Field(ge=1, le=50, description="Max hits (1..50).")] = 10,
         folder: Annotated[str | None, Field(description="Restrict to this folder subtree.")] = None,
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
+        since: Annotated[str | None,
+                         Field(description="ISO-8601 lower bound on updated_at (recency filter).")] = None,
+        until: Annotated[str | None,
+                         Field(description="ISO-8601 upper bound on updated_at.")] = None,
     ) -> dict:
         def fn(_p: Principal) -> dict:
             if not query or not query.strip():
                 raise ValidationError("query must not be empty.")
             results, truncated = docs.search_page(query, mode=mode, top_k=top_k,
-                                                  folder=folder, tags=tags)
+                                                  folder=folder, tags=tags, since=since, until=until)
             capped = clamp_int(top_k, 1, 50)
             return {"ok": True, "mode": mode, "top_k": capped, "count": len(results),
                     "truncated": truncated,
@@ -681,6 +694,25 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             p, path, line=line, index=index, base_version=base_version), return_content)},
             "toggle_task", shape=lambda d: _shape_conflict(d, return_content))
 
+    @mcp.tool(description="Open today's (or a given date's) daily note, creating it if absent — the "
+                          "journaling entry point. Reading an existing note works for any role; "
+                          "CREATING one needs editor/admin. 'date' is YYYY-MM-DD (default: today, "
+                          "UTC); 'folder' is where daily notes live (default 'daily', so the path is "
+                          "e.g. daily/2026-06-18.md). Returns the note (path/version/content) plus "
+                          "'created' (true if just made). Pair with append_to_document(path=…) to "
+                          "log timestamped entries into it.")
+    async def get_or_create_daily_note(
+        ctx: Context,
+        date: Annotated[str | None, Field(description="YYYY-MM-DD; default today (UTC).")] = None,
+        folder: Annotated[str, Field(description="Folder daily notes live in.")] = "daily",
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="'full' echoes the body; 'metadata' (default) "
+                                        "omits it, giving a char count.")] = "metadata",
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(
+            docs.daily_note(p, date, folder=folder), return_content)},
+            "get_or_create_daily_note")
+
     @mcp.tool(description="Create an empty folder so it persists as an organizational unit before "
                           "it holds any documents (editor/admin only) — 'structure first, content "
                           "later'. Fails 'conflict' if a folder already exists there (including one "
@@ -704,7 +736,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         ctx: Context, path: str, new_path: str,
         fix_references: Annotated[bool, Field(
             description="Rewrite inbound links in other docs to the new path.")] = False,
+        dry_run: Annotated[bool, Field(
+            description="Preview only: report whether the destination is free and which "
+                        "inbound links fix_references would rewrite, WITHOUT moving.")] = False,
     ) -> dict:
+        if dry_run:
+            return await _call(ctx, lambda _p: {"ok": True, "dry_run": True,
+                               **docs.move_preview(path, new_path)}, "move_document")
         return await _call(ctx, lambda p: {"ok": True, **docs.move(
             p, path, new_path, fix_references=fix_references)}, "move_document")
 
@@ -724,6 +762,32 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "{ok, path, deleted: true} on success.")
     async def delete_document(ctx: Context, path: str, base_version: int | None = None) -> dict:
         return await _call(ctx, lambda p: docs.delete(p, path, base_version), "delete_document")
+
+    @mcp.tool(description="List soft-deleted documents (the trash), most-recently-deleted first. "
+                          "Each carries path/title/version/folder and when/by whom it was deleted. "
+                          "Feed a path to restore_document (undo) or purge_document (permanent).")
+    async def list_trash(
+        ctx: Context,
+        limit: Annotated[int, Field(ge=1, le=1000, description="Max entries (1..1000).")] = 100,
+        offset: Annotated[int, Field(ge=0, description="Paging offset.")] = 0,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            items = docs.list_deleted(limit=limit, offset=offset)
+            return {"ok": True, "count": len(items), "offset": offset, "documents": items}
+        return await _call(ctx, fn, "list_trash")
+
+    @mcp.tool(description="Restore a soft-deleted document from the trash (editor/admin only): "
+                          "un-tombstone it and rebuild its search/graph indexes from the "
+                          "pre-delete body. Fails 'validation' if it isn't deleted, 'not_found' "
+                          "if there's no such path.")
+    async def restore_document(ctx: Context, path: str) -> dict:
+        return await _call(ctx, lambda p: docs.restore(p, path), "restore_document")
+
+    @mcp.tool(description="Permanently delete a TRASHED document and ALL its history (admin only) — "
+                          "there is no undo. Refuses a live document with 'validation' (soft-delete "
+                          "it first); 'not_found' if there's no such path.")
+    async def purge_document(ctx: Context, path: str) -> dict:
+        return await _call(ctx, lambda p: docs.purge(p, path), "purge_document")
 
     def _apply_op(principal: Principal, raw: dict) -> dict:
         """Dispatch one batch operation to the matching single-document service call
@@ -786,6 +850,53 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                          base_version=raw.get("base_version"))
         raise ValidationError(f"unknown op {op!r}.")
 
+    _LIVE_DOC_OPS = {"update", "patch", "replace_section", "append_section", "append",
+                     "patch_tags", "toggle_task", "set_properties", "delete", "move"}
+
+    def _preview_op(principal: Principal, raw: dict) -> dict:
+        """Read-only feasibility check for one batch op (dry run): predict whether it would
+        apply or fail — forbidden/validation/conflict/not_found — WITHOUT mutating anything.
+        Best-effort: a green preview doesn't guarantee success against a concurrent edit."""
+        op, path = raw.get("op"), raw.get("path")
+        rep = {"op": op, "path": path, "ok": True}
+        try:
+            if not principal.can_write:
+                raise ForbiddenError(f"Role '{principal.role}' cannot modify documents.")
+            if op == "rename_references":
+                old, new = raw.get("old_path") or raw.get("path"), raw.get("new_path")
+                if not isinstance(old, str) or not isinstance(new, str):
+                    raise ValidationError("'rename_references' requires 'old_path'/'path' and 'new_path'.")
+                return {**rep, "path": old}
+            if not isinstance(path, str) or not path:
+                raise ValidationError("each operation needs a 'path' string.")
+            if op == "create":
+                if docs.exists(path):
+                    raise ConflictError("A document already exists at this path.", path=path)
+                return rep
+            if op in ("create_folder", "delete_folder"):
+                return rep  # cheap to attempt; folder conflicts surface on apply
+            if op in _LIVE_DOC_OPS:
+                info = docs.info(path)  # raises not_found if missing/deleted
+                bv = raw.get("base_version")
+                if bv is not None and int(bv) != info["version"]:
+                    return {**rep, "ok": False, "error": {
+                        "code": "conflict", "message": f"base_version {bv} != current {info['version']}",
+                        "current_version": info["version"]}}
+                if op == "move":
+                    new = raw.get("new_path")
+                    if not new:
+                        raise ValidationError("'move' requires 'new_path'.")
+                    if docs.exists(new):
+                        raise ConflictError("Destination already exists.", path=new)
+                return rep
+            if op == "restore":
+                return rep  # tombstone state isn't cheaply checkable here; verified on apply
+            raise ValidationError(f"unknown op {op!r}.")
+        except WikiError as e:
+            return {**rep, "ok": False, "error": e.to_dict()["error"]}
+        except Exception as e:  # bad op shape (unsafe path, bad field, …)
+            return {**rep, "ok": False, "error": {"code": "validation", "message": str(e)[:200]}}
+
     @mcp.tool(description="Apply many single-document edits in ONE call (editor/admin only). "
                           "'operations' is a list of {op, path, ...args}; op is one of create, "
                           "update, patch, replace_section, append_section, append, patch_tags, "
@@ -803,6 +914,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                               Field(description="Edit operations, applied in order.")],
         stop_on_error: Annotated[bool, Field(
             description="Stop at the first failing op (already-applied ops are kept).")] = True,
+        dry_run: Annotated[bool, Field(
+            description="Preview only: per-op feasibility report (would-apply / would-fail "
+                        "with the predicted error) WITHOUT mutating anything. Use to pre-flight "
+                        "a sweep. Best-effort — a green preview can still lose a CAS race.")] = False,
         return_content: Annotated[Literal["full", "metadata"], Field(
             description="On a per-op conflict, 'metadata' (default) omits the competing "
                         "document's current_content (current_chars given) to keep sweep "
@@ -815,6 +930,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 raise ValidationError("operations must be a non-empty list.")
             if len(operations) > 100:
                 raise ValidationError("too many operations (max 100 per call).")
+            if dry_run:
+                preview = [_preview_op(principal, raw if isinstance(raw, dict) else {})
+                           for raw in operations]
+                ok_n = sum(1 for r in preview if r["ok"])
+                return {"ok": True, "dry_run": True, "would_apply": ok_n,
+                        "would_fail": len(preview) - ok_n, "results": preview}
             results: list[dict] = []
             for raw in operations:
                 if not isinstance(raw, dict):

@@ -35,9 +35,11 @@
     <button class="ribbon-btn" type="button" data-action="switcher" title="빠른 이동 (Ctrl/⌘+O)" aria-label="빠른 이동">{{ icon("search") }}</button>
     <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">{{ icon("command") }}</button>
     {% if user.can_write %}<a class="ribbon-btn" href="/new" {% if nav_path == '/new' %}aria-current="page"{% endif %} title="새 문서" aria-label="새 문서">{{ icon("file-plus") }}</a>{% endif %}
+    {% if user.can_write %}<a class="ribbon-btn" href="/daily" title="오늘 노트" aria-label="오늘 노트">{{ icon("calendar") }}</a>{% endif %}
     <a class="ribbon-btn" href="/graph" {% if nav_path == '/graph' %}aria-current="page"{% endif %} title="그래프" aria-label="그래프">{{ icon("network") }}</a>
     {% if user.can_write %}<a class="ribbon-btn" href="/activity" {% if nav_path == '/activity' %}aria-current="page"{% endif %} title="활동" aria-label="활동">{{ icon("activity") }}</a>{% endif %}
     <a class="ribbon-btn" href="/broken-links" {% if nav_path == '/broken-links' %}aria-current="page"{% endif %} title="깨진 링크" aria-label="깨진 링크">{{ icon("unlink") }}</a>
+    {% if user.can_write %}<a class="ribbon-btn" href="/trash" {% if nav_path == '/trash' %}aria-current="page"{% endif %} title="휴지통" aria-label="휴지통">{{ icon("trash") }}</a>{% endif %}
     <span class="ribbon-spacer"></span>
     <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">{{ icon("contrast") }}</button>
     <a class="ribbon-btn" href="/settings" {% if nav_path.startswith('/settings') %}aria-current="page"{% endif %} title="API 키 / 설정" aria-label="설정">{{ icon("settings") }}</a>
@@ -61,6 +63,16 @@
           <span class="tt-spacer"></span>
           <button class="tt-btn tt-icon" type="button" data-action="collapse-all" title="모두 접기" aria-label="모두 접기">{{ icon("collapse") }}</button>
         </div>
+        {% if nav_favorites %}
+        <nav class="sb-favorites" aria-label="즐겨찾기">
+          <div class="sb-favorites-head">{{ icon("star") }} 즐겨찾기</div>
+          <ul>
+            {% for f in nav_favorites %}
+            <li><a href="/doc/{{ f.path|urlpath }}" {% if nav_path == '/doc/' + f.path %}aria-current="page"{% endif %}>{{ f.title }}</a></li>
+            {% endfor %}
+          </ul>
+        </nav>
+        {% endif %}
         <div class="file-tree" id="file-tree">
           {% from "_tree.html" import render_tree %}
           {% if nav_tree.folders or nav_tree.docs %}
@@ -72,7 +84,7 @@
       </div>
       <div class="sb-panel" data-panel="search" id="sb-panel-search" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-search" hidden>
         <input type="search" class="sb-search-input" id="sb-search-input" placeholder="문서 검색…" aria-label="사이드바 검색">
-        <div class="sb-search-results" id="sb-search-results"></div>
+        <div class="sb-search-results" id="sb-search-results" role="region" aria-label="검색 결과" aria-live="polite"></div>
       </div>
       <div class="sb-panel" data-panel="tags" id="sb-panel-tags" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-tags" hidden>
         <ul class="sb-taglist">

@@ -204,8 +204,10 @@ def create_web_app(app: AppContext) -> FastAPI:
     # field rendered from render()'s context.
     web = FastAPI(title="llm-wiki", dependencies=[Depends(enforce_csrf)])
     secret = get_or_create_session_secret(db, app.settings.session_secret)
-    web.add_middleware(SecurityHeadersMiddleware)
+    web.add_middleware(SecurityHeadersMiddleware, hsts=app.settings.cookie_secure)
     web.add_middleware(PrometheusMiddleware)
+    # SessionMiddleware always sets the cookie HttpOnly; same_site=lax + (in HTTPS
+    # deployments) Secure round out the session-cookie hardening.
     web.add_middleware(
         SessionMiddleware, secret_key=secret, same_site="lax",
         https_only=app.settings.cookie_secure, max_age=14 * 86400,
@@ -215,6 +217,9 @@ def create_web_app(app: AppContext) -> FastAPI:
     web.add_middleware(RequestIdMiddleware)
     web.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
     login_limiter = RateLimiter()
+    # Cap API-key minting per user so a hijacked session can't fan out a pile of
+    # long-lived keys (which, by policy, only password-change/deactivation revokes).
+    key_limiter = RateLimiter(max_attempts=10, window_s=300.0)
 
     def user(request: Request) -> Principal | None:
         return principal_from_session(db, request.session.get("sid"))
@@ -231,6 +236,9 @@ def create_web_app(app: AppContext) -> FastAPI:
             # not per page. /tags and /api/tree still read canonical DB via tree()/tags().
             ctx.setdefault("nav_tree", docs.nav_tree())
             ctx.setdefault("nav_tags", docs.nav_tags())
+            # Favourites are per-user (can't share the global nav cache), so read them
+            # per request — a small indexed lookup keyed by user_id.
+            ctx.setdefault("nav_favorites", docs.list_favorites(p.user_id))
         ctx.update(kw)
         return templates.TemplateResponse(request, name, ctx, status_code=status)
 
@@ -374,10 +382,15 @@ def create_web_app(app: AppContext) -> FastAPI:
         except Exception:
             ready = False
         code = 200 if ready else 503
-        return JSONResponse({
+        body = {
             "ok": ready, "ready": ready, "model_loaded": embedder.is_loaded,
             "embedding_model": embedder.model_name, **details,
-        }, status_code=code)
+        }
+        # Surface background-embedding-worker health (running / consecutive failures /
+        # last error / backlog) so a silently stalled worker is visible at a glance.
+        if app.embed_worker is not None:
+            body["embed_worker"] = app.embed_worker.status()
+        return JSONResponse(body, status_code=code)
 
     @web.get("/metrics")
     def metrics():
@@ -412,6 +425,18 @@ def create_web_app(app: AppContext) -> FastAPI:
     def tags_page(request: Request, _p: Principal = Depends(require_user)):
         return render("tags.html", request, tags=docs.tags())
 
+    @web.get("/daily")
+    def daily(request: Request, p: Principal = Depends(require_user)):
+        # Open (creating if absent) today's daily note and jump to it — the journaling
+        # entry point. Idempotent: returns the existing note for any role; only creating
+        # one needs write (a viewer hitting a missing note gets a flash + home).
+        try:
+            d = docs.daily_note(p)
+        except WikiError as e:
+            request.session["flash"] = e.message
+            return RedirectResponse("/", status_code=303)
+        return RedirectResponse("/doc/" + quote(d["path"]), status_code=303)
+
     @web.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20,
                     folder: str | None = None, tag: str | None = None,
@@ -438,6 +463,32 @@ def create_web_app(app: AppContext) -> FastAPI:
                           _p: Principal = Depends(require_user)):
         data = docs.broken_links(limit=clamp_int(limit, 1, 2000))
         return render("broken_links.html", request, count=data["count"], links=data["links"])
+
+    @web.get("/trash", response_class=HTMLResponse)
+    def trash_page(request: Request, p: Principal = Depends(require_user)):
+        if not p.can_write:
+            return render("error.html", request, status=403,
+                          message="휴지통은 편집자 이상만 볼 수 있습니다.")
+        return render("trash.html", request, items=docs.list_deleted(limit=200),
+                      is_admin=p.can_admin)
+
+    @web.post("/trash/{path:path}/restore")
+    def trash_restore(path: str, request: Request, p: Principal = Depends(require_user)):
+        try:
+            docs.restore(p, path)
+            request.session["flash"] = f"복원했습니다: {path}"
+        except WikiError as e:
+            request.session["flash"] = f"복원 실패: {e.message}"
+        return RedirectResponse("/trash", status_code=303)
+
+    @web.post("/trash/{path:path}/purge")
+    def trash_purge(path: str, request: Request, p: Principal = Depends(require_user)):
+        try:
+            docs.purge(p, path)
+            request.session["flash"] = f"완전히 삭제했습니다: {path}"
+        except WikiError as e:
+            request.session["flash"] = f"삭제 실패: {e.message}"
+        return RedirectResponse("/trash", status_code=303)
 
     @web.get("/activity", response_class=HTMLResponse)
     def activity_page(request: Request, window: str = "7d", via: str | None = None,
@@ -691,7 +742,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}", response_class=HTMLResponse)
-    def view(path: str, request: Request, _p: Principal = Depends(require_user)):
+    def view(path: str, request: Request, p: Principal = Depends(require_user)):
         try:
             doc = docs.get(path)
         except WikiError:
@@ -703,7 +754,16 @@ def create_web_app(app: AppContext) -> FastAPI:
         stats = word_count(doc["content"])
         properties = document_properties(doc["content"])
         return render("view.html", request, doc=doc, html=html, backlinks=backlinks,
-                      outgoing=outgoing, stats=stats, properties=properties)
+                      outgoing=outgoing, stats=stats, properties=properties,
+                      favorite=docs.is_favorite(p.user_id, doc["path"]))
+
+    @web.post("/doc/{path:path}/favorite")
+    def doc_favorite(path: str, request: Request, p: Principal = Depends(require_user)):
+        try:
+            docs.toggle_favorite(p, path)
+        except WikiError as e:
+            request.session["flash"] = e.message
+        return RedirectResponse("/doc/" + quote(path), status_code=303)
 
     @web.get("/api/doc/{path:path}/related")
     def api_related(path: str, request: Request, _p: Principal = Depends(require_user)):
@@ -723,6 +783,13 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.post("/settings/keys", response_class=HTMLResponse)
     def settings_create_key(request: Request, name: str = Form("key"),
                             p: Principal = Depends(require_user)):
+        # Throttle minting per user (a hijacked session shouldn't be able to spray keys).
+        key_key = f"user:{p.user_id}"
+        if not key_limiter.allowed(key_key):
+            return render("settings.html", request, status=429,
+                          keys=list_api_keys(db, p.user_id), new_key=None,
+                          error="키 발급이 너무 잦습니다. 잠시 후 다시 시도하세요.")
+        key_limiter.record_failure(key_key)  # count this mint toward the window
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
         token = create_api_key(db, p.user_id, name)

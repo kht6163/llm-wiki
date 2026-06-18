@@ -21,7 +21,7 @@ log = logging.getLogger("llm_wiki.audit")
 # deliberately excluded here and only shown to admins via the unfiltered feed.
 DOC_ACTIONS: tuple[str, ...] = (
     "doc_create", "doc_update", "doc_move", "doc_delete",
-    "doc_reconcile", "attachment_upload",
+    "doc_restore", "doc_purge", "doc_reconcile", "attachment_upload",
 )
 
 

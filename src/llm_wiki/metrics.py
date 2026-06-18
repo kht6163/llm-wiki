@@ -66,6 +66,13 @@ EMBED_WORKER_LAST_SUCCESS = Gauge(
     "llmwiki_embed_worker_last_success_timestamp_seconds",
     "Unix time of the last successful background embedding sweep.",
 )
+EMBED_WORKER_BUSY = Gauge(
+    "llmwiki_embed_worker_busy", "1 while an embedding sweep is running, else 0.",
+)
+EMBED_WORKER_FAILURES = Gauge(
+    "llmwiki_embed_worker_consecutive_failures",
+    "Consecutive failed embedding sweeps (0 when healthy).",
+)
 # Realtime stream health: a slow/stuck WebSocket client whose queue fills has its
 # events dropped (so it can't stall the loop). Silent drops mean a browser quietly
 # out-of-sync with the live document; these make that visible.

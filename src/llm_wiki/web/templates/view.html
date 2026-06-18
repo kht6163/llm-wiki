@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "_badges.html" import via_badge %}
+{% from "_icons.html" import icon %}
 {% block title %}{{ doc.title }}{% endblock %}
 {% block content %}
 <link rel="stylesheet" href="{{ static('vendor/hljs-theme.css') }}">
@@ -8,6 +9,13 @@
   <div class="doc-head">
     <h1>{{ doc.title }}</h1>
     <div class="doc-actions">
+      <form method="post" action="/doc/{{ doc.path|urlpath }}/favorite" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="fav-toggle{% if favorite %} is-fav{% endif %}"
+                aria-pressed="{{ 'true' if favorite else 'false' }}"
+                title="{{ '즐겨찾기 해제' if favorite else '즐겨찾기' }}"
+                aria-label="{{ '즐겨찾기 해제' if favorite else '즐겨찾기' }}">{{ icon("star") }}</button>
+      </form>
       {% if user.can_write %}
         <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
         <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"

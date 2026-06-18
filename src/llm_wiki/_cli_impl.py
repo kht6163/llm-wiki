@@ -213,7 +213,12 @@ def _reindex(args) -> int:
     else:
         ctx = build_context(full=True)
         print("Reindexing vault…")
-    res = ctx.docs.reindex_all(reembed=args.reembed)
+    def _progress(done: int, total: int) -> None:
+        pct = int(done * 100 / total) if total else 100
+        end = "\n" if done >= total else ""
+        print(f"\r  embedding {done}/{total} chunks ({pct}%)…", end=end, flush=True)
+
+    res = ctx.docs.reindex_all(reembed=args.reembed, progress=_progress)
     print(f"created={res['created']} updated={res['updated']} renamed={res['renamed']} "
           f"unchanged={res['unchanged']} embedded={res['embedded']}")
     for mv in res.get("renames", []):

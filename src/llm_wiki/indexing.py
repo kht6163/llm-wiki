@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 
 from . import graph
 from .embedding import Embedder
@@ -18,6 +19,8 @@ from .markdown_utils import chunk_markdown, extract_links, parse_frontmatter
 from .metrics import (
     EMBED_CHUNKS,
     EMBED_DURATION,
+    EMBED_WORKER_BUSY,
+    EMBED_WORKER_FAILURES,
     EMBED_WORKER_LAST_SUCCESS,
     EMBED_WORKER_RUNS,
 )
@@ -126,9 +129,12 @@ def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
             conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
 
 
-def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64) -> int:
+def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64,
+                  progress: Callable[[int, int], None] | None = None) -> int:
     """Embed a single doc, or sweep all docs with vector_dirty=1. Returns the number
-    of documents whose vectors were brought up to date.
+    of documents whose vectors were brought up to date. ``progress``, if given, is
+    called ``progress(done_chunks, total_chunks)`` after each batch — used by the
+    reindex CLI to show a progress line on a long re-embed.
 
     The sweep path (doc_id is None, used by reindex) batches the expensive encode
     across *all* dirty chunks, then writes in one transaction. The write is verified
@@ -154,8 +160,11 @@ def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size:
     log.info("embed_pending: embedding %d chunk(s) across %d document(s)", len(texts), len(dirty))
     vectors: list = []
     t0 = time.perf_counter()
-    for i in range(0, len(texts), batch_size):
+    total = len(texts)
+    for i in range(0, total, batch_size):
         vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
+        if progress is not None:
+            progress(min(i + batch_size, total), total)
     EMBED_DURATION.observe(time.perf_counter() - t0)
     EMBED_CHUNKS.inc(len(texts))
     embedded = {r["chunk_id"]: (r["text"], emb) for r, emb in zip(rows, vectors, strict=False)}
@@ -206,6 +215,13 @@ class EmbeddingWorker:
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="llmwiki-embed", daemon=True)
+        # Observable state (read by status() / surfaced on /readyz) so a silently stalled
+        # or failing worker is visible rather than just "RAG quietly rotting".
+        self._busy = False
+        self._failures = 0
+        self._last_error: str | None = None
+        self._last_duration = 0.0
+        self._last_run_at: float | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -226,22 +242,44 @@ class EmbeddingWorker:
                 log.warning("embedding worker still running after %.0fs; "
                             "pending vectors will be re-embedded on next start", timeout)
 
+    def status(self) -> dict:
+        """A snapshot of worker health for /readyz and ops: whether a sweep is running,
+        how many consecutive failures, the last error/duration, and the current
+        vector_dirty backlog (documents still awaiting embedding)."""
+        try:
+            with self._db.reader() as conn:
+                backlog = conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE vector_dirty=1 AND is_deleted=0"
+                ).fetchone()[0]
+        except Exception:
+            backlog = None
+        return {
+            "running": self._busy,
+            "consecutive_failures": self._failures,
+            "last_error": self._last_error,
+            "last_duration_s": round(self._last_duration, 3),
+            "backlog": backlog,
+        }
+
     def _run(self) -> None:
-        failures = 0
         while not self._stop.is_set():
             # Wake on notify() or sooner-of-idle_interval; back off (capped) after
             # consecutive failures so a persistent error (OOM, disk full) doesn't
             # busy-spin the logs/CPU.
-            wait = self._idle_interval * (2 ** min(failures, 5))
+            wait = self._idle_interval * (2 ** min(self._failures, 5))
             self._wake.wait(wait)
             self._wake.clear()
             if self._stop.is_set():
                 break
+            self._busy = True
+            EMBED_WORKER_BUSY.set(1)
+            t0 = time.perf_counter()
             try:
                 embed_pending(self._db, self._embedder)
                 EMBED_WORKER_RUNS.labels("ok").inc()
                 EMBED_WORKER_LAST_SUCCESS.set_to_current_time()
-                failures = 0
+                self._failures = 0
+                self._last_error = None
                 # Best-effort WAL truncation: a long-lived reader can otherwise keep the
                 # -wal file from being reset by autocheckpoint. The worker is the natural
                 # periodic hook; TRUNCATE no-ops harmlessly if other readers are active.
@@ -250,9 +288,16 @@ class EmbeddingWorker:
                         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 except Exception:
                     pass
-            except Exception:
-                failures += 1
+            except Exception as e:
+                self._failures += 1
+                self._last_error = str(e)[:200]
                 EMBED_WORKER_RUNS.labels("error").inc()
-                (log.error if failures >= 3 else log.warning)(
-                    "embed worker: sweep failed (%d consecutive); backing off", failures)
+                (log.error if self._failures >= 3 else log.warning)(
+                    "embed worker: sweep failed (%d consecutive); backing off", self._failures)
                 log.debug("embed worker traceback", exc_info=True)
+            finally:
+                self._busy = False
+                EMBED_WORKER_BUSY.set(0)
+                self._last_duration = time.perf_counter() - t0
+                self._last_run_at = time.time()
+                EMBED_WORKER_FAILURES.set(self._failures)

@@ -68,6 +68,7 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 # A markdown task-list line: "- [ ] ...", "* [x] ...", "1. [ ] ..." (captures the
 # checkbox state for click-to-toggle). Groups: (prefix, state-char, rest).
 _TASK_LINE_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\].*)$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Uploaded images/files live under this vault subdir (excluded from the .md scan).
 ATTACH_DIR = "_attachments"
@@ -815,13 +816,16 @@ class DocumentService:
             return graph.build_graph(conn, root, depth, limit, include_unresolved)
 
     def search_page(self, query: str, *, mode: str = "hybrid", top_k: int = 10,
-                    folder: str | None = None, tags: list[str] | None = None
+                    folder: str | None = None, tags: list[str] | None = None,
+                    since: str | None = None, until: str | None = None,
                     ) -> tuple[list[search.SearchResult], bool]:
         """Hybrid search returning ``(results, truncated)``, applying this service's
         configured fusion tuning (``search_params``). The single entry point both the
-        web and MCP surfaces go through so tuning is honored uniformly."""
+        web and MCP surfaces go through so tuning is honored uniformly. ``since``/``until``
+        bound hits by ``updated_at`` (recency filter)."""
         return search.search_page(self.db, self.embedder, query, mode=mode, top_k=top_k,
-                                  folder=folder, tags=tags, params=self.search_params)
+                                  folder=folder, tags=tags, since=since, until=until,
+                                  params=self.search_params)
 
     def related(self, path: str, limit: int = 8) -> dict:
         """Documents semantically similar to this one (via the shared chunk-vector
@@ -1310,6 +1314,17 @@ class DocumentService:
             items = graph.list_broken_links(conn, limit)
         return {"count": len(items), "links": items}
 
+    def move_preview(self, path: str, new_path: str) -> dict:
+        """Read-only preview of a move: whether the destination is already taken, and the
+        inbound links (other docs pointing at the current path) that fix_references would
+        rewrite. Lets a caller see the blast radius before committing the move."""
+        rel, new_rel = normalize_rel_path(path), normalize_rel_path(new_path)
+        if not self.exists(rel):
+            raise NotFoundError("No document at this path.", path=rel)
+        inbound = self.backlinks(rel)["backlinks"]
+        return {"from": rel, "to": new_rel, "dest_exists": self.exists(new_rel),
+                "inbound_count": len(inbound), "inbound": [b["src_path"] for b in inbound]}
+
     def move(self, principal: Principal, path: str, new_path: str,
              fix_references: bool = False) -> dict:
         if not principal.can_write:
@@ -1447,6 +1462,28 @@ class DocumentService:
                 "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
             } for r in rows]
 
+    def daily_note(self, principal: Principal, date: str | None = None, *,
+                   folder: str = "daily") -> dict:
+        """Open the daily note for ``date`` (YYYY-MM-DD; default today, UTC), creating it
+        if absent — the journaling entry point. Reading an existing note needs no write
+        permission; only creating one does. The new note carries a minimal ``# <date>``
+        heading. Returns the document (path/version/content/…) plus ``created`` (True if
+        it was just made)."""
+        if date:
+            date = str(date).strip()
+            if not _DATE_RE.match(date):
+                raise ValidationError("date must be in YYYY-MM-DD form.")
+        else:
+            date = datetime.now(UTC).strftime("%Y-%m-%d")
+        fold = normalize_folder_path(folder) if folder else ""
+        rel = (fold + "/" if fold else "") + date + ".md"
+        if self.exists(rel):
+            return {**self.get(rel), "created": False}
+        if not principal.can_write:
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot create the daily note (read/search only).")
+        return {**self.create(principal, rel, f"# {date}\n\n", title=date), "created": True}
+
     def delete(self, principal: Principal, path: str, base_version: int | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
@@ -1493,6 +1530,149 @@ class DocumentService:
                    updated_by=principal.username, via=principal.via)
         self._bump_nav()
         return {"ok": True, "path": rel, "deleted": True}
+
+    def list_deleted(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Soft-deleted documents (the trash), most-recently-deleted first. Each carries
+        path/title/version/folder, when and by whom it was deleted — enough to decide
+        what to restore or purge."""
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT id, path, title, version, folder, updated_at, updated_by "
+                "FROM documents WHERE is_deleted=1 ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (clamp_int(limit, 1, 1000), max(0, int(offset))),
+            ).fetchall()
+            return [{
+                "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
+                "folder": r["folder"], "updated_at": r["updated_at"],
+                "deleted_by": self._username(conn, r["updated_by"]),
+            } for r in rows]
+
+    def restore(self, principal: Principal, path: str) -> dict:
+        """Bring a soft-deleted document back (editor/admin only): un-tombstone it, rebuild
+        the search/graph artifacts that delete tore down (FTS rows, chunks, link edges,
+        and inbound-link backfill), re-project the .md, and re-embed. The pre-delete body
+        is the latest revision's, so no content travels through the caller."""
+        if not principal.can_write:
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot restore documents (read/search only).")
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        stem = basename_stem(rel)
+        now = now_iso()
+        with self.db.writer() as conn:
+            row = conn.execute(
+                "SELECT id, version, title, folder, is_deleted FROM documents WHERE path_norm=?",
+                (norm,)).fetchone()
+            if not row:
+                raise NotFoundError("No document at this path.", path=rel)
+            if not row["is_deleted"]:
+                raise ValidationError("Document is not deleted; nothing to restore.")
+            doc_id, title, folder = row["id"], row["title"], row["folder"]
+            body = self._latest_body(conn, doc_id)
+            new_version = row["version"] + 1
+            # file_state='pending' guards the post-commit file re-projection, mirroring
+            # create()/delete(): a crash before the write is finished by recover_pending().
+            conn.execute(
+                "UPDATE documents SET version=version+1, content_hash=?, file_state='pending', "
+                "vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? WHERE id=?",
+                (sha256_hex(body), now, principal.user_id, doc_id),
+            )
+            conn.execute(
+                "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
+                "VALUES(?,?,?,?,?,?, 'edit', ?, ?)",
+                (doc_id, new_version, body, title, sha256_hex(body), principal.user_id, principal.via, now),
+            )
+            # tags survive a soft delete (delete() leaves the tags table alone), so only
+            # the FTS/chunk/link artifacts — torn down on delete — need rebuilding.
+            indexing.reindex_fts(conn, doc_id, title, body)
+            indexing.rechunk(conn, doc_id, body)
+            indexing.reindex_links(conn, doc_id, body, folder)
+            graph.backfill_links_for(conn, doc_id, norm, stem)
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_restore", target=rel, detail=f"v{new_version}")
+        mtime = self._write_file(rel, body)
+        with self.db.writer() as conn:
+            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?",
+                         (mtime, doc_id))
+        self._embed(doc_id)
+        DOC_WRITES.labels("restore").inc()
+        self._emit("restore", rel, new_version, updated_by=principal.username, via=principal.via)
+        self._bump_nav()
+        return {"ok": True, "path": rel, "version": new_version, "restored": True}
+
+    def purge(self, principal: Principal, path: str) -> dict:
+        """Permanently delete a TRASHED document and all its history (admin only) — there
+        is no undo. Refuses a live document (soft-delete it first). The row's revisions /
+        tags / links are removed by FK cascade (its chunks + vectors were already cleared
+        on soft delete); the .trash copy of the file is removed best-effort."""
+        if not principal.can_admin:
+            raise ForbiddenError("Only an admin can permanently delete a document.")
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.writer() as conn:
+            row = conn.execute(
+                "SELECT id, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+            if not row:
+                raise NotFoundError("No document at this path.", path=rel)
+            if not row["is_deleted"]:
+                raise ValidationError("Document is not in the trash; delete it first.")
+            doc_id = row["id"]
+            graph.unresolve_incoming(conn, doc_id)  # break any inbound links before the row goes
+            conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+            audit.record(conn, actor=principal.username, via=principal.via,
+                         action="doc_purge", target=rel)
+        try:  # remove the trashed file copy (best-effort; DB is canonical)
+            trashed = safe_join(self.vault / ".trash", rel)
+            if trashed.is_file():
+                trashed.unlink()
+        except OSError:
+            pass
+        self._bump_nav()
+        return {"ok": True, "path": rel, "purged": True}
+
+    # ---- favorites (per-user pins) --------------------------------------
+    def toggle_favorite(self, principal: Principal, path: str) -> dict:
+        """Flip whether the current user has pinned this document. Per-user and content-
+        neutral: it creates no revision and needs no write permission (a reader may pin
+        what they read). Returns the resulting ``favorite`` state."""
+        rel = normalize_rel_path(path)
+        norm = path_norm(rel)
+        with self.db.writer() as conn:
+            d = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+            if not d:
+                raise NotFoundError("No document at this path.", path=rel)
+            existing = conn.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND doc_id=?",
+                (principal.user_id, d["id"])).fetchone()
+            if existing:
+                conn.execute("DELETE FROM favorites WHERE user_id=? AND doc_id=?",
+                             (principal.user_id, d["id"]))
+                fav = False
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO favorites(user_id, doc_id, created_at) VALUES(?,?,?)",
+                    (principal.user_id, d["id"], now_iso()))
+                fav = True
+        return {"ok": True, "path": rel, "favorite": fav}
+
+    def is_favorite(self, user_id: int, path: str) -> bool:
+        norm = path_norm(normalize_rel_path(path))
+        with self.db.reader() as conn:
+            r = conn.execute(
+                "SELECT 1 FROM favorites f JOIN documents d ON d.id=f.doc_id "
+                "WHERE f.user_id=? AND d.path_norm=? AND d.is_deleted=0", (user_id, norm)).fetchone()
+        return r is not None
+
+    def list_favorites(self, user_id: int) -> list[dict]:
+        """The user's pinned documents (live only), title-sorted — for the sidebar
+        favourites section and a favourites view."""
+        with self.db.reader() as conn:
+            rows = conn.execute(
+                "SELECT d.path, d.title FROM favorites f JOIN documents d ON d.id=f.doc_id "
+                "WHERE f.user_id=? AND d.is_deleted=0 ORDER BY d.title COLLATE NOCASE",
+                (user_id,)).fetchall()
+            return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
     def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
         """Store an uploaded image/file under the vault's _attachments dir and return
@@ -1584,13 +1764,15 @@ class DocumentService:
                      deletable, keep)
         return {"keep": keep, "deletable_revisions": deletable, "applied": bool(apply)}
 
-    def reindex_all(self, reembed: bool = False) -> dict:
+    def reindex_all(self, reembed: bool = False,
+                    progress: Callable[[int, int], None] | None = None) -> dict:
         """Reconcile the DB with the on-disk vault (handles external edits / new files /
         renames). New files are created; changed files get an 'external-reconcile'
         revision. A new file whose content UNIQUELY matches a document whose own file
         vanished is treated as that document RENAMED — relocated in place, preserving its
         id / history / backlinks — instead of forking into a duplicate plus an orphan.
-        Vanished files with no content match are reported (not auto-deleted)."""
+        Vanished files with no content match are reported (not auto-deleted). ``progress``,
+        if given, is forwarded to the embedding sweep for a CLI progress line."""
         vault = self.vault.resolve()
         log.info("reindex: scanning vault %s (reembed=%s)", vault, reembed)
 
@@ -1719,7 +1901,7 @@ class DocumentService:
             missing = [r["path"] for r in conn.execute(
                 "SELECT path, path_norm FROM documents WHERE is_deleted=0").fetchall()
                 if r["path_norm"] not in disk_norms]
-        embedded = indexing.embed_pending(self.db, self.embedder)
+        embedded = indexing.embed_pending(self.db, self.embedder, progress=progress)
         log.info("reindex: created=%d updated=%d renamed=%d unchanged=%d skipped_deleted=%d "
                  "missing_files=%d embedded=%d", created, updated, renamed, unchanged,
                  len(skipped_deleted), len(missing), embedded)

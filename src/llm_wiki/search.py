@@ -49,6 +49,9 @@ class SearchResult:
     chunk_id: int | None = None       # stable chunk id; feed to read_chunk for full passage
     folder: str = ""                  # the document's folder, so callers can group/filter
     tags: list[str] | None = None     # the document's tags, to avoid a follow-up read
+    updated_at: str | None = None     # last-modified timestamp, for recency sort/filter
+    backlinks_count: int | None = None   # how many docs link TO this hit (popularity signal)
+    outlinks_count: int | None = None    # how many links this hit points OUT to
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -239,8 +242,23 @@ def _docs_meta_for_ids(conn, ids: list[int]) -> dict[int, dict]:
         return {}
     ph = ",".join("?" * len(ids))
     return {r["id"]: r for r in conn.execute(
-        f"SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id IN ({ph})",
-        ids)}
+        f"SELECT id, path, title, version, folder, updated_at, is_deleted "
+        f"FROM documents WHERE id IN ({ph})", ids)}
+
+
+def _link_counts_for_ids(conn, ids: list[int]) -> dict[int, tuple[int, int]]:
+    """(backlinks, outlinks) counts for many docs in two grouped queries — backlinks =
+    resolved links pointing AT the doc, outlinks = links it points OUT to. doc_id ->
+    (backlinks, outlinks); missing docs default to (0, 0)."""
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    back = {r[0]: r[1] for r in conn.execute(
+        f"SELECT dst_doc_id, COUNT(*) FROM links WHERE dst_doc_id IN ({ph}) AND is_resolved=1 "
+        f"GROUP BY dst_doc_id", ids)}
+    out = {r[0]: r[1] for r in conn.execute(
+        f"SELECT src_doc_id, COUNT(*) FROM links WHERE src_doc_id IN ({ph}) GROUP BY src_doc_id", ids)}
+    return {i: (back.get(i, 0), out.get(i, 0)) for i in ids}
 
 
 def _passes_filters(d, folder: str | None, tags: list[str] | None, conn,
@@ -266,12 +284,14 @@ def search_page(
     db, embedder: Embedder, query: str, *,
     mode: str = "hybrid", top_k: int = 10,
     folder: str | None = None, tags: list[str] | None = None,
+    since: str | None = None, until: str | None = None,
     params: FusionParams = DEFAULT_FUSION,
 ) -> tuple[list[SearchResult], bool]:
     """Run a search and report truncation. Returns ``(results, truncated)`` where
     ``truncated`` is True only when at least one more qualifying document existed
     beyond ``top_k`` — so a corpus of exactly ``top_k`` matches reports False (no
-    misleading 'raise top_k' signal). ``results`` is capped at ``top_k``."""
+    misleading 'raise top_k' signal). ``results`` is capped at ``top_k``.
+    ``since``/``until`` (ISO-8601) bound the hits by ``updated_at`` (recency filter)."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
     SEARCH_QUERIES.labels(mode).inc()
@@ -299,6 +319,11 @@ def search_page(
             if not d or d["is_deleted"]:
                 continue
             if not _passes_filters(d, folder, tags, conn, filter_tags):
+                continue
+            # Recency window (string comparison is valid for our canonical UTC ISO format).
+            if since and (d["updated_at"] or "") < since:
+                continue
+            if until and (d["updated_at"] or "") > until:
                 continue
 
             heading = None
@@ -332,6 +357,7 @@ def search_page(
                 chunk_ordinal=vi["ordinal"] if vi is not None else None,
                 chunk_id=vi["chunk_id"] if vi is not None else None,
                 folder=d["folder"] or "",
+                updated_at=d["updated_at"],
             ))
             result_ids.append(did)
             if len(results) >= want:
@@ -341,8 +367,10 @@ def search_page(
         # the page without a follow-up read per hit.
         if result_ids:
             tagmap = _tags_for_doc_ids(conn, result_ids)
+            linkmap = _link_counts_for_ids(conn, result_ids)
             for r, did in zip(results, result_ids, strict=True):
                 r.tags = tagmap.get(did, [])
+                r.backlinks_count, r.outlinks_count = linkmap.get(did, (0, 0))
     SEARCH_LATENCY.labels(mode).observe(time.perf_counter() - t0)
     return results[:top_k], len(results) > top_k
 

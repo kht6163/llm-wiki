@@ -8,7 +8,9 @@
   <button class="primary" onclick="reloadGraph()">적용</button>
   <span id="ginfo" class="muted" role="status" aria-live="polite"></span>
 </div>
-<div id="cy"></div>
+<div id="cy" tabindex="0" role="application"
+     aria-label="링크 그래프. 포커스한 뒤 방향키로 노드를 이동하고 Enter로 엽니다."></div>
+<span id="gkb" class="visually-hidden" aria-live="polite"></span>
 <p id="gempty" class="muted" hidden>표시할 노드가 없습니다. 중심 문서 경로를 확인하거나, 문서 사이에 <code>[[위키링크]]</code>를 추가해 보세요.</p>
 <script src="{{ static('vendor/cytoscape.min.js') }}"></script>
 <script>
@@ -29,6 +31,7 @@ function graphStyle() {
         'text-valign': 'bottom', 'text-halign': 'center', 'text-wrap': 'wrap' } },
     { selector: 'node[?root]', style: { 'background-color': ink, 'width': 18, 'height': 18, 'font-size': '11px' } },
     { selector: 'node[!exists]', style: { 'background-color': inset, 'border-width': 1, 'border-style': 'dashed', 'border-color': lineStrong, 'color': faint } },
+    { selector: 'node:selected', style: { 'border-width': 3, 'border-style': 'solid', 'border-color': accent, 'overlay-color': accent, 'overlay-opacity': 0.12 } },
     { selector: 'edge', style: { 'width': 1, 'line-color': lineStrong, 'target-arrow-color': lineStrong, 'target-arrow-shape': 'triangle', 'curve-style': 'bezier', 'arrow-scale': 0.6 } },
     { selector: 'edge[!resolved]', style: { 'line-style': 'dashed', 'line-color': line, 'target-arrow-color': line } }
   ];
@@ -125,6 +128,43 @@ if (window.matchMedia) {
   if (mq.addEventListener) mq.addEventListener('change', applyGraphTheme);
   else if (mq.addListener) mq.addListener(applyGraphTheme);
 }
+
+// Keyboard navigation over the canvas (Cytoscape is otherwise mouse-only). Focus the
+// graph, then arrows/Tab move a cursor through the nodes (id order) and Enter opens the
+// focused one — the same affordance as clicking a node, reachable without a pointer. The
+// current node is announced via the #gkb live region for screen readers.
+let kbIndex = -1;
+function kbNodes() {
+  return cy ? cy.nodes().sort(function (a, b) {
+    return a.data('id') < b.data('id') ? -1 : (a.data('id') > b.data('id') ? 1 : 0);
+  }) : [];
+}
+function kbFocus(delta) {
+  const nodes = kbNodes();
+  if (!nodes.length) return;
+  kbIndex = ((kbIndex + delta) % nodes.length + nodes.length) % nodes.length;
+  const node = nodes[kbIndex];
+  cy.nodes().unselect();
+  node.select();
+  cy.center(node);
+  const gkb = document.getElementById('gkb');
+  if (gkb) gkb.textContent = node.data('label') + (node.data('exists') ? '' : ' (없는 문서)') +
+    ' — ' + (kbIndex + 1) + '/' + nodes.length;
+}
+document.getElementById('cy').addEventListener('keydown', function (e) {
+  if (e.key === 'ArrowRight' || e.key === 'ArrowDown' ||
+      (e.key === 'Tab' && !e.shiftKey)) { e.preventDefault(); kbFocus(1); }
+  else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' ||
+           (e.key === 'Tab' && e.shiftKey)) { e.preventDefault(); kbFocus(-1); }
+  else if (e.key === 'Enter') {
+    const nodes = kbNodes();
+    const node = kbIndex >= 0 && kbIndex < nodes.length ? nodes[kbIndex] : null;
+    if (node && node.data('exists')) {
+      e.preventDefault();
+      location.href = '/doc/' + encodeURIComponent(node.data('id'));
+    }
+  }
+});
 
 // Enter in the root/depth fields applies the graph (keyboard parity with the button).
 ['root', 'depth'].forEach(function (id) {

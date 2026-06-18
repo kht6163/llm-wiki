@@ -49,6 +49,7 @@ async def test_tools_registered(ctx):
         "set_document_property", "remove_document_property",
         "list_folders", "create_folder", "delete_folder", "toggle_task",
         "set_document_properties",
+        "get_or_create_daily_note", "list_trash", "restore_document", "purge_document",
     }
     assert expected <= names, names
 
@@ -581,3 +582,110 @@ async def test_internal_error_envelope_carries_request_id(ctx, principals, monke
     d = _payload(await mcp.call_tool("get_tags", {}))
     assert d["ok"] is False and d["error"]["code"] == "internal"
     assert isinstance(d["error"].get("request_id"), str) and d["error"]["request_id"]
+
+
+# -- shortlist: daily note, trash, dry-run, search enrichment --------------
+@pytest.fixture
+def admin_mcp(ctx, principals, monkeypatch):
+    key = create_api_key(ctx.db, principals["admin"].user_id, "adminkey")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
+    return create_mcp_server(ctx)
+
+
+async def test_daily_note_create_then_idempotent(editor_mcp):
+    first = _payload(await editor_mcp.call_tool(
+        "get_or_create_daily_note", {"date": "2026-01-15", "return_content": "full"}))
+    assert first["ok"] and first["created"] is True and first["path"] == "daily/2026-01-15.md"
+    assert "# 2026-01-15" in first["content"]
+    again = _payload(await editor_mcp.call_tool(
+        "get_or_create_daily_note", {"date": "2026-01-15"}))
+    assert again["ok"] and again["created"] is False and again["version"] == first["version"]
+
+
+async def test_daily_note_rejects_bad_date(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("get_or_create_daily_note", {"date": "2026/01/15"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_trash_lifecycle(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "tr.md", "content": "# T\n\nx"}))
+    _payload(await editor_mcp.call_tool("delete_document", {"path": "tr.md"}))
+    trash = _payload(await editor_mcp.call_tool("list_trash", {}))
+    assert trash["ok"] and any(d["path"] == "tr.md" for d in trash["documents"])
+    restored = _payload(await editor_mcp.call_tool("restore_document", {"path": "tr.md"}))
+    assert restored["ok"] and restored["restored"] is True
+    # Back to a live, readable document; no longer in the trash.
+    read = _payload(await editor_mcp.call_tool("read_document", {"path": "tr.md"}))
+    assert read["ok"] and "x" in read["content"]
+    assert not any(d["path"] == "tr.md"
+                   for d in _payload(await editor_mcp.call_tool("list_trash", {}))["documents"])
+
+
+async def test_restore_rejects_live_document(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "live.md", "content": "x"}))
+    d = _payload(await editor_mcp.call_tool("restore_document", {"path": "live.md"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_purge_requires_admin(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "pg.md", "content": "x"}))
+    _payload(await editor_mcp.call_tool("delete_document", {"path": "pg.md"}))
+    d = _payload(await editor_mcp.call_tool("purge_document", {"path": "pg.md"}))
+    assert d["ok"] is False and d["error"]["code"] == "forbidden"
+
+
+async def test_purge_by_admin_removes_history(admin_mcp):
+    _payload(await admin_mcp.call_tool("create_document", {"path": "ph.md", "content": "x"}))
+    _payload(await admin_mcp.call_tool("delete_document", {"path": "ph.md"}))
+    d = _payload(await admin_mcp.call_tool("purge_document", {"path": "ph.md"}))
+    assert d["ok"] and d["purged"] is True
+    # Gone for good: not in the trash, and a fresh create at the same path is a v1 doc.
+    assert not any(x["path"] == "ph.md"
+                   for x in _payload(await admin_mcp.call_tool("list_trash", {}))["documents"])
+    recreated = _payload(await admin_mcp.call_tool("create_document", {"path": "ph.md", "content": "y"}))
+    assert recreated["ok"] and recreated["version"] == 1
+
+
+async def test_move_dry_run_previews_without_moving(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "mv.md", "content": "# MV\n\nx"}))
+    _payload(await editor_mcp.call_tool("create_document", {"path": "ref.md", "content": "see [[mv]]"}))
+    prev = _payload(await editor_mcp.call_tool(
+        "move_document", {"path": "mv.md", "new_path": "moved.md", "dry_run": True}))
+    assert prev["ok"] and prev["dry_run"] is True and prev["dest_exists"] is False
+    assert "ref.md" in prev["inbound"] and prev["inbound_count"] >= 1
+    # Nothing actually moved: the original still exists, the destination does not.
+    assert _payload(await editor_mcp.call_tool("read_document", {"path": "mv.md"}))["ok"]
+    assert _payload(await editor_mcp.call_tool("read_document", {"path": "moved.md"}))["ok"] is False
+
+
+async def test_edit_documents_dry_run_predicts_outcomes(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "ex.md", "content": "v1"}))
+    ops = [
+        {"op": "create", "path": "fresh.md", "content": "x"},          # would apply
+        {"op": "update", "path": "ex.md", "base_version": 0, "content": "y"},  # stale -> conflict
+        {"op": "create", "path": "ex.md", "content": "dup"},           # exists -> conflict
+    ]
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops, "dry_run": True}))
+    assert d["ok"] and d["dry_run"] is True
+    assert d["would_apply"] == 1 and d["would_fail"] == 2
+    assert d["results"][1]["error"]["code"] == "conflict"
+    # The dry run mutated nothing: fresh.md was not actually created.
+    assert _payload(await editor_mcp.call_tool("read_document", {"path": "fresh.md"}))["ok"] is False
+
+
+async def test_search_results_carry_link_counts_and_recency(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "kw.md", "content": "# KW\n\nzymurgy distinctive term"}))
+    _payload(await editor_mcp.call_tool("create_document", {"path": "p1.md", "content": "[[kw]]"}))
+    d = _payload(await editor_mcp.call_tool("search_documents", {"query": "zymurgy", "mode": "bm25"}))
+    assert d["ok"] and d["count"] >= 1
+    hit = next(r for r in d["results"] if r["path"] == "kw.md")
+    assert hit["backlinks_count"] >= 1          # p1 links to it
+    assert hit["updated_at"] and "outlinks_count" in hit
+    # A future 'since' filters everything out; a past one keeps the hit.
+    future = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "zymurgy", "mode": "bm25", "since": "2999-01-01"}))
+    assert future["count"] == 0
+    past = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "zymurgy", "mode": "bm25", "since": "2000-01-01"}))
+    assert any(r["path"] == "kw.md" for r in past["results"])

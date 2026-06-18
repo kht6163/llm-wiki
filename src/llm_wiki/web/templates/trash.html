@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_icons.html" import icon %}
+{% block title %}휴지통{% endblock %}
+{% block content %}
+<h1>휴지통 <span class="muted">{{ items|length }}건</span></h1>
+<p class="muted">삭제된 문서입니다. 복원하면 본문·링크·검색 색인이 되살아납니다. 완전 삭제는 되돌릴 수 없습니다{% if not is_admin %} (관리자만){% endif %}.</p>
+{% if not items %}
+  <div class="empty-state">
+    <span class="empty-icon">{{ icon("trash") }}</span>
+    <p class="empty-title">휴지통이 비어 있습니다</p>
+    <p class="empty-text">삭제한 문서가 여기 모입니다. 복원하거나 완전히 지울 수 있습니다.</p>
+  </div>
+{% else %}
+<table class="revtable">
+  <thead><tr><th scope="col">문서</th><th scope="col">폴더</th><th scope="col">삭제 시각</th><th scope="col">삭제자</th><th scope="col"></th></tr></thead>
+  <tbody>
+  {% for d in items %}
+    <tr>
+      <td data-label="문서">{{ d.title }} <span class="path">{{ d.path }}</span></td>
+      <td data-label="폴더"><span class="path">{{ d.folder or "—" }}</span></td>
+      <td data-label="삭제 시각">{{ d.updated_at|dt }}</td>
+      <td data-label="삭제자" class="muted">{{ d.deleted_by or "—" }}</td>
+      <td data-label="작업">
+        <form method="post" action="/trash/{{ d.path|urlpath }}/restore" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="ghost">{{ icon("rotate-ccw") }} 복원</button>
+        </form>
+        {% if is_admin %}
+        <form method="post" action="/trash/{{ d.path|urlpath }}/purge" class="inline"
+              onsubmit="return confirm('완전히 삭제하면 되돌릴 수 없습니다. 계속할까요?')">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger">{{ icon("trash") }} 완전 삭제</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

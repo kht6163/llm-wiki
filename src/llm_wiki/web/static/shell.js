@@ -14,7 +14,11 @@
 
   function toast(msg) {
     var t = document.createElement("div");
-    t.className = "rt-toast"; t.setAttribute("role", "status"); t.textContent = msg;
+    t.className = "rt-toast";
+    t.setAttribute("role", "status");
+    t.setAttribute("aria-live", "polite");
+    t.setAttribute("aria-atomic", "true");
+    t.textContent = msg;
     document.body.appendChild(t);
     requestAnimationFrame(function () { t.classList.add("show"); });
     setTimeout(function () { t.classList.remove("show"); setTimeout(function () { t.remove(); }, 300); }, 3000);
