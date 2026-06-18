@@ -37,6 +37,7 @@ from fastapi.templating import Jinja2Templates
 from markupsafe import Markup
 from starlette.middleware.sessions import SessionMiddleware
 
+from ..logconf import get_request_id
 from ..markdown_render import render_markdown
 from ..markdown_utils import document_properties
 from ..metrics import BUILD_INFO, PrometheusMiddleware, collect_index_gauges, render_latest
@@ -66,6 +67,7 @@ from ..util import (
 )
 from .security import (
     RateLimiter,
+    RequestIdMiddleware,
     SecurityHeadersMiddleware,
     enforce_csrf,
     get_csrf_token,
@@ -208,6 +210,9 @@ def create_web_app(app: AppContext) -> FastAPI:
         SessionMiddleware, secret_key=secret, same_site="lax",
         https_only=app.settings.cookie_secure, max_age=14 * 86400,
     )
+    # Outermost (added last): bind the correlation id before any other middleware runs
+    # so all of them log under it and the X-Request-ID header is set on every response.
+    web.add_middleware(RequestIdMiddleware)
     web.mount("/static", StaticFiles(directory=str(_HERE / "static")), name="static")
     login_limiter = RateLimiter()
 
@@ -288,6 +293,23 @@ def create_web_app(app: AppContext) -> FastAPI:
         if request.url.path.startswith("/api/"):
             return JSONResponse(exc.to_dict(), status_code=exc.http_status)
         return render("error.html", request, status=exc.http_status, message=exc.message)
+
+    @web.exception_handler(Exception)
+    async def _on_unexpected(request: Request, exc: Exception):
+        # Last-resort handler for a genuinely unhandled error (RequestIdMiddleware has
+        # already logged the traceback under this id). Return the SAME id to the client
+        # so a user can quote it and an operator can grep straight to the failing request.
+        rid = getattr(request.state, "request_id", None) or get_request_id()
+        if request.url.path.startswith(("/api/", "/attachments/")):
+            resp: Response = JSONResponse(
+                {"ok": False, "error": {"code": "internal",
+                                        "message": "Internal server error.", "request_id": rid}},
+                status_code=500)
+        else:
+            resp = render("error.html", request, status=500,
+                          message=f"서버 오류가 발생했습니다. (요청 ID: {rid})")
+        resp.headers["X-Request-ID"] = rid
+        return resp
 
     # ---- auth -----------------------------------------------------------
     @web.get("/login", response_class=HTMLResponse)

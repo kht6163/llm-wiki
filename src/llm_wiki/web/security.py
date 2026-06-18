@@ -5,16 +5,22 @@ humans); the MCP surface is guarded separately by per-request Bearer keys.
 from __future__ import annotations
 
 import hmac
+import logging
 import secrets
 from urllib.parse import urlsplit
 
 from fastapi import HTTPException, Request
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from ..logconf import bind_request_id, new_request_id, reset_request_id
 from ..ratelimit import RateLimiter
 
 # Re-exported for callers that still import RateLimiter from this module.
-__all__ = ["RateLimiter", "SecurityHeadersMiddleware", "enforce_csrf", "get_csrf_token"]
+__all__ = ["RateLimiter", "RequestIdMiddleware", "SecurityHeadersMiddleware",
+           "enforce_csrf", "get_csrf_token"]
+
+_log = logging.getLogger("llm_wiki.web")
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "TRACE"})
 
@@ -77,6 +83,57 @@ async def enforce_csrf(request: Request) -> None:
         sent = value if isinstance(value, str) else None
     if not expected or not sent or not hmac.compare_digest(sent, str(expected)):
         raise HTTPException(status_code=403, detail="Missing or invalid CSRF token.")
+
+
+# -- request correlation ---------------------------------------------------
+class RequestIdMiddleware:
+    """Bind a per-request correlation id into the logging context so every llm_wiki
+    log line for the request carries it, echo it back as the ``X-Request-ID`` response
+    header, and log any unhandled exception with that id before it becomes a 500 — so an
+    operator can trace one failing request across the (web + agent) log stream.
+
+    An inbound ``X-Request-ID`` is honoured (so a fronting proxy / caller can correlate
+    end-to-end); otherwise a fresh id is minted. The id is also stashed on ``scope['state']``
+    so the 500 handler — which runs outside this middleware, after the contextvar is reset —
+    can still surface it to the client.
+
+    Pure ASGI (not BaseHTTPMiddleware) on purpose: the contextvar is set in the SAME task
+    that runs the endpoint, so it propagates to sync handlers dispatched to the threadpool
+    (which copy the context) — a BaseHTTPMiddleware would run the endpoint in a child task
+    and the binding would not reliably reach it."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        inbound = None
+        for k, v in scope.get("headers") or []:
+            if k == b"x-request-id":
+                inbound = v.decode("latin-1").strip()[:64] or None
+                break
+        rid = inbound or new_request_id()
+        scope.setdefault("state", {})["request_id"] = rid
+        token = bind_request_id(rid)
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message).setdefault("X-Request-ID", rid)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # The exception is still re-raised (ServerErrorMiddleware turns it into the
+            # 500); we just make sure a server-side log line carries the id first, while
+            # the contextvar is still bound.
+            _log.exception("unhandled error: method=%s path=%s",
+                           scope.get("method"), scope.get("path"))
+            raise
+        finally:
+            reset_request_id(token)
 
 
 # -- response headers ------------------------------------------------------

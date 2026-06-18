@@ -14,6 +14,7 @@ import anyio
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
+from .logconf import bind_request_id, new_request_id
 from .metrics import MCP_CALLS, MCP_LATENCY
 from .ratelimit import RateLimiter
 from .runtime import AppContext
@@ -50,6 +51,18 @@ def _client_ip(ctx: Context) -> str:
     req = _request(ctx)
     client = getattr(req, "client", None) if req is not None else None
     return normalize_client_ip(getattr(client, "host", None))
+
+
+def _request_id(ctx: Context) -> str:
+    """Correlation id for this tool call: honour an inbound ``X-Request-ID`` (so a
+    caller/proxy can trace end-to-end), else mint one. Bound into the logging context
+    so every llm_wiki log line for the call carries it."""
+    req = _request(ctx)
+    if req is not None:
+        hdr = req.headers.get("x-request-id")
+        if hdr and hdr.strip():
+            return hdr.strip()[:64]
+    return new_request_id()
 
 
 def _shape_write(result: dict, return_content: str) -> dict:
@@ -106,8 +119,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                     shape: Callable[[dict], dict] | None = None) -> dict:
         token = _bearer_token(ctx)
         ip_key = f"ip:{_client_ip(ctx)}"
+        rid = _request_id(ctx)
 
         def impl() -> dict:
+            # impl runs in a worker thread with a per-call copy of this context, so
+            # binding the id here scopes it to this call (no cross-call leak).
+            bind_request_id(rid)
             t0 = time.monotonic()
             actor = (token or "")[:12] or "-"  # key prefix only — never log the full token
             outcome = "ok"
@@ -150,7 +167,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 outcome = "internal"
                 log.exception("tool=%s actor=%s crashed", tool, actor)
                 return {"ok": False,
-                        "error": {"code": "internal", "message": "Internal server error."}}
+                        "error": {"code": "internal", "message": "Internal server error.",
+                                  "request_id": rid}}
             finally:
                 dt = time.monotonic() - t0
                 MCP_CALLS.labels(tool, outcome).inc()
@@ -353,6 +371,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "Use this to discover exact tag strings for the 'tag'/'tags' filters.")
     async def get_tags(ctx: Context) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, "tags": docs.tags()}, "get_tags")
+
+    @mcp.tool(description="Every folder path in the vault (folders that hold documents, their "
+                          "ancestors, and explicitly-created empty folders), sorted. Use to learn "
+                          "the layout before creating a document, passing a 'folder' filter to "
+                          "search/list_documents, or calling create_folder/delete_folder.")
+    async def list_folders(ctx: Context) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, "folders": docs.list_folders()},
+                           "list_folders")
 
     @mcp.tool(description="Outgoing links of a document (resolved + broken).")
     async def get_links(ctx: Context, path: str) -> dict:
@@ -608,6 +634,66 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             p, path, key, base_version=base_version), return_content)},
             "remove_document_property", shape=lambda d: _shape_conflict(d, return_content))
 
+    @mcp.tool(description="Replace the WHOLE editable frontmatter property set in one revision "
+                          "(editor/admin only) — keys you OMIT are REMOVED, keys you include are "
+                          "set. This is the bulk/declarative counterpart to set_document_property "
+                          "(which sets ONE key and leaves the rest): use it to reconcile a "
+                          "document's properties to an exact desired state. 'properties' maps each "
+                          "key to a string or list of strings (an empty value drops that key). "
+                          "'title'/'tags' are managed elsewhere (update_document title / patch_tags) "
+                          "and rejected with 'validation'. The body is preserved. base_version "
+                          "optional (defaults to current); runs through optimistic locking.")
+    async def set_document_properties(
+        ctx: Context, path: str,
+        properties: Annotated[dict[str, str | list[str]],
+                              Field(description="key -> scalar or list value; the COMPLETE editable "
+                                    "set (omitted keys are removed).")],
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
+    ) -> dict:
+        def fn(p: Principal) -> dict:
+            props = [(k, v if isinstance(v, list) else [v]) for k, v in (properties or {}).items()]
+            return {"ok": True, **_shape_write(
+                docs.replace_properties(p, path, props, base_version=base_version), return_content)}
+        return await _call(ctx, fn, "set_document_properties",
+                           shape=lambda d: _shape_conflict(d, return_content))
+
+    @mcp.tool(description="Flip one markdown task checkbox (- [ ] <-> - [x]) and save through the "
+                          "optimistic-locking update (editor/admin only) — tick off daily-note / "
+                          "checklist items without rewriting the body. Target the checkbox by "
+                          "0-based 'index' (the Nth checkbox in document order) OR 1-based 'line'; "
+                          "exactly one is required. Fails 'validation' if the target isn't a task "
+                          "line or is out of range. base_version optional (defaults to current).")
+    async def toggle_task(
+        ctx: Context, path: str,
+        index: Annotated[int | None, Field(ge=0,
+                         description="0-based checkbox index in document order.")] = None,
+        line: Annotated[int | None, Field(ge=1,
+                        description="1-based line number of the checkbox.")] = None,
+        base_version: Annotated[int | None, Field(description="Guard against concurrent edits.")] = None,
+        return_content: Annotated[Literal["full", "metadata"],
+                                  Field(description="'full' echoes the body (and current_content on a "
+                                        "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
+    ) -> dict:
+        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.toggle_task(
+            p, path, line=line, index=index, base_version=base_version), return_content)},
+            "toggle_task", shape=lambda d: _shape_conflict(d, return_content))
+
+    @mcp.tool(description="Create an empty folder so it persists as an organizational unit before "
+                          "it holds any documents (editor/admin only) — 'structure first, content "
+                          "later'. Fails 'conflict' if a folder already exists there (including one "
+                          "implied by existing documents), 'validation' on an empty path.")
+    async def create_folder(ctx: Context, path: str) -> dict:
+        return await _call(ctx, lambda p: docs.create_folder(p, path), "create_folder")
+
+    @mcp.tool(description="Delete an empty folder and its empty subfolders (editor/admin only). "
+                          "Refuses with 'validation' if any document still lives under it (move or "
+                          "delete those first); 'not_found' if there is no such folder.")
+    async def delete_folder(ctx: Context, path: str) -> dict:
+        return await _call(ctx, lambda p: docs.delete_folder(p, path), "delete_folder")
+
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
                           "re-resolving links (editor/admin only). Fails 'conflict' if the "
                           "destination exists. Set fix_references=true to ALSO rewrite the link "
@@ -674,6 +760,18 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                            base_version=raw.get("base_version"))
         if op == "patch_tags":
             return docs.patch_tags(principal, path, add=raw.get("add"), remove=raw.get("remove"))
+        if op == "toggle_task":
+            return docs.toggle_task(principal, path, line=raw.get("line"),
+                                    index=raw.get("index"), base_version=raw.get("base_version"))
+        if op == "set_properties":
+            props_in = raw.get("properties") or {}
+            props = [(k, v if isinstance(v, list) else [v]) for k, v in props_in.items()]
+            return docs.replace_properties(principal, path, props,
+                                           base_version=raw.get("base_version"))
+        if op == "create_folder":
+            return docs.create_folder(principal, path)
+        if op == "delete_folder":
+            return docs.delete_folder(principal, path)
         if op == "move":
             if not raw.get("new_path"):
                 raise ValidationError("'move' requires 'new_path'.")
@@ -691,8 +789,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     @mcp.tool(description="Apply many single-document edits in ONE call (editor/admin only). "
                           "'operations' is a list of {op, path, ...args}; op is one of create, "
                           "update, patch, replace_section, append_section, append, patch_tags, "
-                          "move, delete, restore, rename_references — each takes the same args as "
-                          "its standalone tool. Returns a per-op report [{op, path, ok, version?, "
+                          "set_properties, toggle_task, create_folder, delete_folder, move, delete, "
+                          "restore, rename_references — each takes the same args as its standalone "
+                          "tool. Returns a per-op report [{op, path, ok, version?, "
                           "error?}] plus {applied, failed, stopped_early}. Ops are NOT one "
                           "transaction: each commits independently with its own CAS guard. With "
                           "stop_on_error=true (default) the first failure stops the rest (already-"

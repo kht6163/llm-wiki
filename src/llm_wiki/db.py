@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sqlite_vec
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 11
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -96,7 +96,9 @@ CREATE TABLE IF NOT EXISTS tags (
   tag    TEXT NOT NULL,
   PRIMARY KEY (doc_id, tag)
 );
-CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+-- (tag, doc_id) so the recurring "SELECT doc_id FROM tags WHERE tag=?" tag-filter
+-- subquery (search + listing) is covered/index-only instead of fetching each row.
+CREATE INDEX IF NOT EXISTS idx_tags_tag_doc ON tags(tag, doc_id);
 
 CREATE TABLE IF NOT EXISTS revisions (
   id           INTEGER PRIMARY KEY,
@@ -130,7 +132,10 @@ CREATE TABLE IF NOT EXISTS chunks (
   char_end     INTEGER NOT NULL,
   heading_path TEXT  -- "H1 > H2 > H3" breadcrumb of the chunk's enclosing headings
 );
-CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
+-- Every hot chunk read is "WHERE doc_id=? ORDER BY ordinal" (passage assembly,
+-- read_chunk, BM25 section anchoring, related_documents); (doc_id, ordinal) serves
+-- both the lookup and the sort, so no separate single-column index is needed.
+CREATE INDEX IF NOT EXISTS idx_chunks_doc_ord ON chunks(doc_id, ordinal);
 
 CREATE TABLE IF NOT EXISTS links (
   id            INTEGER PRIMARY KEY,
@@ -162,6 +167,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts DESC);
+-- The activity feed reconcile use case ("what did actor X — or every OTHER actor —
+-- change") filters by actor and pages newest-first (ORDER BY id DESC); (actor, id DESC)
+-- serves the filter and the ordering without a scan+sort over the whole log.
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor, id DESC);
 
 -- Idempotency ledger for retry-safe writes (e.g. append_to_document). A client that
 -- retries a request after a lost response replays its key; the prior result is
@@ -205,6 +214,21 @@ MIGRATIONS: list[tuple[int, str]] = [
     # v5: index the default listing/autocomplete sort (is_deleted + updated_at DESC)
     # so large vaults seek instead of full-scanning + sorting on every page render.
     (5, "CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(is_deleted, updated_at DESC)"),
+    # v7-v11: query-shaped indexes. Each statement is its own numbered (atomic) step
+    # because the applier advances the stamp past a target once any entry for it runs,
+    # so multi-statement changes need ascending targets. Create each replacement before
+    # dropping the old single-column index so a read between steps is never unindexed.
+    #  - chunks (doc_id, ordinal): covers "WHERE doc_id=? ORDER BY ordinal" (the hot
+    #    chunk-read shape) without a sort, superseding idx_chunks_doc(doc_id).
+    #  - tags (tag, doc_id): makes the "SELECT doc_id FROM tags WHERE tag=?" tag-filter
+    #    subquery index-only, superseding idx_tags_tag(tag).
+    #  - audit_log (actor, id DESC): serves the actor-filtered activity feed (paged by
+    #    id DESC) without scanning + sorting the whole log.
+    (7, "CREATE INDEX IF NOT EXISTS idx_chunks_doc_ord ON chunks(doc_id, ordinal)"),
+    (8, "DROP INDEX IF EXISTS idx_chunks_doc"),
+    (9, "CREATE INDEX IF NOT EXISTS idx_tags_tag_doc ON tags(tag, doc_id)"),
+    (10, "DROP INDEX IF EXISTS idx_tags_tag"),
+    (11, "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor, id DESC)"),
 ]
 
 

@@ -47,6 +47,8 @@ async def test_tools_registered(ctx):
         "append_section", "append_to_document", "patch_tags", "move_document",
         "delete_document", "restore_revision", "rename_references", "edit_documents",
         "set_document_property", "remove_document_property",
+        "list_folders", "create_folder", "delete_folder", "toggle_task",
+        "set_document_properties",
     }
     assert expected <= names, names
 
@@ -474,3 +476,108 @@ async def test_bad_key_is_rate_limited(ctx, monkeypatch):
     mcp = create_mcp_server(ctx)
     messages = [_payload(await mcp.call_tool("get_tags", {}))["error"]["message"] for _ in range(15)]
     assert any("Too many" in m for m in messages)  # limiter engaged after repeated failures
+
+
+# -- MCP parity tools: folders, task toggle, bulk properties ---------------
+async def test_folder_create_list_delete_tools(editor_mcp):
+    # Create an empty folder, see it via list_folders, then delete it.
+    created = _payload(await editor_mcp.call_tool("create_folder", {"path": "Projects"}))
+    assert created["ok"] and created["path"] == "Projects"
+    listed = _payload(await editor_mcp.call_tool("list_folders", {}))
+    assert listed["ok"] and "Projects" in listed["folders"]
+    deleted = _payload(await editor_mcp.call_tool("delete_folder", {"path": "Projects"}))
+    assert deleted["ok"] and deleted["deleted"] is True
+    again = _payload(await editor_mcp.call_tool("list_folders", {}))
+    assert "Projects" not in again["folders"]
+
+
+async def test_create_folder_conflict_tool(editor_mcp):
+    assert _payload(await editor_mcp.call_tool("create_folder", {"path": "Dup"}))["ok"]
+    d = _payload(await editor_mcp.call_tool("create_folder", {"path": "Dup"}))
+    assert d["ok"] is False and d["error"]["code"] == "conflict"
+
+
+async def test_delete_nonempty_folder_rejected_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "notes/keep.md", "content": "# K\n\nx"}))
+    d = _payload(await editor_mcp.call_tool("delete_folder", {"path": "notes"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_folder_tools_forbidden_for_viewer(ctx, principals, monkeypatch):
+    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
+    mcp = create_mcp_server(ctx)
+    d = _payload(await mcp.call_tool("create_folder", {"path": "X"}))
+    assert d["ok"] is False and d["error"]["code"] == "forbidden"
+
+
+async def test_toggle_task_tool(editor_mcp):
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "todo.md", "content": "- [ ] a\n- [ ] b\n"}))
+    # 0-based index targets the first checkbox.
+    d = _payload(await editor_mcp.call_tool(
+        "toggle_task", {"path": "todo.md", "index": 0, "return_content": "full"}))
+    assert d["ok"] and "- [x] a" in d["content"] and "- [ ] b" in d["content"]
+    # Toggling it back flips it off again.
+    back = _payload(await editor_mcp.call_tool(
+        "toggle_task", {"path": "todo.md", "index": 0, "return_content": "full"}))
+    assert back["ok"] and "- [ ] a" in back["content"]
+
+
+async def test_toggle_task_requires_target(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "t2.md", "content": "- [ ] a\n"}))
+    d = _payload(await editor_mcp.call_tool("toggle_task", {"path": "t2.md"}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_set_document_properties_replaces_whole_set(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "props.md", "content": "# P\n\nbody"}))
+    d = _payload(await editor_mcp.call_tool(
+        "set_document_properties",
+        {"path": "props.md", "properties": {"status": "draft", "aliases": ["a1", "a2"]},
+         "return_content": "full"}))
+    assert d["ok"] and "status: draft" in d["content"] and "aliases: [a1, a2]" in d["content"]
+    # Reconciling to a set that omits 'aliases' removes it (declarative full replace).
+    r = _payload(await editor_mcp.call_tool(
+        "set_document_properties",
+        {"path": "props.md", "properties": {"status": "final"}, "return_content": "full"}))
+    assert r["ok"] and "status: final" in r["content"] and "aliases" not in r["content"]
+
+
+async def test_set_document_properties_rejects_reserved_key(editor_mcp):
+    _payload(await editor_mcp.call_tool("create_document", {"path": "pr.md", "content": "# P\n\nb"}))
+    d = _payload(await editor_mcp.call_tool(
+        "set_document_properties", {"path": "pr.md", "properties": {"title": "x"}}))
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_edit_documents_batch_new_ops(editor_mcp):
+    # The newly-exposed ops dispatch through the batch tool too.
+    _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "daily.md", "content": "- [ ] task\n"}))
+    ops = [
+        {"op": "toggle_task", "path": "daily.md", "index": 0},
+        {"op": "set_properties", "path": "daily.md", "properties": {"status": "done"}},
+        {"op": "create_folder", "path": "Archive"},
+    ]
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops}))
+    assert d["ok"] and d["applied"] == 3 and d["failed"] == 0
+    read = _payload(await editor_mcp.call_tool("read_document", {"path": "daily.md"}))
+    assert "- [x] task" in read["content"] and "status: done" in read["content"]
+
+
+async def test_internal_error_envelope_carries_request_id(ctx, principals, monkeypatch):
+    # The structured internal-error envelope includes the correlation id so an agent
+    # can quote it and an operator can grep straight to the failing call's log line.
+    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
+
+    def boom():
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(ctx.docs, "tags", boom)
+    mcp = create_mcp_server(ctx)
+    d = _payload(await mcp.call_tool("get_tags", {}))
+    assert d["ok"] is False and d["error"]["code"] == "internal"
+    assert isinstance(d["error"].get("request_id"), str) and d["error"]["request_id"]

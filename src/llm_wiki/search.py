@@ -228,6 +228,21 @@ def _tags_for_doc_ids(conn, ids: list[int]) -> dict[int, list[str]]:
     return out
 
 
+def _docs_meta_for_ids(conn, ids: list[int]) -> dict[int, dict]:
+    """Document metadata (id/path/title/version/folder/is_deleted) for many ids in ONE
+    query (id -> row). Replaces the per-candidate ``SELECT ... WHERE id=?`` that ran
+    once per scored candidate in the result-assembly loop (an N+1 that grew with how
+    many candidates the filters discarded). The candidate set is already materialized
+    in ``scored`` and the tag-filter path already batches over the same ids, so this is
+    one extra small query, not a behavioural change."""
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    return {r["id"]: r for r in conn.execute(
+        f"SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id IN ({ph})",
+        ids)}
+
+
 def _passes_filters(d, folder: str | None, tags: list[str] | None, conn,
                     tag_map: dict[int, list[str]] | None = None) -> bool:
     """Re-apply folder/tag filters to a vector-matched doc (the BM25 leg already
@@ -270,17 +285,17 @@ def search_page(
         scored, vec_info, match = _rank(conn, embedder, query, mode=mode, k=k,
                                         folder=folder, tags=tags, params=params)
 
-        # When a tag filter is active, batch-load the candidates' tags once instead of
-        # one SELECT per doc inside the filter loop (O(candidates) -> O(1) queries).
-        filter_tags = _tags_for_doc_ids(conn, [d for d, _ in scored]) if tags else None
+        # Batch-load the candidates' metadata (and, when a tag filter is active, their
+        # tags) once up front instead of one SELECT per doc inside the loop — the loop
+        # otherwise issued an N+1 that grew with how many candidates the filters discard.
+        scored_ids = [d for d, _ in scored]
+        doc_meta = _docs_meta_for_ids(conn, scored_ids)
+        filter_tags = _tags_for_doc_ids(conn, scored_ids) if tags else None
 
         results: list[SearchResult] = []
         result_ids: list[int] = []
         for did, score in scored:
-            d = conn.execute(
-                "SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id=?",
-                (did,),
-            ).fetchone()
+            d = doc_meta.get(did)
             if not d or d["is_deleted"]:
                 continue
             if not _passes_filters(d, folder, tags, conn, filter_tags):
@@ -516,15 +531,15 @@ def assemble_context(
     with db.reader() as conn:
         scored, vec_info, _match = _rank(conn, embedder, question, mode=mode, k=k,
                                          folder=folder, tags=tags, params=params)
-        filter_tags = _tags_for_doc_ids(conn, [d for d, _ in scored]) if tags else None
+        # One batched metadata (and tag) load for all candidates, not a SELECT per doc.
+        scored_ids = [d for d, _ in scored]
+        doc_meta = _docs_meta_for_ids(conn, scored_ids)
+        filter_tags = _tags_for_doc_ids(conn, scored_ids) if tags else None
         for did, score in scored:
             if len(sources) >= max_sources:
                 truncated = True
                 break
-            d = conn.execute(
-                "SELECT id, path, title, version, folder, is_deleted FROM documents WHERE id=?",
-                (did,),
-            ).fetchone()
+            d = doc_meta.get(did)
             if not d or d["is_deleted"] or not _passes_filters(d, folder, tags, conn, filter_tags):
                 continue
 
