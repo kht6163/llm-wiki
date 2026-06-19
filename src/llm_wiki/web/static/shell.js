@@ -34,20 +34,15 @@
 
   // ---- CSP-safe form handlers ------------------------------------------
   // The CSP drops script-src 'unsafe-inline', so the former inline on* attributes are
-  // delegated here. `data-confirm` guards a destructive submit (cancel = no submit);
-  // `data-autosubmit` submits a filter/sort form when its control changes. Behaviour is
-  // identical to the old onsubmit=confirm() / onchange=this.form.submit() handlers.
+  // delegated here. `data-confirm` guards a destructive submit (cancel = no submit).
+  // (There is intentionally no change->auto-submit: sort/filter selects use an explicit
+  // 적용 button — WCAG 3.2.2 / DESIGN.md — so no select silently reloads the page.)
   document.addEventListener("submit", function (e) {
     var f = e.target;
     if (f && f.dataset && f.dataset.confirm && !window.confirm(f.dataset.confirm)) {
       e.preventDefault();
     }
   });
-  document.addEventListener("change", function (e) {
-    var el = e.target;
-    if (el && el.dataset && "autosubmit" in el.dataset && el.form) el.form.submit();
-  });
-
   // ---- sidebar collapse ------------------------------------------------
   // On narrow viewports the sidebars are fixed overlays over the content. They
   // must default closed (else they cover the page on load) and their open state
@@ -82,7 +77,23 @@
     syncBackdrop();
   }
   function closeOverlays() { shell.classList.add("no-left", "no-right"); syncBackdrop(); }
+  // Reflect each panel's open/closed state on its toggle button(s) so keyboard and
+  // screen-reader users perceive the state, not just the action — and the button
+  // picks up the shared "selected" styling. toggle-left lives in both the ribbon and
+  // the topbar, so update every match. (The theme button is a 3-state cycle, not a
+  // binary, so it's intentionally not an aria-pressed toggle.)
+  function syncToggleState() {
+    var left = !shell.classList.contains("no-left");
+    var right = !shell.classList.contains("no-right");
+    document.querySelectorAll('[data-action="toggle-left"]').forEach(function (b) {
+      b.setAttribute("aria-pressed", left ? "true" : "false");
+    });
+    document.querySelectorAll('[data-action="toggle-right"]').forEach(function (b) {
+      b.setAttribute("aria-pressed", right ? "true" : "false");
+    });
+  }
   function syncBackdrop() {
+    syncToggleState();
     var open = isNarrow() &&
       (!shell.classList.contains("no-left") || !shell.classList.contains("no-right"));
     if (open && !backdrop) {
@@ -515,7 +526,8 @@
   };
 
   applyCollapsed();
-  autoHideRight();
+  autoHideRight();        // may close the right panel on its own
+  syncToggleState();      // so the toggle buttons reflect the final initial state
   initTabs(".sb-tab", "data-panel", "data-tab");
   initTabs(".rp-tab", "data-rp-panel", "data-rp");
   document.querySelectorAll(".sb-resizer").forEach(initResize);

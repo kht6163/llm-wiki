@@ -22,13 +22,13 @@
 
 <form class="listsort" method="get" action="/activity">
   <label>기간
-    <select name="window" data-autosubmit>
+    <select name="window">
       {% set wlabel = {"today": "오늘", "24h": "최근 24시간", "7d": "최근 7일", "30d": "최근 30일", "all": "전체"} %}
       {% for w in windows %}<option value="{{ w }}" {{ 'selected' if window==w }}>{{ wlabel[w] }}</option>{% endfor %}
     </select>
   </label>
   <label>출처
-    <select name="via" data-autosubmit>
+    <select name="via">
       <option value="" {{ 'selected' if not via }}>전체</option>
       <option value="web" {{ 'selected' if via=='web' }}>사람</option>
       <option value="mcp" {{ 'selected' if via=='mcp' }}>에이전트</option>
@@ -36,6 +36,7 @@
     </select>
   </label>
   {% if action %}<input type="hidden" name="action" value="{{ action }}">{% endif %}
+  <button class="ghost">적용</button>
 </form>
 
 {% if not events %}

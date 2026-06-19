@@ -906,13 +906,16 @@ def test_csp_uses_script_nonce_not_unsafe_inline(client):
 
 
 def test_destructive_forms_use_delegated_handlers(client):
-    # CSP refactor: former inline on* handlers became data-confirm / data-autosubmit.
+    # CSP refactor: former inline on* handlers became data-confirm (delete guard).
     login(client, "admin")
     create_doc(client, "delme.md", "# D\n\nbody")
     view = client.get("/doc/delme.md").text
     assert "data-confirm=" in view and "onsubmit=" not in view
+    # Sort/filter selects must NOT auto-submit (WCAG 3.2.2): no onchange and no
+    # data-autosubmit anywhere — the sort form carries an explicit 적용 button instead.
     home = client.get("/").text
-    assert "data-autosubmit" in home and "onchange=" not in home
+    assert "onchange=" not in home and "data-autosubmit" not in home
+    assert "list-sort" in home and "적용" in home
 
 
 def test_search_rate_limited_per_user(client):

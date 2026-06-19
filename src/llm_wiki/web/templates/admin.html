@@ -18,8 +18,8 @@
   <tbody>
   {% for u in users %}
     <tr>
-      <td>{{ u.username }}</td>
-      <td>
+      <td data-label="아이디">{{ u.username }}</td>
+      <td data-label="역할">
         <form method="post" action="/admin/users/{{ u.id }}/role" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <label class="visually-hidden" for="role-{{ u.id }}">{{ u.username }} 역할</label>
@@ -29,22 +29,22 @@
           <button class="ghost">적용</button>
         </form>
       </td>
-      <td>
+      <td data-label="상태">
         <form method="post" action="/admin/users/{{ u.id }}/active" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="active" value="{{ 0 if u.is_active else 1 }}">
           <button>{{ '활성' if u.is_active else '비활성' }}</button>
         </form>
       </td>
-      <td>{{ u.created_at|dt }}</td>
-      <td>
+      <td data-label="가입">{{ u.created_at|dt }}</td>
+      <td data-label="비밀번호">
         <form method="post" action="/admin/users/{{ u.id }}/password" class="inline">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input name="password" type="password" placeholder="새 비밀번호" size="12" required>
           <button>변경</button>
         </form>
       </td>
-      <td>
+      <td data-label="작업">
         <form method="post" action="/admin/users/{{ u.id }}/delete" class="inline" data-confirm="삭제할까요?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button class="danger">삭제</button>

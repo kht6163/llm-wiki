@@ -38,7 +38,7 @@
   --diff-add-bg: #e6ffec; --diff-add-fg: #04260f;
   --diff-del-bg: #ffebe9; --diff-del-fg: #3a0a07;
   /* focus ring — always visible for keyboard users */
-  --focus: color-mix(in srgb, var(--accent) 60%, transparent);
+  --focus: color-mix(in srgb, var(--accent) 100%, transparent);
   /* select chevron (replaces the native OS arrow); stroke tracks fg-muted */
   --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23586069' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   /* type */
@@ -97,7 +97,9 @@ pre code { background: none; padding: 0; border: 0; font-size: inherit; }
 .searchbox input { padding: 6px 10px; background-color: var(--bg); }
 
 main { max-width: 1080px; margin: 0 auto; padding: 24px 20px 80px; }
-h1 { font-size: 1.6em; }
+/* balance keeps the largest type on the page (doc title, list/search headings) from
+   leaving a lone word on the last line — .rendered h1 already balances separately. */
+h1 { font-size: 1.6em; text-wrap: balance; }
 
 /* Message banners — one rule per role, theme-adaptive via semantic-soft mixes
    (no per-theme overrides needed). A leading 2px accent border on the inline
@@ -133,7 +135,10 @@ h1 { font-size: 1.6em; }
 .version, .count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .tag { font-size: 0.74em; font-family: var(--font-mono); background: var(--inset);
   border: 1px solid var(--line); border-radius: var(--r-sm); padding: 1px 7px; color: var(--fg-muted); }
-.tag:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
+/* Hover text uses --accent-hover (not --accent): the bright accent only hits ~4.4:1
+   on the --inset chip, so step it down one to clear AA — same rule DESIGN.md mandates
+   for accent text on any soft/tinted surface (tree/outline/palette selection). */
+.tag:hover { border-color: var(--accent); color: var(--accent-hover); text-decoration: none; }
 
 /* Authorship surface: 사람(web, neutral) vs 에이전트(mcp, accent) vs CLI(amber).
    The accent on the agent badge is the product's identity colour — co-editing by
@@ -217,7 +222,7 @@ h1 { font-size: 1.6em; }
 .rendered { font-size: 1.04em; max-width: 74ch; }
 .rendered > :first-child { margin-top: 0; }
 .rendered img { max-width: 100%; border-radius: var(--r-sm); }
-.rendered h1, .rendered h2, .rendered h3, .rendered h4 {
+.rendered h1, .rendered h2, .rendered h3, .rendered h4, .rendered h5, .rendered h6 {
   line-height: 1.3; margin: 1.6em 0 0.5em; text-wrap: balance; scroll-margin-top: 12px;
 }
 /* The page <h1> in .doc-head (1.6em) is THE document title; demote an in-body
@@ -229,7 +234,19 @@ h1 { font-size: 1.6em; }
 /* h4 keeps full ink and carries its level by weight, not by dimming (a muted,
    near-body-size heading loses its heading affordance). */
 .rendered h4 { font-size: 0.96em; font-weight: 600; }
-.rendered p { text-wrap: pretty; }
+/* h5/h6 continue the weight-carries-level idea one step each, so deep technical
+   docs keep an ordered hierarchy instead of dropping to UA defaults (where h6 would
+   render smaller than body text and invert the structure). */
+.rendered h5 { font-size: 0.9em; font-weight: 600; }
+.rendered h6 { font-size: 0.85em; font-weight: 600; color: var(--fg-muted); }
+/* Body rhythm — UA defaults leave a 40px list indent that's too wide for the 74ch
+   measure and a paragraph gap that doesn't echo the tuned heading spacing. Tighten
+   to a dense, even cadence; em-relative so it tracks the theme/font scale. */
+.rendered p { text-wrap: pretty; margin: 0 0 0.85em; }
+.rendered ul, .rendered ol { margin: 0 0 0.85em; padding-left: 1.5em; }
+.rendered li { margin: 0.15em 0; }
+.rendered li > ul, .rendered li > ol { margin: 0.15em 0 0; }
+.rendered > :last-child { margin-bottom: 0; }
 .rendered a { text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--accent) 40%, transparent); text-underline-offset: 2px; }
 .rendered a:hover { text-decoration-color: var(--accent); }
 .rendered table { border-collapse: collapse; font-size: 0.92em; max-width: 100%; }
@@ -393,10 +410,18 @@ select {
 
 .graph-controls { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
 .graph-controls input[type=number] { width: 4em; }
+/* The root-document field would otherwise hold its size=36 intrinsic width and force
+   horizontal scroll in the narrow content column; let its label and the field shrink. */
+.graph-controls .g-root { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
+.graph-controls #root { flex: 1; min-width: 0; }
 #cy { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); }
 
 .list-head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
 .list-head h1 { margin-right: auto; }
+/* sort/filter forms: select(s) + an explicit 적용 button on one row. Changing a
+   select must not auto-submit (WCAG 3.2.2 / DESIGN.md) — the button is the action,
+   matching the admin role form and the search controls. */
+.listsort { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .listsort select { padding-block: 5px; }
 .taglist { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
 .taglist li { display: flex; align-items: center; gap: 6px; }
@@ -468,9 +493,13 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
 .pager a:hover { border-color: var(--accent); color: var(--accent); text-decoration: none; }
 
 /* Realtime change notifications (WebSocket live reflection). */
+/* Neutral by default (a plain "the list changed" notice reads as info on the inset
+   surface); only the .warn variant — an external version landed while you were
+   editing — escalates to the amber semantic, matching .flash/.conflict. */
 .rt-banner { max-width: 1080px; margin: 12px auto 0; padding: 10px 14px; border-radius: var(--r-md);
-  color: var(--fg); background: var(--warn-soft);
-  border: 1px solid color-mix(in srgb, var(--warn) 38%, transparent); }
+  color: var(--fg); background: var(--inset); border: 1px solid var(--line); }
+.rt-banner.warn { background: var(--warn-soft);
+  border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
 .rt-toast { position: fixed; bottom: 20px; right: 20px; z-index: var(--z-toast);
   background: var(--fg); color: var(--bg); padding: 10px 16px; border-radius: var(--r-md);
   box-shadow: var(--shadow-pop); opacity: 0; transform: translateY(8px);
@@ -526,7 +555,7 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
     --danger: #ff7b72; --danger-emphasis: #da3633;
     --warn: #d29922; --success: #3fb950;
     --diff-add-bg: #12261a; --diff-add-fg: #aff5c6; --diff-del-bg: #2d1517; --diff-del-fg: #ffc9c4;
-    --focus: color-mix(in srgb, var(--accent) 65%, transparent);
+    --focus: color-mix(in srgb, var(--accent) 80%, transparent);
     --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   }
 }
@@ -546,18 +575,18 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
   --accent: #2563eb; --accent-hover: #1d4ed8; --accent-emphasis: #2563eb;
   --danger: #cf222e; --danger-emphasis: #cf222e;
   --warn: #835800; --success: #16722f;
-  --focus: color-mix(in srgb, var(--accent) 60%, transparent);
+  --focus: color-mix(in srgb, var(--accent) 100%, transparent);
   --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23586069' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 [data-theme="dark"] {
   --bg: #0d1117; --chrome: #010409; --inset: #161b22; --pop: #161b22;
-  --fg: #e6edf3; --fg-muted: #9198a1; --fg-faint: #7d8590;
+  --fg: #e6edf3; --fg-muted: #9198a1; --fg-faint: #8b939f;
   --line: #2a313b; --line-strong: #3d444d; --field-border: #454d57;
   --accent: #58a6ff; --accent-hover: #79b8ff; --accent-emphasis: #1f6feb;
   --danger: #ff7b72; --danger-emphasis: #da3633;
   --warn: #d29922; --success: #3fb950;
   --diff-add-bg: #12261a; --diff-add-fg: #aff5c6; --diff-del-bg: #2d1517; --diff-del-fg: #ffc9c4;
-  --focus: color-mix(in srgb, var(--accent) 65%, transparent);
+  --focus: color-mix(in srgb, var(--accent) 80%, transparent);
   --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%239198a1' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
 }
 
@@ -577,8 +606,13 @@ body.resizing { cursor: col-resize; user-select: none; }
 /* ribbon (far-left icon bar) */
 .ribbon {
   grid-row: 1; grid-column: 1; display: flex; flex-direction: column; align-items: center;
-  gap: 4px; padding: 9px 0; background: var(--chrome); border-right: 1px solid var(--line); overflow: hidden;
+  gap: 4px; padding: 9px 0; background: var(--chrome); border-right: 1px solid var(--line);
+  /* Scroll vertically (quietly) rather than clip: on short viewports — landscape
+     phones, split windows — the bottom group (theme/settings/admin/logout) would
+     otherwise be cut off with no way to reach it. Horizontal stays clipped. */
+  overflow: hidden auto; scrollbar-width: none;
 }
+.ribbon::-webkit-scrollbar { display: none; }
 .ribbon-btn {
   display: flex; align-items: center; justify-content: center; width: 38px; height: 38px;
   padding: 0; border: 0; background: transparent; border-radius: var(--r-md); cursor: pointer;
@@ -593,9 +627,14 @@ body.resizing { cursor: col-resize; user-select: none; }
   color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent);
   box-shadow: inset 2px 0 0 var(--accent);
 }
+/* An open panel keeps its toggle lit with the same quiet chip, so the bar shows
+   what's currently open (no accent edge — that's reserved for the current page). */
+.ribbon-btn[aria-pressed="true"] {
+  color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent);
+}
 /* Brand/home anchor keeps a persistent soft chip (not only on hover). */
-.ribbon-btn.brand { color: var(--accent); margin-bottom: 6px; background: var(--accent-soft); }
-.ribbon-btn.brand:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.ribbon-btn.brand { color: var(--accent-hover); margin-bottom: 6px; background: var(--accent-soft); }
+.ribbon-btn.brand:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent-hover); }
 .ribbon-btn.brand svg { width: 24px; height: 24px; }
 .ribbon-spacer { flex: 1; }
 
@@ -689,7 +728,12 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
 .sb-taglist { list-style: none; padding: 0; margin: 0; font-size: 0.86em; }
-.sb-taglist li { padding: 3px 6px; }
+.sb-taglist li.muted { padding: 3px 6px; }
+/* Same row-hover affordance as every other clickable sidebar row (tree/favourites/
+   results), so the tags panel doesn't read as the odd one out. */
+.sb-taglist li a { display: block; padding: 3px 6px; border-radius: 6px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-taglist li a:hover { background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
 /* Sidebar favourites: pinned docs above the file tree, separated by a hairline. */
 .sb-favorites { margin: 0 0 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
 .sb-favorites-head { display: flex; align-items: center; gap: 5px; font-size: 0.74em;
@@ -722,6 +766,10 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 }
 .icon-btn svg { width: 16px; height: 16px; }
 .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+/* A topbar toggle whose panel is open carries the same quiet fg chip as the ribbon
+   toggle (not an accent outline — the left panel is open most of the time, so accent
+   would read as loud/persistent). State also lives in aria-pressed for AT. */
+.icon-btn[aria-pressed="true"] { background: color-mix(in srgb, var(--fg) 8%, transparent); color: var(--fg); }
 .main-topbar .searchbox { flex: 0 1 420px; }
 .main-topbar .searchbox input { width: 100%; min-width: 0; }
 .topbar-spacer { flex: 1; }
@@ -820,11 +868,14 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
   color: var(--fg); border-radius: 6px; cursor: pointer; font-size: 0.86em;
 }
 .ctx-item:hover { background: var(--soft); }
-/* danger menu item = red *text* on the normal menu surface. The global
-   `button.danger` (bg:var(--danger)) would otherwise paint a solid red block
-   over the red text and hide the label, so override the background here. */
+/* Danger menu item = red text on the menu surface, matching button.danger's
+   ghost/outline treatment (it has no solid fill — only a tint on hover). The
+   background reset keeps the row reading as a menu item, not a button. On hover,
+   step the text one shade darker (danger mixed toward ink) so red-on-12%-tint
+   clears AA — the bright --danger alone only reaches ~4.4:1 on that tint. */
 .ctx-item.danger { color: var(--danger); background: transparent; }
-.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.ctx-item.danger:hover { background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: color-mix(in srgb, var(--danger) 80%, var(--fg)); }
 .ctx-sep { height: 1px; background: var(--line); margin: 4px 0; }
 
 /* Callouts (Obsidian [!type]). Type is carried by a full tinted border + bg

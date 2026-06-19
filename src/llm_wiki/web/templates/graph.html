@@ -3,7 +3,7 @@
 {% block content %}
 <h1>링크 그래프</h1>
 <div class="graph-controls">
-  <label>중심 문서 <input id="root" value="{{ root }}" placeholder="(비우면 전체)" size="36"></label>
+  <label class="g-root">중심 문서 <input id="root" type="text" value="{{ root }}" placeholder="(비우면 전체)" size="36"></label>
   <label>깊이 <input id="depth" type="number" value="1" min="1" max="3"></label>
   <button class="primary" id="graph-apply" type="button">적용</button>
   <span id="ginfo" class="muted" role="status" aria-live="polite"></span>
@@ -24,7 +24,7 @@ function graphStyle() {
   const cs = getComputedStyle(document.documentElement);
   const v = (n, fb) => (cs.getPropertyValue(n).trim() || fb);
   const accent = v('--accent', '#2563eb'), ink = v('--fg', '#1c2128'),
-    faint = v('--fg-faint', '#6e7781'), line = v('--line', '#d5dbe2'),
+    faint = v('--fg-faint', '#636b75'), line = v('--line', '#d5dbe2'),
     lineStrong = v('--line-strong', '#c2cad4'), inset = v('--inset', '#e9edf2');
   return [
     { selector: 'node', style: { 'label': 'data(label)', 'font-size': '9px', 'background-color': accent, 'width': 12, 'height': 12, 'color': ink,

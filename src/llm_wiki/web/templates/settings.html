@@ -22,12 +22,12 @@
   <tbody>
   {% for k in keys %}
     <tr>
-      <td>{{ k.name }}</td>
-      <td><code>{{ k.key_prefix }}…</code></td>
-      <td>{{ k.created_at|dt }}</td>
-      <td>{% if k.last_used_at %}{{ k.last_used_at|dt }}{% else %}—{% endif %}</td>
-      <td>{% if k.revoked_at %}<span class="muted">폐기됨</span>{% else %}활성{% endif %}</td>
-      <td>{% if not k.revoked_at %}
+      <td data-label="이름">{{ k.name }}</td>
+      <td data-label="prefix"><code>{{ k.key_prefix }}…</code></td>
+      <td data-label="생성">{{ k.created_at|dt }}</td>
+      <td data-label="마지막 사용">{% if k.last_used_at %}{{ k.last_used_at|dt }}{% else %}—{% endif %}</td>
+      <td data-label="상태">{% if k.revoked_at %}<span class="muted">폐기됨</span>{% else %}활성{% endif %}</td>
+      <td data-label="작업">{% if not k.revoked_at %}
         <form method="post" action="/settings/keys/{{ k.id }}/revoke" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">폐기</button></form>
       {% endif %}</td>
     </tr>
