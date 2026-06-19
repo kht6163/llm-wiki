@@ -54,6 +54,9 @@ class SearchResult:
     outlinks_count: int | None = None    # how many links this hit points OUT to
     content_length: int | None = None    # char length of the doc's latest body (triage short vs long)
     section_depth: int | None = None     # nesting depth of the matched heading (1=top-level; None if none)
+    char_start: int | None = None        # matched chunk's start offset in the (frontmatter-stripped) body; None if the hit has no chunk
+    char_end: int | None = None          # matched chunk's end offset; pair with char_start for the range
+    context_preview: str | None = None   # leading plain-text lines of the matched chunk (no <mark>); None if no chunk
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -212,9 +215,9 @@ def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
 
 def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int, dict]]:
     """Vector KNN collapsed to one best chunk per document. Each value is a dict
-    with the matched chunk's distance/heading/text/heading_path plus its stable
-    ``chunk_id`` and ``ordinal`` — the latter two let callers expose a chunk
-    address (for read_chunk) instead of only an opaque snippet."""
+    with the matched chunk's distance/heading/text/heading_path, its stable
+    ``chunk_id`` and ``ordinal`` (a chunk address for read_chunk), and its
+    ``char_start``/``char_end`` offsets (the exact body range, for deep-linking)."""
     qv = embedder.embed_query(query)
     rows = conn.execute(
         "SELECT chunk_id, distance FROM chunk_vectors "
@@ -229,7 +232,7 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
     chunk_map = {
         c["id"]: c
         for c in conn.execute(
-            f"SELECT id, doc_id, ordinal, heading, text, heading_path "
+            f"SELECT id, doc_id, ordinal, heading, text, heading_path, char_start, char_end "
             f"FROM chunks WHERE id IN ({ph})", ids
         )
     }
@@ -243,6 +246,7 @@ def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int,
             best[d] = {
                 "distance": r["distance"], "heading": ch["heading"], "text": ch["text"],
                 "heading_path": ch["heading_path"], "chunk_id": ch["id"], "ordinal": ch["ordinal"],
+                "char_start": ch["char_start"], "char_end": ch["char_end"],
             }
     return sorted(best.items(), key=lambda kv: kv[1]["distance"])
 
@@ -323,21 +327,39 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     return scored, vec_info, match
 
 
-def _chunk_heading_for_tokens(conn, doc_id: int, q_tokens: list[str]) -> tuple[str | None, str | None]:
-    """(heading, heading_path) of the chunk where the query tokens most land — used to
-    give a BM25-only hit a section anchor (the vector leg, which normally supplies it,
-    didn't run for this doc). Mirrors RAG's passage selection."""
+def _chunk_match_for_tokens(conn, doc_id: int, q_tokens: list[str]) -> dict | None:
+    """The chunk where the query tokens most land (heading/heading_path/text + its
+    char_start/char_end offsets) — used to give a BM25-only hit the same section anchor,
+    char range, and context preview the vector leg would have supplied (it didn't run for
+    this doc). Mirrors RAG's passage selection. None if the doc has no indexed chunks."""
     rows = conn.execute(
-        "SELECT ordinal, heading, heading_path, text FROM chunks WHERE doc_id=? ORDER BY ordinal",
+        "SELECT ordinal, heading, heading_path, text, char_start, char_end "
+        "FROM chunks WHERE doc_id=? ORDER BY ordinal",
         (doc_id,),
     ).fetchall()
     if not rows:
-        return None, None
-    center = _best_token_chunk(rows, q_tokens)
-    for r in rows:
-        if r["ordinal"] == center:
-            return r["heading"], r["heading_path"]
-    return None, None
+        return None
+    # _best_token_chunk always returns an ordinal drawn from `rows`, so this lookup is
+    # total — make that invariant explicit instead of a scan with an unreachable fallback.
+    r = {row["ordinal"]: row for row in rows}[_best_token_chunk(rows, q_tokens)]
+    return {"heading": r["heading"], "heading_path": r["heading_path"],
+            "text": r["text"], "char_start": r["char_start"], "char_end": r["char_end"]}
+
+
+def _context_preview(text: str | None, *, max_lines: int = 4, max_chars: int = 320) -> str | None:
+    """A short, readable plain-text preview of the matched chunk: its leading non-empty
+    lines, joined and capped. Distinct from ``snippet`` (FTS-centered, ``<mark>``-annotated,
+    ~12 tokens): this is a run of surrounding prose so an agent can judge a hit's relevance
+    without a ``read_chunk`` round-trip. None for empty/blank chunk text."""
+    if not text:
+        return None
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    preview = " ".join(lines[:max_lines])
+    if len(preview) > max_chars:
+        preview = preview[:max_chars].rstrip() + "…"
+    return preview
 
 
 def _tags_for_doc_ids(conn, ids: list[int]) -> dict[int, list[str]]:
@@ -484,6 +506,8 @@ def search_page(
 
             heading = None
             heading_path = None
+            char_start = char_end = None
+            context_preview = None
             snippet = ""
             vi = vec_info.get(did)
             if match:
@@ -497,13 +521,20 @@ def search_page(
             if vi is not None:
                 heading = vi["heading"]
                 heading_path = vi["heading_path"]
+                char_start, char_end = vi["char_start"], vi["char_end"]
+                context_preview = _context_preview(vi["text"])
                 if not snippet:
                     snippet = vi["text"][:240]
             elif match:
                 # BM25-only hit (vector leg skipped, or this doc is unembedded): the
-                # section anchor would otherwise be None. Derive it from the chunk the
-                # query tokens land in, so deep-linking works in every search mode.
-                heading, heading_path = _chunk_heading_for_tokens(conn, did, q_tokens)
+                # section anchor/char range would otherwise be None. Derive them from the
+                # chunk the query tokens land in, so deep-linking and a context preview
+                # work in every search mode.
+                cm = _chunk_match_for_tokens(conn, did, q_tokens)
+                if cm:
+                    heading, heading_path = cm["heading"], cm["heading_path"]
+                    char_start, char_end = cm["char_start"], cm["char_end"]
+                    context_preview = _context_preview(cm["text"])
 
             results.append(SearchResult(
                 path=d["path"], title=d["title"] or d["path"],
@@ -515,6 +546,7 @@ def search_page(
                 folder=d["folder"] or "",
                 updated_at=d["updated_at"],
                 section_depth=(heading_path.count(" > ") + 1) if heading_path else None,
+                char_start=char_start, char_end=char_end, context_preview=context_preview,
             ))
             result_ids.append(did)
             if len(results) >= want:

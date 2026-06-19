@@ -57,7 +57,24 @@ async def test_tools_registered(ctx):
 
 def test_error_envelope_shape():
     d = ForbiddenError("nope").to_dict()
-    assert d == {"ok": False, "error": {"code": "forbidden", "message": "nope"}}
+    assert d == {"ok": False, "error": {"code": "forbidden", "message": "nope",
+                                        "suggested_action": "check_permissions"}}
+
+
+def test_error_suggested_actions_per_code():
+    from llm_wiki.services.errors import (
+        ConflictError,
+        NotFoundError,
+        RateLimitedError,
+        ValidationError,
+    )
+    assert NotFoundError("x").to_dict()["error"]["suggested_action"] == "verify_path"
+    assert ValidationError("x").to_dict()["error"]["suggested_action"] == "fix_request"
+    assert ConflictError("x").to_dict()["error"]["suggested_action"] == "re_read_and_retry"
+    assert RateLimitedError("x").to_dict()["error"]["suggested_action"] == "retry_after"
+    # Per-instance extra coexists with the code-level hint.
+    e = ConflictError("x", current_version=3).to_dict()["error"]
+    assert e["suggested_action"] == "re_read_and_retry" and e["current_version"] == 3
 
 
 # -- end-to-end tool calls -------------------------------------------------
@@ -129,6 +146,29 @@ async def test_search_operator_only_query_is_validation(editor_mcp):
 async def test_search_unknown_has_is_validation(editor_mcp):
     d = _payload(await editor_mcp.call_tool("search_documents", {"query": "widget has:bogus"}))
     assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
+async def test_search_exposes_char_range_and_context_preview(editor_mcp):
+    # An agent can deep-link to the matched span and judge relevance from the preview
+    # without a read_chunk round-trip.
+    await editor_mcp.call_tool("create_document", {
+        "path": "cp.md", "content": "# Doc\n\n## Section\n\nwidget alpha beta gamma delta epsilon zeta"})
+    d = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "widget", "mode": "bm25"}))
+    hit = next(r for r in d["results"] if r["path"] == "cp.md")
+    assert isinstance(hit["char_start"], int) and isinstance(hit["char_end"], int)
+    assert hit["char_end"] > hit["char_start"] >= 0
+    assert hit["context_preview"] and "widget" in hit["context_preview"]
+    assert "<mark>" not in hit["context_preview"]  # plain prose, not the FTS snippet
+
+
+async def test_error_envelope_carries_suggested_action(editor_mcp):
+    # not_found -> verify_path; validation -> fix_request. Agents branch on the token
+    # without parsing the human message.
+    nf = _payload(await editor_mcp.call_tool("read_document", {"path": "ghost.md"}))
+    assert nf["error"]["code"] == "not_found" and nf["error"]["suggested_action"] == "verify_path"
+    val = _payload(await editor_mcp.call_tool("search_documents", {"query": "   "}))
+    assert val["error"]["code"] == "validation" and val["error"]["suggested_action"] == "fix_request"
 
 
 async def test_create_then_read_roundtrip(editor_mcp):
@@ -338,6 +378,9 @@ async def test_update_conflict_full_includes_body(editor_mcp):
         {"path": "cf.md", "base_version": 0, "content": "v2", "return_content": "full"}))
     assert d["ok"] is False and d["error"]["code"] == "conflict"
     assert "current_content" in d["error"] and "content_omitted" not in d["error"]
+    # The recovery hint rides alongside the conflict's decision context (current_version etc.).
+    assert d["error"]["suggested_action"] == "re_read_and_retry"
+    assert d["error"]["current_version"] == 1
 
 
 async def test_section_base_version_conflict_via_tool(editor_mcp):

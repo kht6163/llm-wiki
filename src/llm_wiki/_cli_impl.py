@@ -99,6 +99,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--no-vacuum", action="store_true", help="Skip VACUUM after deleting.")
     pr.add_argument("--force", action="store_true",
                     help="Actually delete. Without it, prints a dry-run preview only.")
+
+    dc = sub.add_parser("db-check", help="Check the database for corruption (integrity + foreign keys + orphan vectors).")
+    dc.add_argument("--quick", action="store_true",
+                    help="Use the faster PRAGMA quick_check (skips per-index ordering scan).")
+    dc.add_argument("--fix-orphan-vectors", action="store_true",
+                    help="Delete chunk_vectors rows whose chunk no longer exists (safe repair).")
     return p
 
 
@@ -149,6 +155,8 @@ def _dispatch(args) -> int:
         return _restore(args)
     if args.cmd == "prune":
         return _prune(args)
+    if args.cmd == "db-check":
+        return _db_check(args)
     return 2
 
 
@@ -359,6 +367,39 @@ def _prune(args) -> int:
             conn.execute("VACUUM")
     print("Prune complete.")
     return 0
+
+
+def _db_check(args) -> int:
+    ctx = build_context(full=False)
+    # An opt-in repair runs first so the subsequent check reflects the fixed state.
+    if args.fix_orphan_vectors:
+        removed = ctx.db.delete_orphan_vectors()
+        print(f"orphan vectors: removed {removed}")
+    report = ctx.db.integrity_check(quick=args.quick)
+    if report["ok"]:
+        print(f"integrity ({report['check']}): ok")
+        print("foreign keys: ok")
+        print("orphan vectors: ok")
+        return 0
+    print(f"integrity ({report['check']}): "
+          f"{'ok' if report['integrity'] == ['ok'] else 'FAILED'}")
+    for line in report["integrity"]:
+        if line != "ok":
+            print(f"  - {line}")
+    fk = report["foreign_key_violations"]
+    if fk:
+        print(f"foreign keys: {len(fk)} violation(s)")
+        for v in fk:
+            print(f"  - table={v['table']} rowid={v['rowid']} "
+                  f"parent={v['parent']} fkid={v['fkid']}")
+    else:
+        print("foreign keys: ok")
+    orphans = report["orphan_vectors"]
+    if orphans:
+        print(f"orphan vectors: {orphans} (run with --fix-orphan-vectors to remove)")
+    else:
+        print("orphan vectors: ok")
+    return 1
 
 
 def _backup(args) -> int:

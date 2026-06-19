@@ -117,3 +117,24 @@ def test_section_depth_matches_heading_path_contract(ctx, principals):
         assert hit.section_depth >= 1
     else:
         assert hit.section_depth is None
+
+
+def test_hit_exposes_char_range_and_context_preview_bm25(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "doc.md", "# Title\n\n## Section\n\n"
+                + "The quick brown fox jumps over the lazy dog. " * 3)
+    res, _ = docs.search_page("brown fox", mode="bm25", top_k=5)
+    hit = next(r for r in res if r.path == "doc.md")
+    assert isinstance(hit.char_start, int) and isinstance(hit.char_end, int)
+    assert hit.char_end > hit.char_start >= 0
+    assert hit.context_preview and "fox" in hit.context_preview
+    assert "<mark>" not in hit.context_preview   # plain prose, distinct from the snippet
+
+
+def test_hit_exposes_char_range_in_hybrid_mode(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "v.md", "# V\n\nphotosynthesis converts sunlight into chemical energy in plants")
+    res, _ = docs.search_page("photosynthesis energy", mode="hybrid", top_k=5)
+    hit = next(r for r in res if r.path == "v.md")
+    assert hit.char_start is not None and hit.char_end is not None
+    assert hit.context_preview is not None

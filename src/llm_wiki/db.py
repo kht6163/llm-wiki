@@ -314,6 +314,49 @@ class Database:
             conn.close()
             self._local.conn = None
 
+    def integrity_check(self, *, quick: bool = False) -> dict:
+        """Run SQLite's built-in corruption checks plus a vec0 referential check, and
+        report. ``PRAGMA integrity_check`` (or the cheaper ``quick_check``, which skips the
+        per-index ordering scan) verifies the b-tree/page structure; ``PRAGMA
+        foreign_key_check`` lists rows whose FK target is missing. ``orphan_vectors`` counts
+        ``chunk_vectors`` rows whose ``chunk_id`` no longer exists in ``chunks`` — a class of
+        corruption ``foreign_key_check`` CANNOT see, because ``chunk_vectors`` is a
+        sqlite-vec virtual table and virtual tables can't declare FKs (so the embed worker
+        upserting a vector for a chunk that a concurrent delete already removed leaves a
+        danglers the search leg then silently skips). Returns
+        ``{ok, check, integrity, foreign_key_violations, orphan_vectors}``; ``ok`` is True
+        only when integrity reports ``['ok']`` AND there are no FK violations AND no orphan
+        vectors. Read-only: safe on a live DB. Worth running before a backup/snapshot, since
+        a consistent copy of a corrupt DB is still corrupt."""
+        check = "quick_check" if quick else "integrity_check"
+        with self.reader() as conn:
+            integrity = [r[0] for r in conn.execute(f"PRAGMA {check}").fetchall()]
+            fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            orphans = conn.execute(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+            ).fetchone()[0]
+        violations = [
+            {"table": r[0], "rowid": r[1], "parent": r[2], "fkid": r[3]} for r in fk
+        ]
+        ok = integrity == ["ok"] and not violations and not orphans
+        return {"ok": ok, "check": check, "integrity": integrity,
+                "foreign_key_violations": violations, "orphan_vectors": orphans}
+
+    def delete_orphan_vectors(self) -> int:
+        """Delete ``chunk_vectors`` rows whose ``chunk_id`` has no surviving ``chunks`` row
+        and return how many were removed. The one safe, well-defined repair for the orphan
+        class ``integrity_check`` surfaces: such a vector can never resolve to a chunk (the
+        search leg already skips it), so dropping it only reclaims space and stops it from
+        crowding the KNN window. Runs in its own write transaction."""
+        with self.writer() as conn:
+            before = conn.execute(
+                "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+            ).fetchone()[0]
+            if before:
+                conn.execute(
+                    "DELETE FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)")
+            return before
+
     # -- schema / meta -----------------------------------------------------
     def ensure_schema(self) -> None:
         # executescript() implicitly COMMITs, so it must run outside our explicit
