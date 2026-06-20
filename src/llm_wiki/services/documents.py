@@ -19,6 +19,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from itertools import groupby
 from pathlib import Path
 from urllib.parse import quote
 
@@ -852,6 +853,109 @@ class DocumentService:
             self.db, self.embedder, question, max_chars=max_chars,
             max_sources=max_sources, mode=mode, folder=folder, tags=tags,
             params=self.search_params)
+
+    # ---- llms.txt corpus export (agent-facing site map / full ingest) ----
+    def _corpus_docs(self, folder: str | None = None) -> list[dict]:
+        """Every non-deleted document, ordered folder→path, each with its latest
+        body and tags — the single-pass source shared by the llms.txt exports."""
+        q = "SELECT id, path, title, folder, updated_at FROM documents WHERE is_deleted=0"
+        params: list = []
+        if folder:
+            f = folder.strip("/")
+            q += " AND (folder=? OR folder LIKE ?)"
+            params += [f, f + "/%"]
+        q += " ORDER BY folder, path"
+        out: list[dict] = []
+        with self.db.reader() as conn:
+            rows = conn.execute(q, params).fetchall()
+            tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
+            for r in rows:
+                out.append({
+                    "path": r["path"], "title": r["title"] or r["path"],
+                    "folder": r["folder"] or "", "updated_at": r["updated_at"],
+                    "tags": tags_by.get(r["id"], []),
+                    "body": self._latest_body(conn, r["id"]),
+                })
+        return out
+
+    @staticmethod
+    def _doc_description(body: str, max_chars: int = 120) -> str:
+        """A one-line description for the llms.txt index: a frontmatter
+        ``description``/``summary`` if present, else the first non-empty body line
+        with markdown markers stripped (single line, never HTML)."""
+        meta, off = parse_frontmatter(body)
+        for key in ("description", "summary"):
+            v = meta.get(key)
+            if isinstance(v, str) and v.strip():
+                return " ".join(v.split())[:max_chars]
+        for line in body[off:].splitlines():
+            s = line.strip()
+            # Skip blank lines and headings — a heading is ~the title we already show
+            # as the link text, so the description should be the first prose line.
+            if not s or s.startswith("#"):
+                continue
+            s = s.lstrip(">").strip().lstrip("-*").strip()
+            if s:
+                return " ".join(s.split())[:max_chars]
+        return ""
+
+    def _doc_raw_url(self, path: str, base_url: str = "") -> str:
+        enc = quote(path)
+        return f"{base_url.rstrip('/')}/doc/{enc}/raw" if base_url else f"/doc/{enc}/raw"
+
+    def llms_index(self, *, site_title: str, base_url: str = "") -> str:
+        """Render the vault as an ``llms.txt`` index (the emerging agent-facing site
+        map, https://llmstxt.org/): an H1 title, a one-line blockquote summary, then
+        an H2 section per folder listing each document as a markdown link to its raw
+        (.md) source plus a short description — so any LLM, not just an MCP client,
+        can discover what the knowledge base holds."""
+        docs = self._corpus_docs()
+        lines = [
+            f"# {site_title}", "",
+            f"> 마크다운 지식베이스 — 문서 {len(docs)}개. "
+            "각 항목은 원문(.md) 링크이며, 전체 본문은 /llms-full.txt 로 한 번에 가져올 수 있습니다.",
+            "",
+        ]
+        for folder, group in groupby(docs, key=lambda d: d["folder"]):
+            lines.append(f"## {folder or '루트'}")
+            for d in group:
+                desc = self._doc_description(d["body"])
+                url = self._doc_raw_url(d["path"], base_url)
+                lines.append(f"- [{d['title']}]({url})" + (f": {desc}" if desc else ""))
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def llms_full(self, *, site_title: str, max_chars: int = 2_000_000) -> dict:
+        """Render the whole vault as one concatenated markdown document
+        (``llms-full.txt``): each document's full body, prefixed by a path/tags/updated
+        header and separated by a horizontal rule, so an agent can ingest the entire
+        corpus in a single request. Emission stops once ``max_chars`` of content is
+        reached (``truncated=True``), bounding the response for very large vaults."""
+        docs = self._corpus_docs()
+        out = [f"# {site_title}", "", f"> 전체 코퍼스 export — 문서 {len(docs)}개.", ""]
+        included = 0
+        size = 0
+        truncated = False
+        for d in docs:
+            body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
+            header = (f"---\n\n# {d['title']}\n\n"
+                      f"- 경로: `{d['path']}`\n"
+                      + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
+                      + f"- 수정: {d['updated_at']}\n")
+            block = header + "\n" + body + "\n"
+            # Always emit at least one document, even if it alone exceeds the budget,
+            # so the response is never just a header for a huge first doc.
+            if included > 0 and size + len(block) > max_chars:
+                truncated = True
+                break
+            out.append(block)
+            size += len(block)
+            included += 1
+        text = "\n".join(out).rstrip() + "\n"
+        if truncated:
+            text += (f"\n---\n\n> [truncated] {included}/{len(docs)} 문서만 포함되었습니다. "
+                     "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n")
+        return {"text": text, "included": included, "total": len(docs), "truncated": truncated}
 
     def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
         """Resolve a wikilink/markdown target to an existing document path, or None."""

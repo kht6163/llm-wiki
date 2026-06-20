@@ -42,4 +42,5 @@
 </div>
 {% endif %}
 <p class="muted">MCP 엔드포인트(streamable-http): <code>http://{{ request.url.hostname }}:&lt;MCP_PORT&gt;/mcp</code></p>
+<p class="muted">에이전트 수집 엔드포인트(llms.txt 표준): <code>/llms.txt</code>(문서 색인) · <code>/llms-full.txt</code>(전체 본문 한 번에). 로그인 세션 또는 위 API 키(<code>Authorization: Bearer</code>)로 접근합니다.</p>
 {% endblock %}

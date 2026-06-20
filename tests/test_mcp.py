@@ -47,12 +47,27 @@ async def test_tools_registered(ctx):
         "append_section", "append_to_document", "patch_tags", "move_document",
         "delete_document", "restore_revision", "rename_references", "edit_documents",
         "set_document_property", "remove_document_property",
-        "list_folders", "create_folder", "delete_folder", "toggle_task",
+        "list_folders", "create_folder", "delete_folder", "toggle_task", "export_corpus",
+        "whoami",
         "set_document_properties",
         "get_or_create_daily_note", "list_trash", "restore_document", "purge_document",
         "list_favorites", "set_favorite", "upload_attachment", "rename_tag", "merge_tags",
     }
     assert expected <= names, names
+
+
+def test_server_exposes_agent_instructions(ctx):
+    # The initialize-time orientation must reach the FastMCP server so clients can
+    # surface it to the model (primes vault conventions: locking, wikilinks, etc.).
+    mcp = create_mcp_server(ctx)
+    instr = mcp.instructions or ""
+    assert "base_version" in instr and "[[wikilinks]]" in instr
+
+
+async def test_whoami_reports_role_and_capabilities(editor_mcp):
+    d = _payload(await editor_mcp.call_tool("whoami", {}))
+    assert d["ok"] and d["username"] == "alice" and d["role"] == "editor"
+    assert d["can_read"] is True and d["can_write"] is True and d["can_admin"] is False
 
 
 def test_error_envelope_shape():

@@ -109,9 +109,35 @@ def _shape_conflict(err: dict, return_content: str) -> dict:
     return {**err, "error": trimmed}
 
 
+# Server-level orientation surfaced in the MCP `initialize` result (clients show it
+# to the model). It primes an agent on this vault's conventions ONCE, so the per-tool
+# descriptions can stay terse and the agent picks the right tool without trial-and-error.
+MCP_INSTRUCTIONS = """\
+This is an Obsidian-style markdown knowledge base — a shared memory for humans and \
+LLM agents. Conventions:
+
+- DISCOVER: call `whoami` to learn your role/permissions, `export_corpus(format="index")` \
+for an llms.txt site map of every document, or `list_folders`/`get_tags` for the layout. \
+For a question, prefer `assemble_context` (returns citation-tagged, budget-bounded context) \
+over reading documents one by one; use `search_documents` for exploratory discovery.
+- READ: `read_document` returns a `version` — that is the `base_version` you echo back when \
+writing. `get_outline`/`read_chunk` read a slice without pulling the whole body.
+- WRITE (editor/admin only): pass the `base_version` you last read. If the document changed \
+since, the write is REJECTED with a `conflict` error carrying the current content — re-read \
+and retry, never force. Prefer token-cheap targeted edits (`patch_document`, `append_section`, \
+`replace_section`, `append_to_document`, `patch_tags`) over rewriting the whole body with \
+`update_document`.
+- LINK: documents cite each other with `[[wikilinks]]`. Call `resolve_links` BEFORE writing \
+links to confirm targets exist (avoid creating broken references); `get_backlinks` shows who \
+links here and why.
+- Errors are structured with a machine-readable `suggested_action` (e.g. re_read_and_retry, \
+verify_path) — branch on it instead of parsing prose."""
+
+
 def create_mcp_server(app: AppContext) -> FastMCP:
     db, docs = app.db, app.docs
-    mcp = FastMCP(name="llm-wiki", stateless_http=True, json_response=True)
+    mcp = FastMCP(name="llm-wiki", instructions=MCP_INSTRUCTIONS,
+                  stateless_http=True, json_response=True)
     # Throttle Bearer-auth failures per client IP so a leaked endpoint can't be
     # used to brute-force API keys (the web login is limited separately).
     auth_limiter = RateLimiter(max_attempts=10, window_s=300.0)
@@ -432,6 +458,36 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def list_folders(ctx: Context) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, "folders": docs.list_folders()},
                            "list_folders")
+
+    @mcp.tool(description="Identify the calling agent: the username, role, and exactly which "
+                          "capabilities the presented API key grants (can_read/can_write/"
+                          "can_admin). Call this first to decide whether you may create/edit "
+                          "documents before attempting a write that would be rejected.")
+    async def whoami(ctx: Context) -> dict:
+        def fn(p: Principal) -> dict:
+            return {"ok": True, "username": p.username, "role": p.role,
+                    "can_read": True, "can_write": p.can_write, "can_admin": p.can_admin}
+        return await _call(ctx, fn, "whoami")
+
+    @mcp.tool(description="Export the whole vault as one block of text for context-stuffing. "
+                          "format='index' returns the llms.txt site map (a markdown link + short "
+                          "description per document); format='full' concatenates every document's "
+                          "full body (llms-full.txt) so you can ingest the ENTIRE corpus in ONE "
+                          "call instead of many read_document round-trips. 'full' stops at "
+                          "max_chars and sets truncated=true when more remains.")
+    async def export_corpus(
+        ctx: Context,
+        format: Annotated[Literal["index", "full"],
+                          Field(description="'index' (site map) or 'full' (whole corpus).")] = "index",
+        max_chars: Annotated[int, Field(ge=1000, le=2_000_000,
+                             description="For format='full': stop after this many characters.")] = 200_000,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            title = app.settings.site_title
+            if format == "full":
+                return {"ok": True, "format": "full", **docs.llms_full(site_title=title, max_chars=max_chars)}
+            return {"ok": True, "format": "index", "text": docs.llms_index(site_title=title)}
+        return await _call(ctx, fn, "export_corpus")
 
     @mcp.tool(description="Outgoing links of a document (resolved + broken).")
     async def get_links(ctx: Context, path: str) -> dict:

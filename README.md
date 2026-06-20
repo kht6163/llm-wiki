@@ -4,6 +4,7 @@
 
 - 📝 **웹 UI** — 옵시디언풍 앱 셸(리본 + 상시 좌측 파일트리 + 본문 + 우측 패널 + 상태바), 마크다운 뷰어/에디터, `[[위키링크]]`·백링크, 리비전 이력, 링크 그래프 시각화
 - 🤖 **HTTP MCP 서버** — LLM 에이전트가 streamable-http로 접속해 문서를 검색/읽기/생성/수정
+- 📃 **에이전트 친화 포맷(llms.txt)** — `/llms.txt`(문서 색인 사이트맵)·`/llms-full.txt`(전체 본문 한 번에 수집)로 MCP가 아닌 **어떤 LLM 클라이언트도** vault를 발견·통째 수집. 세션 또는 API 키(Bearer)로 접근
 - 🔎 **하이브리드 검색** — BM25(SQLite FTS5) + 임베딩 벡터(sqlite-vec)를 RRF로 융합
 - 🧠 **로컬 임베딩** — HuggingFace `sentence-transformers`(API 키 불필요, 한국어 강함)
 - 🔒 **다중 사용자 동시 편집** — 문서별 정수 버전 낙관적 잠금. 앞선 변경이 있으면 **거부**하고 현재 내용을 돌려줘서 재확인 후 재시도. 모든 변경은 작성자·시각과 함께 **전체 본문 스냅샷**으로 기록
@@ -43,6 +44,7 @@ uv sync          # 의존성 설치 (torch는 CPU 전용 휠로 설치됨)
 | `VAULT_PATH` | 마크다운 `.md` 파일 저장 위치(vault) | `./vault` |
 | `DB_PATH` | SQLite DB 경로(메타·리비전·검색인덱스·그래프·사용자) | `./data/llm_wiki.db` |
 | `EMBEDDING_MODEL` | 로컬 임베딩 모델 | `intfloat/multilingual-e5-base` |
+| `SITE_TITLE` | 지식베이스 표시 이름(`/llms.txt`·`/llms-full.txt` 코퍼스 export의 H1) | `llm-wiki` |
 | `SESSION_SECRET` | 세션 쿠키 서명 키(비우면 자동 생성·DB 저장) | (자동) |
 | `COOKIE_SECURE` | 세션 쿠키 Secure(HTTPS 전용) 플래그. TLS 뒤에서는 `true` | `false` |
 | `FORWARDED_ALLOW_IPS` | 신뢰할 리버스 프록시 IP(쉼표 구분 또는 `*`). 프록시 뒤에서 실제 클라이언트 IP를 복원해 스로틀·감사가 정확해짐 | `127.0.0.1` |
@@ -93,8 +95,12 @@ uv run llm-wiki create-api-key --username admin --name my-agent
 
 제공 MCP 툴:
 
+접속 직후 클라이언트에는 서버 **`instructions`**(이 vault의 규약 — 낙관적 잠금·`[[위키링크]]`·토큰 절약 편집 등)가 전달되어 에이전트가 시행착오 없이 올바른 툴을 고를 수 있습니다.
+
 | 툴 | 권한 | 설명 |
 |---|---|---|
+| `whoami()` | 읽기 | 호출 에이전트의 사용자명·역할·권한(`can_write`/`can_admin`). 쓰기 전 권한 확인 |
+| `export_corpus(format, max_chars?)` | 읽기 | vault 전체를 한 덩어리로: `index`=llms.txt 색인, `full`=전체 본문 연결(컨텍스트 일괄 수집) |
 | `search_documents(query, mode, top_k, folder?, tags?)` | 읽기 | 하이브리드/BM25/벡터 검색. `count`+`truncated`(top_k 초과 가능성) 반환 |
 | `assemble_context(question, max_chars?, max_sources?, mode?, folder?, tags?)` | 읽기 | RAG 1-콜 프리미티브: 하이브리드 랭킹→문서별 최적 구절을 예산 내로 조립해 인용(`[n]`) 태깅된 `context`+`sources` 반환. `search`+`read` 왕복 대체 |
 | `get_related_documents(path, limit?)` | 읽기 | 임베딩상 의미가 가까운 문서(링크가 아닌 벡터 기준). `score`=코사인 유사도 |

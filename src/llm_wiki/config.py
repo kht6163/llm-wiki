@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # Embeddings (local HuggingFace sentence-transformers model)
     embedding_model: str = "intfloat/multilingual-e5-base"
 
+    # Display name for the knowledge base — used as the H1 of the llms.txt /
+    # llms-full.txt corpus exports (the agent-facing "what is this vault" line).
+    site_title: str = "llm-wiki"
+
     # Hybrid-search fusion tuning. Defaults match the long-standing hardcoded values;
     # tune per corpus (recall vs. latency) without a code change. rrf_k is the
     # Reciprocal-Rank-Fusion constant (larger flattens rank influence); the candidate_*

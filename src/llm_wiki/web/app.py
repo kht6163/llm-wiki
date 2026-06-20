@@ -54,6 +54,7 @@ from ..services.auth import (
     delete_session,
     get_or_create_session_secret,
     list_api_keys,
+    principal_from_api_key,
     principal_from_session,
     revoke_api_key,
 )
@@ -302,6 +303,27 @@ def create_web_app(app: AppContext) -> FastAPI:
             raise ForbiddenError("Admin only.")
         return p
 
+    def principal_web_or_bearer(request: Request) -> Principal | None:
+        """A logged-in human (session cookie) OR an agent presenting its MCP API key
+        as a Bearer token. Bridges the two surfaces so agent-facing reads (llms.txt
+        and the raw .md links it points at) work with a `curl -H 'Authorization:
+        Bearer <key>'` exactly as they do in a browser."""
+        p = user(request)
+        if p is not None:
+            return p
+        authz = request.headers.get("authorization", "")
+        if authz[:7].lower() == "bearer ":
+            return principal_from_api_key(db, authz[7:].strip())
+        return None
+
+    def require_user_or_bearer(request: Request) -> Principal:
+        """Route dependency: a session OR Bearer-API-key Principal, else raise (login
+        redirect for a browser, 401 for an `/api/` path) — see principal_web_or_bearer."""
+        p = principal_web_or_bearer(request)
+        if p is None:
+            raise _AuthRequired()
+        return p
+
     @web.exception_handler(PathError)
     async def _on_path_error(request: Request, exc: PathError):
         # An unsafe/malformed path is a client error, not a 500. API routes get JSON;
@@ -428,6 +450,34 @@ def create_web_app(app: AppContext) -> FastAPI:
             pass  # never let a metrics refresh failure 500 the scrape endpoint
         body, ctype = render_latest()
         return Response(content=body, media_type=ctype)
+
+    # ---- llms.txt corpus export (agent-facing site map / full ingest) ---
+    def _llms_unauthorized() -> PlainTextResponse:
+        return PlainTextResponse(
+            "Unauthorized. Log in via the web UI, or send "
+            "'Authorization: Bearer <api_key>'.\n",
+            status_code=401, media_type="text/plain; charset=utf-8",
+            headers={"WWW-Authenticate": "Bearer"})
+
+    @web.get("/llms.txt")
+    def llms_txt(request: Request):
+        # The emerging agent-facing site map (https://llmstxt.org/): an index of the
+        # vault as markdown links to each doc's raw (.md), readable by ANY LLM client.
+        if principal_web_or_bearer(request) is None:
+            return _llms_unauthorized()
+        text = docs.llms_index(site_title=app.settings.site_title,
+                               base_url=str(request.base_url))
+        return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
+
+    @web.get("/llms-full.txt")
+    def llms_full_txt(request: Request, max_chars: int = 2_000_000):
+        # The whole corpus concatenated into one markdown document, so an agent can
+        # ingest the full context in a single request.
+        if principal_web_or_bearer(request) is None:
+            return _llms_unauthorized()
+        res = docs.llms_full(site_title=app.settings.site_title,
+                             max_chars=clamp_int(max_chars, 10_000, 20_000_000))
+        return PlainTextResponse(res["text"], media_type="text/markdown; charset=utf-8")
 
     # ---- documents ------------------------------------------------------
     @web.get("/", response_class=HTMLResponse)
@@ -739,7 +789,9 @@ def create_web_app(app: AppContext) -> FastAPI:
                       current_version=data["current_version"], revisions=data["revisions"])
 
     @web.get("/doc/{path:path}/raw")
-    def raw(path: str, request: Request, _p: Principal = Depends(require_user)):
+    def raw(path: str, request: Request, _p: Principal = Depends(require_user_or_bearer)):
+        # Dual auth (session OR Bearer): the raw .md is the target of every /llms.txt
+        # link, so an API-key agent must be able to GET it the same way it fetched the index.
         doc = docs.get(path)
         filename = doc["path"].rsplit("/", 1)[-1]
         return PlainTextResponse(
