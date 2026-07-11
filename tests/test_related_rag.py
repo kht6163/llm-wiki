@@ -60,6 +60,82 @@ def test_assemble_context_cites_sources_and_caps_budget(ctx, principals):
     assert res["truncated"] is True                          # the chunk outran the budget
 
 
+@pytest.mark.parametrize(
+    ("budget", "documents", "expected_sources", "expected_truncated"),
+    [
+        pytest.param(0, [("zero.md", "# Zero\n\nbudget material")], 0, True, id="zero"),
+        pytest.param(5, [("tiny.md", "# Tiny\n\nbudget material")], 0, True, id="tiny"),
+        pytest.param(
+            200,
+            [
+                ("one.md", "# One\n\nbudget apple"),
+                ("two.md", "# Two\n\nbudget berry"),
+                ("three.md", "# Three\n\nbudget cherry"),
+            ],
+            3,
+            False,
+            id="multiple-citations-and-separators",
+        ),
+        pytest.param(
+            35,
+            [("heading.md", "# A Heading Too Long For This Budget\n\nbudget material")],
+            0,
+            True,
+            id="heading-citation-does-not-fit",
+        ),
+        pytest.param(
+            80,
+            [("long.md", "# Long\n\n" + "budget material keeps going " * 20)],
+            1,
+            True,
+            id="truncated-first-source",
+        ),
+    ],
+)
+def test_assemble_context_budget_includes_citations_and_separators(
+    ctx, principals, budget, documents, expected_sources, expected_truncated
+):
+    docs, principal = ctx.docs, principals["editor"]
+    for path, body in documents:
+        docs.create(principal, path, body)
+
+    result = docs.assemble_context(
+        "budget", mode="bm25", max_chars=budget, max_sources=len(documents)
+    )
+
+    assert result["char_count"] == len(result["context"])
+    assert result["char_count"] <= budget
+    assert result["count"] == expected_sources
+    assert result["truncated"] is expected_truncated
+    if expected_sources == 0:
+        assert result["context"] == ""
+
+
+def test_assemble_context_budget_keeps_balanced_fence_when_it_fits(ctx, principals):
+    ctx.docs.create(
+        principals["editor"], "fenced.md", "```py\nbudget material continues\n```"
+    )
+    citation = "[1] fenced.md\n"
+    minimum = len(citation) + len("```\n```")
+
+    for budget in range(len(citation), minimum):
+        result = ctx.docs.assemble_context(
+            "budget", mode="bm25", max_chars=budget, max_sources=1
+        )
+        assert result["count"] == 0, (budget, result)
+        assert result["context"] == ""
+        assert result["truncated"] is True
+
+    for budget in range(minimum, minimum + 20):
+        result = ctx.docs.assemble_context(
+            "budget", mode="bm25", max_chars=budget, max_sources=1
+        )
+        assert result["count"] == 1, budget
+        assert result["char_count"] <= budget
+        assert result["context"].count("```") % 2 == 0
+        assert result["truncated"] is True
+
+
 def test_assemble_context_marker_count_matches_sources(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "alpha.md", "# Alpha\n\nThe alpha note talks about rivers and water flow.")

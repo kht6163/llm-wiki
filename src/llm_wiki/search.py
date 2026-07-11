@@ -800,7 +800,7 @@ def assemble_context(
     ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
-    max_chars = clamp_int(max_chars, 200, 24000)
+    max_chars = clamp_int(max_chars, 0, 24000)
     max_sources = clamp_int(max_sources, 1, 20)
     k = max(max_sources * params.candidate_factor, params.candidate_min)
     text, filters = parse_query_filters(question)
@@ -842,7 +842,8 @@ def assemble_context(
             if allowed is not None and did not in allowed:
                 continue
 
-            remaining = max_chars - total
+            separator = "\n\n" if parts else ""
+            remaining = max_chars - total - len(separator)
             if remaining <= 0:
                 truncated = True
                 break
@@ -850,12 +851,37 @@ def assemble_context(
             if passage is None:
                 continue
             heading, text, was_trunc = passage
-            if was_trunc:
-                truncated = True
             n = len(sources) + 1
             cite = f"[{n}] {d['path']}" + (f" › {heading}" if heading else "")
-            parts.append(f"{cite}\n{text}")
-            total += len(text)
+            passage_budget = remaining - len(cite) - 1
+            if passage_budget <= 0:
+                truncated = True
+                break
+            passage_text = text
+            trim_limit = passage_budget
+            while True:
+                text, budget_trunc = _trim_to_budget(passage_text, trim_limit)
+                if len(text) <= passage_budget:
+                    break
+                # Leave room for a code-fence closer added by _trim_to_budget().
+                trim_limit -= max(1, len(text) - passage_budget)
+                if trim_limit <= 0:
+                    text = ""
+                    break
+            if (
+                passage_text.startswith("```")
+                and text
+                and (not text.startswith("```") or text.count("```") % 2)
+            ):
+                text = ""
+            if not text or len(text) > passage_budget:
+                truncated = True
+                break
+            if was_trunc or budget_trunc:
+                truncated = True
+            block = f"{cite}\n{text}"
+            parts.append(block)
+            total += len(separator) + len(block)
             sources.append({
                 "n": n, "path": d["path"], "title": d["title"] or d["path"],
                 "heading": heading, "version": d["version"],
