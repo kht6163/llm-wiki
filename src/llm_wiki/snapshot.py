@@ -52,6 +52,7 @@ class RestoreRollbackError(ValueError):
         self.publish_error = publish_error
         self.rollback_errors = tuple(rollback_errors)
         self.backup_paths = backup_paths
+        self.staging_cleanup_errors: tuple[OSError, ...] = ()
         locations = ", ".join(str(path) for path in backup_paths) or "unknown locations"
         super().__init__(
             "restore publication failed and rollback could not complete; "
@@ -551,6 +552,7 @@ def restore_snapshot(
     staged_vault = Path(
         tempfile.mkdtemp(prefix=f".{vault.name}.restore-stage-", dir=vault.parent)
     )
+    primary_error: BaseException | None = None
     try:
         try:
             with tarfile.open(src, "r") as archive:
@@ -587,9 +589,20 @@ def restore_snapshot(
         backup_cleanup_warnings = _publish_restore(
             staged_db, staged_vault, db_path, vault
         )
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        _remove_path(staged_db)
-        _remove_path(staged_vault)
+        staging_cleanup_errors: list[OSError] = []
+        for staged_path in (staged_db, staged_vault):
+            try:
+                _remove_path(staged_path)
+            except OSError as exc:
+                staging_cleanup_errors.append(exc)
+        if isinstance(primary_error, RestoreRollbackError):
+            primary_error.staging_cleanup_errors = tuple(staging_cleanup_errors)
+        elif primary_error is None and staging_cleanup_errors:
+            raise staging_cleanup_errors[0]
 
     embedding_model = manifest.get("embedding_model")
     return RestoreReport(

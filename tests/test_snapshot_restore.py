@@ -623,6 +623,12 @@ def test_restore_backup_cleanup_failure_is_success_with_cli_warning(
     assert "WARNING: restored successfully but backup cleanup failed" in output
     assert preserved
     assert all(path.exists() for path in preserved)
+    assert all(str(path) in output for path in preserved)
+    assert any(path.is_file() and path.read_bytes() == b"original db" for path in preserved)
+    assert any(
+        path.is_dir() and (path / "original.txt").read_text() == "original"
+        for path in preserved
+    )
     assert (settings.vault_path / "note.md").exists()
 
 
@@ -645,6 +651,7 @@ def test_restore_cli_reports_preserved_backup_when_rollback_fails(
     settings.vault_path.mkdir()
     (settings.vault_path / "original.txt").write_text("original")
     real_replace = snapshot_writer.os.replace
+    real_remove = snapshot_writer._remove_path
     preserved: list[Path] = []
     rollback_errors: list[snapshot_writer.RestoreRollbackError] = []
 
@@ -664,6 +671,13 @@ def test_restore_cli_reports_preserved_backup_when_rollback_fails(
         return real_replace(source, destination)
 
     monkeypatch.setattr(snapshot_writer.os, "replace", fail_publish_and_db_rollback)
+
+    def fail_staging_cleanup(path):
+        if ".restore-stage-" in path.name and path.exists():
+            raise OSError("simulated staging cleanup failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(snapshot_writer, "_remove_path", fail_staging_cleanup)
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     real_restore = _cli_impl.restore_snapshot
 
@@ -687,6 +701,9 @@ def test_restore_cli_reports_preserved_backup_when_rollback_fails(
     assert rollback_errors[0].backup_paths == (preserved[0],)
     assert str(rollback_errors[0].publish_error) == "simulated vault publish failure"
     assert str(rollback_errors[0].rollback_errors[0]) == "simulated database rollback failure"
+    assert str(rollback_errors[0].staging_cleanup_errors[0]) == (
+        "simulated staging cleanup failure"
+    )
 
 
 @pytest.mark.parametrize("corruption", ["database", "managed"])
