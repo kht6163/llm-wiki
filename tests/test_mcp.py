@@ -58,6 +58,23 @@ async def test_tools_registered(ctx):
     assert expected <= names, names
 
 
+async def test_workload_range_schema_hints_preserve_structured_errors(editor_mcp):
+    tools = {tool.name: tool for tool in await editor_mcp.list_tools()}
+    search_top_k = tools["search_documents"].inputSchema["properties"]["top_k"]
+    graph_depth = tools["get_graph"].inputSchema["properties"]["depth"]
+    graph_limit = tools["get_graph"].inputSchema["properties"]["limit"]
+
+    assert (search_top_k["minimum"], search_top_k["maximum"]) == (1, 50)
+    assert (graph_depth["minimum"], graph_depth["maximum"]) == (1, 3)
+    assert (graph_limit["minimum"], graph_limit["maximum"]) == (1, 2000)
+
+    search_error = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "bounded", "top_k": 0}))
+    graph_error = _payload(await editor_mcp.call_tool("get_graph", {"limit": 2001}))
+    assert search_error["ok"] is False and search_error["error"]["code"] == "validation"
+    assert graph_error["ok"] is False and graph_error["error"]["code"] == "validation"
+
+
 def test_server_exposes_agent_instructions(ctx):
     # The initialize-time orientation must reach the FastMCP server so clients can
     # surface it to the model (primes vault conventions: locking, wikilinks, etc.).
@@ -630,9 +647,9 @@ async def test_all_rejected_mcp_write_tools_use_safe_audit_metadata(
         ("purge_document", {"path": "purge.md"},
          "doc_purge", "purge.md"),
         ("rename_tag", {"old": "private", "new": "public"},
-         "doc_update", "tag:private -> public"),
+         "doc_update", "tags:rename"),
         ("merge_tags", {"sources": ["one", "two"], "dest": "merged"},
-         "doc_update", "tags:one,two -> merged"),
+         "doc_update", "tags:merge count=2"),
         ("create_folder", {"path": "new-folder"},
          "folder_create", "new-folder"),
         ("delete_folder", {"path": "old-folder"},
@@ -1306,6 +1323,28 @@ async def test_merge_tags_limit_does_not_audit_raw_tags(editor_mcp, ctx, caplog)
         ).fetchall()
     assert secret_tag not in json.dumps([dict(row) for row in rows])
     assert secret_tag not in caplog.text
+
+
+async def test_tag_validation_audits_never_include_raw_values(editor_mcp, ctx, caplog):
+    rename_secret = "private-rename-source"
+    merge_secret = "private-merge-source"
+
+    rename_result = _payload(await editor_mcp.call_tool(
+        "rename_tag", {"old": rename_secret, "new": ""}))
+    merge_result = _payload(await editor_mcp.call_tool(
+        "merge_tags", {"sources": [merge_secret], "dest": ""}))
+
+    assert rename_result["ok"] is False and rename_result["error"]["code"] == "validation"
+    assert merge_result["ok"] is False and merge_result["error"]["code"] == "validation"
+    with ctx.db.reader() as conn:
+        rows = conn.execute(
+            "SELECT target, detail FROM audit_log "
+            "WHERE action='doc_update' AND outcome='validation' ORDER BY id"
+        ).fetchall()
+    serialized = json.dumps([dict(row) for row in rows])
+    assert {row["target"] for row in rows} == {"tags:rename", "tags:merge count=1"}
+    assert rename_secret not in serialized and merge_secret not in serialized
+    assert rename_secret not in caplog.text and merge_secret not in caplog.text
 
 
 async def test_rename_tag_forbidden_for_viewer(ctx, principals, monkeypatch):

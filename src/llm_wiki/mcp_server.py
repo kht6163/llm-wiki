@@ -330,7 +330,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         query: str,
         mode: Annotated[Literal["hybrid", "bm25", "vector"],
                         Field(description="Ranking mode.")] = "hybrid",
-        top_k: Annotated[int, Field(description="Max hits (1..50).")] = 10,
+        top_k: Annotated[int, Field(
+            description="Max hits (1..50).",
+            json_schema_extra={"minimum": 1, "maximum": 50},
+        )] = 10,
         folder: Annotated[str | None, Field(description="Restrict to this folder subtree.")] = None,
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
         since: Annotated[str | None,
@@ -637,8 +640,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "whole vault; otherwise BFS to 'depth' around the root document.")
     async def get_graph(
         ctx: Context, root: str | None = None,
-        depth: Annotated[int, Field(description="BFS depth around root (1..3).")] = 1,
-        limit: Annotated[int, Field(description="Max nodes (1..2000).")] = 500,
+        depth: Annotated[int, Field(
+            description="BFS depth around root (1..3).",
+            json_schema_extra={"minimum": 1, "maximum": 3},
+        )] = 1,
+        limit: Annotated[int, Field(
+            description="Max nodes (1..2000).",
+            json_schema_extra={"minimum": 1, "maximum": 2000},
+        )] = 500,
         include_unresolved: bool = True,
     ) -> dict:
         def fn(_p: Principal) -> dict:
@@ -984,7 +993,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "left as-is. Returns {dest, sources, docs_affected, docs_changed}.")
     async def rename_tag(ctx: Context, old: str, new: str) -> dict:
         return await _call(ctx, lambda p: docs.rename_tag(p, old, new), "rename_tag",
-                           audit_action="doc_update", audit_target=f"tag:{old} -> {new}")
+                           audit_action="doc_update", audit_target="tags:rename")
 
     @mcp.tool(description="Merge several frontmatter tags into one across the whole vault "
                           "(editor/admin only): every document tagged with any of 'sources' is "
@@ -1003,8 +1012,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             fn,
             "merge_tags",
             audit_action="doc_update",
-            audit_target=(f"tags:{','.join(sources)} -> {dest}"
-                          if len(sources) <= MAX_TAGS else f"tags:count={len(sources)}"),
+            audit_target=f"tags:merge count={len(sources)}",
         )
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
