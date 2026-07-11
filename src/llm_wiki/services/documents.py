@@ -29,6 +29,7 @@ from ..embedding import Embedder
 from ..markdown_utils import (
     SCHEME_RE,
     _mask,
+    derive_content_title,
     derive_title,
     document_properties,
     extract_links,
@@ -1043,16 +1044,24 @@ class DocumentService:
         norm, folder = path_norm(rel), folder_of(rel)
         content = content or ""
         meta = parse_frontmatter(content)[0]
-        final_title = (title or derive_title(meta, content, rel)).strip()
-        tagset = self._merge_tags(meta, content, tags)
+        content_title = derive_content_title(meta, content)
+        derived_tags = self._merge_tags(meta, content, tags)
         chash, now = sha256_hex(content), now_iso()
 
         with self.db.writer() as conn:
             row = conn.execute(
-                "SELECT id, version, content_hash, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+                "SELECT id, title, version, content_hash, is_deleted FROM documents "
+                "WHERE path_norm=?",
+                (norm,),
+            ).fetchone()
             if not row or row["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
             doc_id = row["id"]
+            final_title = (
+                title.strip() if title and title.strip() else content_title or row["title"]
+            )
+            current_tags = self._tags_for_ids(conn, [doc_id]).get(doc_id, [])
+            tagset = derived_tags if (tags is not None or derived_tags) else current_tags
             content_changed = row["content_hash"] != chash
             # vector_dirty moves monotonically toward dirty: a content change forces
             # 1, but an unchanged-content edit must NOT clear a pending flag — doing so
@@ -1324,7 +1333,9 @@ class DocumentService:
         if target == sorted(current):  # no net change — stay idempotent, skip the version bump
             return {"path": doc["path"], "version": doc["version"], "tags": sorted(current)}
         new_content = set_frontmatter_tags(doc["content"], target)
-        updated = self.update(principal, doc["path"], doc["version"], new_content)
+        updated = self.update(
+            principal, doc["path"], doc["version"], new_content, tags=target
+        )
         return {"path": updated["path"], "version": updated["version"], "tags": updated["tags"]}
 
     def merge_tags(self, principal: Principal, sources: list[str], dest: str) -> dict:

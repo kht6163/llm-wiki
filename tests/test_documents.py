@@ -28,6 +28,69 @@ def test_create_read_update_version(ctx, principals):
     assert (ctx.settings.vault_path / "notes" / "hello.md").read_text(encoding="utf-8").endswith("updated")
 
 
+def test_explicit_title_and_tags_survive_body_only_update(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(
+        p, "note.md", "plain body", title="Explicit", tags=["kept"], embed=False
+    )
+
+    updated = docs.update(
+        p, "note.md", created["version"], "plain body changed", embed=False
+    )
+
+    assert updated["title"] == "Explicit"
+    assert updated["tags"] == ["kept"]
+
+
+def test_content_title_replaces_preserved_title_on_update(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
+
+    updated = docs.update(
+        p, "note.md", created["version"], "# Derived\n\nplain body changed", embed=False
+    )
+
+    assert updated["title"] == "Derived"
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_tags"),
+    [
+        ("---\ntags: [frontmatter]\n---\nplain body changed", ["frontmatter"]),
+        ("plain body changed #inline", ["inline"]),
+    ],
+)
+def test_content_tags_replace_preserved_tags_on_update(
+    ctx, principals, content, expected_tags
+):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", tags=["kept"], embed=False)
+
+    updated = docs.update(p, "note.md", created["version"], content, embed=False)
+
+    assert updated["tags"] == expected_tags
+
+
+def test_explicit_update_metadata_replaces_preserved_metadata(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(
+        p, "note.md", "plain body", title="Old", tags=["old"], embed=False
+    )
+
+    updated = docs.update(
+        p,
+        "note.md",
+        created["version"],
+        "plain body changed",
+        title="Explicit",
+        tags=["replacement"],
+        embed=False,
+    )
+
+    assert updated["title"] == "Explicit"
+    assert updated["tags"] == ["replacement"]
+
+
 def test_optimistic_conflict(ctx, principals):
     docs = ctx.docs
     p = principals["editor"]

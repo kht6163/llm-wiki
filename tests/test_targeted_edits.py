@@ -90,6 +90,16 @@ def test_append_key_is_scoped_per_user(docs, principals):
 
 
 # ---- patch: occurrence + regex ------------------------------------------
+def test_patch_preserves_explicit_title_and_tags(docs, principals):
+    p = principals["editor"]
+    docs.create(p, "patch-note.md", "plain old", title="Explicit", tags=["kept"])
+
+    updated = docs.patch(p, "patch-note.md", "old", "new")
+
+    assert updated["title"] == "Explicit"
+    assert updated["tags"] == ["kept"]
+
+
 def test_patch_literal_targets_nth_occurrence(docs, principals):
     p = principals["editor"]
     docs.create(p, "rep.md", "x\nx\nx\n")          # 'x' three times
@@ -132,6 +142,33 @@ def test_patch_occurrence_out_of_range(docs, principals):
     docs.create(p, "o.md", "k k")
     with pytest.raises(ValidationError):
         docs.patch(p, "o.md", "k", "Z", occurrence=5)
+
+
+# ---- replace_section metadata -------------------------------------------
+def test_replace_section_preserves_explicit_metadata(docs, principals):
+    p = principals["editor"]
+    docs.create(
+        p,
+        "section-note.md",
+        "## Section\n\nold body\n",
+        title="Section",
+        tags=["kept"],
+    )
+
+    updated = docs.replace_section(p, "section-note.md", "Section", "new body")
+
+    assert updated["title"] == "Section"
+    assert updated["tags"] == ["kept"]
+
+
+def test_patch_tags_can_clear_all_explicit_tags(docs, principals):
+    p = principals["editor"]
+    docs.create(p, "tagged.md", "plain body", title="Explicit", tags=["remove-me"])
+
+    updated = docs.patch_tags(p, "tagged.md", remove=["remove-me"])
+
+    assert updated["tags"] == []
+    assert docs.get("tagged.md")["tags"] == []
 
 
 # ---- restore_revision ----------------------------------------------------
