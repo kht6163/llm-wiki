@@ -856,28 +856,51 @@ class DocumentService:
             params=self.search_params)
 
     # ---- llms.txt corpus export (agent-facing site map / full ingest) ----
-    def _corpus_docs(self, folder: str | None = None) -> list[dict]:
-        """Every non-deleted document, ordered folder→path, each with its latest
-        body and tags — the single-pass source shared by the llms.txt exports."""
-        q = "SELECT id, path, title, folder, updated_at FROM documents WHERE is_deleted=0"
+    def _iter_corpus_docs(
+        self, folder: str | None = None, batch_size: int = 128
+    ) -> Iterator[dict]:
+        """Yield non-deleted documents in bounded batches, ordered folder→path."""
+        q = (
+            "SELECT d.id, d.path, d.title, d.folder, d.updated_at, r.body "
+            "FROM documents d "
+            "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version "
+            "WHERE d.is_deleted=0"
+        )
         params: list = []
         if folder:
             f = folder.strip("/")
-            q += " AND (folder=? OR folder LIKE ?)"
+            q += " AND (d.folder=? OR d.folder LIKE ?)"
             params += [f, f + "/%"]
-        q += " ORDER BY folder, path"
-        out: list[dict] = []
+        q += " ORDER BY d.folder, d.path"
+        batch_size = max(1, int(batch_size))
         with self.db.reader() as conn:
-            rows = conn.execute(q, params).fetchall()
-            tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
-            for r in rows:
-                out.append({
-                    "path": r["path"], "title": r["title"] or r["path"],
-                    "folder": r["folder"] or "", "updated_at": r["updated_at"],
-                    "tags": tags_by.get(r["id"], []),
-                    "body": self._latest_body(conn, r["id"]),
-                })
-        return out
+            cursor = conn.execute(q, params)
+            while rows := cursor.fetchmany(batch_size):
+                tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
+                for r in rows:
+                    yield {
+                        "path": r["path"], "title": r["title"] or r["path"],
+                        "folder": r["folder"] or "", "updated_at": r["updated_at"],
+                        "tags": tags_by.get(r["id"], []), "body": r["body"],
+                    }
+
+    def _corpus_count(self, folder: str | None = None) -> int:
+        q = "SELECT COUNT(*) FROM documents d WHERE d.is_deleted=0"
+        params: list = []
+        if folder:
+            f = folder.strip("/")
+            q += " AND (d.folder=? OR d.folder LIKE ?)"
+            params += [f, f + "/%"]
+        with self.db.reader() as conn:
+            return int(conn.execute(q, params).fetchone()[0])
+
+    @staticmethod
+    def _one_line(value: object) -> str:
+        return " ".join(str(value or "").split())
+
+    @classmethod
+    def _md_label(cls, value: object) -> str:
+        return cls._one_line(value).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
     @staticmethod
     def _doc_description(body: str, max_chars: int = 120) -> str:
@@ -910,19 +933,21 @@ class DocumentService:
         an H2 section per folder listing each document as a markdown link to its raw
         (.md) source plus a short description — so any LLM, not just an MCP client,
         can discover what the knowledge base holds."""
-        docs = self._corpus_docs()
+        total = self._corpus_count()
+        docs = self._iter_corpus_docs()
         lines = [
-            f"# {site_title}", "",
-            f"> 마크다운 지식베이스 — 문서 {len(docs)}개. "
+            f"# {self._md_label(site_title)}", "",
+            f"> 마크다운 지식베이스 — 문서 {total}개. "
             "각 항목은 원문(.md) 링크이며, 전체 본문은 /llms-full.txt 로 한 번에 가져올 수 있습니다.",
             "",
         ]
         for folder, group in groupby(docs, key=lambda d: d["folder"]):
-            lines.append(f"## {folder or '루트'}")
+            lines.append(f"## {self._md_label(folder or '루트')}")
             for d in group:
-                desc = self._doc_description(d["body"])
+                desc = self._one_line(self._doc_description(d["body"]))
                 url = self._doc_raw_url(d["path"], base_url)
-                lines.append(f"- [{d['title']}]({url})" + (f": {desc}" if desc else ""))
+                title = self._md_label(d["title"])
+                lines.append(f"- [{title}]({url})" + (f": {desc}" if desc else ""))
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
@@ -932,31 +957,59 @@ class DocumentService:
         header and separated by a horizontal rule, so an agent can ingest the entire
         corpus in a single request. Emission stops once ``max_chars`` of content is
         reached (``truncated=True``), bounding the response for very large vaults."""
-        docs = self._corpus_docs()
-        out = [f"# {site_title}", "", f"> 전체 코퍼스 export — 문서 {len(docs)}개.", ""]
+        limit = max(0, int(max_chars))
+        total = self._corpus_count()
+        parts = [
+            f"# {self._md_label(site_title)}\n\n"
+            f"> 전체 코퍼스 export — 문서 {total}개.\n"
+        ]
         included = 0
-        size = 0
         truncated = False
-        for d in docs:
-            body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
-            header = (f"---\n\n# {d['title']}\n\n"
-                      f"- 경로: `{d['path']}`\n"
-                      + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
-                      + f"- 수정: {d['updated_at']}\n")
-            block = header + "\n" + body + "\n"
-            # Always emit at least one document, even if it alone exceeds the budget,
-            # so the response is never just a header for a huge first doc.
-            if included > 0 and size + len(block) > max_chars:
+
+        def marker(count: int) -> str:
+            return (
+                f"\n---\n\n> [truncated] {count}/{total} 문서만 포함되었습니다. "
+                "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n"
+            )
+
+        size = len(parts[0])
+        if size <= limit:
+            for d in self._iter_corpus_docs():
+                body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
+                header = (f"---\n\n# {self._md_label(d['title'])}\n\n"
+                          f"- 경로: `{d['path']}`\n"
+                          + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
+                          + f"- 수정: {d['updated_at']}\n")
+                block = header + "\n" + body + "\n"
+                separator = "\n"
+                candidate = separator + block
+                if size + len(candidate) <= limit:
+                    parts.append(candidate)
+                    size += len(candidate)
+                    included += 1
+                    continue
+
+                remaining = limit - size
+                partial_marker = marker(included + 1)
+                block_budget = remaining - len(partial_marker)
+                if block_budget > len(separator):
+                    parts.append(candidate[:block_budget])
+                    included += 1
+                    parts.append(partial_marker)
+                else:
+                    parts.append(marker(included)[:remaining])
                 truncated = True
                 break
-            out.append(block)
-            size += len(block)
-            included += 1
-        text = "\n".join(out).rstrip() + "\n"
-        if truncated:
-            text += (f"\n---\n\n> [truncated] {included}/{len(docs)} 문서만 포함되었습니다. "
-                     "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n")
-        return {"text": text, "included": included, "total": len(docs), "truncated": truncated}
+        else:
+            truncated = True
+
+        text = "".join(parts)
+        return {
+            "text": text[:limit],
+            "included": included,
+            "total": total,
+            "truncated": truncated or len(text) > limit,
+        }
 
     def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
         """Resolve a wikilink/markdown target to an existing document path, or None."""

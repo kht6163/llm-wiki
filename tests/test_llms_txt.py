@@ -49,7 +49,52 @@ def test_llms_index_empty_vault(ctx, principals):
     assert "문서 0개" in text
 
 
+def test_llms_index_escapes_markdown_label(ctx, principals):
+    ctx.docs.create(
+        principals["editor"], "odd.md", "body", title="A [B] \\", embed=False
+    )
+    text = ctx.docs.llms_index(site_title="W")
+    assert r"[A \[B\] \\](/doc/odd.md/raw)" in text
+
+
+def test_llms_index_loads_current_bodies_with_one_join(ctx, principals):
+    _seed(ctx, principals)
+    ctx.docs.update(
+        principals["editor"], "guide/deep.md", 1, "# Deep\n\n최신 본문\n", embed=False
+    )
+    statements = []
+    with ctx.db.reader() as conn:
+        conn.set_trace_callback(statements.append)
+        try:
+            text = ctx.docs.llms_index(site_title="W")
+        finally:
+            conn.set_trace_callback(None)
+
+    body_queries = [
+        sql for sql in statements
+        if "revisions" in sql.lower() and "body" in sql.lower()
+    ]
+    assert "최신 본문" in text
+    assert "본문 첫 줄" not in text
+    assert len(body_queries) == 1
+    assert "join revisions" in " ".join(body_queries[0].lower().split())
+    assert not any(
+        "select body from revisions where doc_id=" in " ".join(sql.lower().split())
+        for sql in statements
+    )
+
+
 # -- service: llms_full ----------------------------------------------------
+def test_llms_full_empty_vault_preserves_text_format(ctx):
+    res = ctx.docs.llms_full(site_title="W")
+    assert res == {
+        "text": "# W\n\n> 전체 코퍼스 export — 문서 0개.\n",
+        "included": 0,
+        "total": 0,
+        "truncated": False,
+    }
+
+
 def test_llms_full_concatenates_and_strips_frontmatter(ctx, principals):
     _seed(ctx, principals)
     res = ctx.docs.llms_full(site_title="W")
@@ -65,10 +110,24 @@ def test_llms_full_concatenates_and_strips_frontmatter(ctx, principals):
 def test_llms_full_truncates_on_budget(ctx, principals):
     _seed(ctx, principals)
     res = ctx.docs.llms_full(site_title="W", max_chars=10)
-    # at least one doc always emitted, then truncation kicks in with a marker
     assert res["truncated"] is True
-    assert 1 <= res["included"] < res["total"]
-    assert "[truncated]" in res["text"]
+    assert res["included"] < res["total"]
+    assert len(res["text"]) <= 10
+
+
+def test_llms_full_hard_caps_single_large_document(ctx, principals):
+    ctx.docs.create(
+        principals["editor"], "big.md", "# Big\n\n" + "가" * 5000, embed=False
+    )
+    res = ctx.docs.llms_full(site_title="W", max_chars=1000)
+    assert len(res["text"]) <= 1000
+    assert res["truncated"] is True
+
+
+def test_llms_full_clamps_negative_string_budget_to_zero(ctx, principals):
+    _seed(ctx, principals)
+    res = ctx.docs.llms_full(site_title="W", max_chars="-3")
+    assert res == {"text": "", "included": 0, "total": 3, "truncated": True}
 
 
 # -- web routes: dual auth (session OR Bearer) -----------------------------
