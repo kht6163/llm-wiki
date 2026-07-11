@@ -151,13 +151,13 @@ def test_replace_section_preserves_explicit_metadata(docs, principals):
         p,
         "section-note.md",
         "## Section\n\nold body\n",
-        title="Section",
+        title="Explicit",
         tags=["kept"],
     )
 
     updated = docs.replace_section(p, "section-note.md", "Section", "new body")
 
-    assert updated["title"] == "Section"
+    assert updated["title"] == "Explicit"
     assert updated["tags"] == ["kept"]
 
 

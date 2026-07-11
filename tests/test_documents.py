@@ -71,7 +71,23 @@ def test_content_tags_replace_preserved_tags_on_update(
     assert updated["tags"] == expected_tags
 
 
-def test_explicit_update_metadata_replaces_preserved_metadata(ctx, principals):
+@pytest.mark.parametrize(
+    "content",
+    [
+        "---\ntags: []\n---\nplain body changed",
+        "---\ntags:\n---\nplain body changed",
+    ],
+)
+def test_empty_content_tags_preserve_explicit_tags(ctx, principals, content):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", tags=["kept"], embed=False)
+
+    updated = docs.update(p, "note.md", created["version"], content, embed=False)
+
+    assert updated["tags"] == ["kept"]
+
+
+def test_explicit_update_metadata_wins_over_content_metadata(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     created = docs.create(
         p, "note.md", "plain body", title="Old", tags=["old"], embed=False
@@ -81,14 +97,15 @@ def test_explicit_update_metadata_replaces_preserved_metadata(ctx, principals):
         p,
         "note.md",
         created["version"],
-        "plain body changed",
+        "---\ntitle: Frontmatter\ntags: [frontmatter]\n---\n"
+        "# Heading\n\nplain body changed #inline",
         title="Explicit",
-        tags=["replacement"],
+        tags=["argument"],
         embed=False,
     )
 
     assert updated["title"] == "Explicit"
-    assert updated["tags"] == ["replacement"]
+    assert updated["tags"] == ["argument", "frontmatter", "inline"]
 
 
 def test_optimistic_conflict(ctx, principals):

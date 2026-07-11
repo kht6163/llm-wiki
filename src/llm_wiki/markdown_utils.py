@@ -168,14 +168,19 @@ def derive_content_title(meta: dict, body: str) -> str | None:
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         return title.strip()
-    hm = HEADING_RE.search(body)
-    return hm.group(2).strip() if hm else None
+    for hm in HEADING_RE.finditer(body):
+        if hm.group(1) == "#":
+            return hm.group(2).strip()
+    return None
 
 
 def derive_title(meta: dict, body: str, rel_path: str) -> str:
-    content_title = derive_content_title(meta, body)
-    if content_title:
-        return content_title
+    title = meta.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    hm = HEADING_RE.search(body)
+    if hm:
+        return hm.group(2).strip()
     name = rel_path.rsplit("/", 1)[-1]
     return name[:-3] if name.lower().endswith(".md") else name
 
