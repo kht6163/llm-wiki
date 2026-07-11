@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tarfile
 import tempfile
 import unicodedata
@@ -17,6 +18,7 @@ from .util import now_iso
 
 SNAPSHOT_FORMAT = "llm-wiki-snapshot"
 _ATTACHMENT_ATTEMPTS = 3
+_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -31,15 +33,17 @@ class SnapshotReport:
 class _ArchiveFile:
     path: str
     kind: str
-    data: bytes
+    source: Path
+    size: int
+    sha256: str
 
     @property
     def manifest_entry(self) -> dict[str, str | int]:
         return {
             "path": self.path,
             "kind": self.kind,
-            "size": len(self.data),
-            "sha256": hashlib.sha256(self.data).hexdigest(),
+            "size": self.size,
+            "sha256": self.sha256,
         }
 
 
@@ -55,29 +59,59 @@ def _normalized_archive_path(rel: str) -> tuple[str, str]:
     return archive_path, identity
 
 
-def _stat_identity(path: Path) -> tuple[int, int, int, int, int]:
-    stat = path.stat()
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
-def _read_attachment_once(path: Path) -> bytes | None:
-    """Read a file only when its filesystem generation remains unchanged."""
+def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, str] | None:
+    """Stage one stable regular-file generation without following a final symlink."""
+    fd = -1
     try:
-        before = _stat_identity(path)
-        data = path.read_bytes()
-        after = _stat_identity(path)
-    except (FileNotFoundError, OSError):
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        visible = os.lstat(path)
+        resolved = path.resolve()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(visible.st_mode)
+            or (before.st_dev, before.st_ino) != (visible.st_dev, visible.st_ino)
+            or resolved == root
+            or root not in resolved.parents
+        ):
+            return None
+
+        digest = hashlib.sha256()
+        size = 0
+        with staged.open("wb") as target:
+            while chunk := os.read(fd, _COPY_CHUNK_SIZE):
+                target.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        after = os.fstat(fd)
+        final_visible = os.lstat(path)
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or size != before.st_size
+            or (before.st_dev, before.st_ino)
+            != (final_visible.st_dev, final_visible.st_ino)
+        ):
+            return None
+        return size, digest.hexdigest()
+    except OSError:
         return None
-    if before != after or len(data) != before[2]:
-        return None
-    return data
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
-def _read_stable_attachment(path: Path) -> bytes:
+def _stage_stable_attachment(path: Path, root: Path, staged: Path) -> tuple[int, str]:
     for _ in range(_ATTACHMENT_ATTEMPTS):
-        data = _read_attachment_once(path)
-        if data is not None:
-            return data
+        staged.unlink(missing_ok=True)
+        metadata = _stage_attachment_once(path, root, staged)
+        if metadata is not None:
+            return metadata
+    staged.unlink(missing_ok=True)
     raise RuntimeError(f"attachment changed while snapshotting: {path.name}")
 
 
@@ -87,6 +121,13 @@ def _add_bytes(tar: tarfile.TarFile, path: str, data: bytes) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
+def _add_staged_file(tar: tarfile.TarFile, file: _ArchiveFile) -> None:
+    info = tarfile.TarInfo(file.path)
+    info.size = file.size
+    with file.source.open("rb") as source:
+        tar.addfile(info, source)
+
+
 def _verify_archive(path: Path, files: list[_ArchiveFile]) -> None:
     """Verify the bytes actually persisted by tar before publishing the archive."""
     with tarfile.open(path, "r") as tar:
@@ -94,39 +135,53 @@ def _verify_archive(path: Path, files: list[_ArchiveFile]) -> None:
             archived = tar.extractfile(file.path)
             if archived is None:
                 raise RuntimeError(f"snapshot file verification failed: {file.path}")
-            data = archived.read()
-            expected = file.manifest_entry
-            if (
-                len(data) != expected["size"]
-                or hashlib.sha256(data).hexdigest() != expected["sha256"]
-            ):
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := archived.read(_COPY_CHUNK_SIZE):
+                digest.update(chunk)
+                size += len(chunk)
+            if size != file.size or digest.hexdigest() != file.sha256:
                 raise RuntimeError(f"snapshot file verification failed: {file.path}")
 
 
-def _managed_files(conn: sqlite3.Connection) -> tuple[list[_ArchiveFile], set[str]]:
+def _stage_managed_files(
+    conn: sqlite3.Connection, staging: Path
+) -> tuple[list[_ArchiveFile], set[str]]:
     rows = conn.execute(
         "SELECT d.path, r.body FROM documents d "
         "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version "
         "WHERE d.is_deleted=0 ORDER BY d.path_norm"
-    ).fetchall()
+    )
     expected = conn.execute(
         "SELECT COUNT(*) FROM documents WHERE is_deleted=0"
     ).fetchone()[0]
-    if len(rows) != expected:
-        raise RuntimeError("active document has no revision at its current version")
 
     files: list[_ArchiveFile] = []
     normalized: set[str] = set()
-    for row in rows:
+    for index, row in enumerate(rows):
         archive_path, identity = _normalized_archive_path(str(row["path"]))
         if identity in normalized:
             raise ValueError(f"duplicate normalized snapshot path: {archive_path}")
         normalized.add(identity)
-        files.append(_ArchiveFile(archive_path, "managed", str(row["body"]).encode("utf-8")))
+        source = staging / f"managed-{index}"
+        digest = hashlib.sha256()
+        size = 0
+        body = str(row["body"])
+        with source.open("wb") as target:
+            for offset in range(0, len(body), _COPY_CHUNK_SIZE // 4):
+                chunk = body[offset:offset + _COPY_CHUNK_SIZE // 4].encode("utf-8")
+                target.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+        files.append(_ArchiveFile(archive_path, "managed", source, size, digest.hexdigest()))
+    if len(files) != expected:
+        raise RuntimeError("active document has no revision at its current version")
     return files, normalized
 
 
-def _attachment_files(vault: Path, normalized: set[str]) -> list[_ArchiveFile]:
+def _stage_attachment_files(
+    vault: Path, normalized: set[str], staging: Path
+) -> list[_ArchiveFile]:
     if not vault.exists():
         return []
     root = vault.resolve()
@@ -135,8 +190,10 @@ def _attachment_files(vault: Path, normalized: set[str]) -> list[_ArchiveFile]:
         rel_path = path.relative_to(vault)
         if rel_path.parts and rel_path.parts[0] == ".tmp":
             continue
-        if path.suffix.lower() == ".md" or not path.is_file():
+        if path.suffix.lower() == ".md" or path.is_dir():
             continue
+        if path.is_symlink():
+            raise ValueError(f"unsafe vault path: {rel_path.as_posix()!r}")
         resolved = path.resolve()
         if resolved == root or root not in resolved.parents:
             raise ValueError(f"unsafe vault path: {rel_path.as_posix()!r}")
@@ -144,7 +201,9 @@ def _attachment_files(vault: Path, normalized: set[str]) -> list[_ArchiveFile]:
         if identity in normalized:
             raise ValueError(f"duplicate normalized snapshot path: {archive_path}")
         normalized.add(identity)
-        files.append(_ArchiveFile(archive_path, "attachment", _read_stable_attachment(path)))
+        source = staging / f"attachment-{len(files)}"
+        size, digest = _stage_stable_attachment(path, root, source)
+        files.append(_ArchiveFile(archive_path, "attachment", source, size, digest))
     return files
 
 
@@ -166,21 +225,22 @@ def write_snapshot(
 
     try:
         with tempfile.TemporaryDirectory() as directory:
-            cloned_db = Path(directory) / "wiki.db"
+            staging = Path(directory)
+            cloned_db = staging / "wiki.db"
             with db.reader() as conn:
                 conn.execute("VACUUM INTO ?", (str(cloned_db),))
 
             clone = sqlite3.connect(cloned_db)
             clone.row_factory = sqlite3.Row
             try:
-                managed, normalized = _managed_files(clone)
+                managed, normalized = _stage_managed_files(clone, staging)
                 schema = get_meta(clone, "schema_version")
                 embedding_model = get_meta(clone, "embedding_model")
                 embedding_dim = get_meta(clone, "embedding_dim")
             finally:
                 clone.close()
 
-            attachments = _attachment_files(vault, normalized)
+            attachments = _stage_attachment_files(vault, normalized, staging)
             archive_files = managed + attachments
             schema_version = int(schema) if schema else None
             manifest = {
@@ -196,7 +256,7 @@ def write_snapshot(
             with tarfile.open(temporary_out, "w") as tar:
                 tar.add(cloned_db, arcname="wiki.db")
                 for file in archive_files:
-                    _add_bytes(tar, file.path, file.data)
+                    _add_staged_file(tar, file)
                 manifest_data = json.dumps(
                     manifest, ensure_ascii=False, indent=2
                 ).encode("utf-8")

@@ -134,15 +134,15 @@ def test_snapshot_retries_an_unstable_attachment(tmp_path, monkeypatch):
     src = _seed(_settings(tmp_path, "retry"))
     attachment = src.settings.vault_path / "asset.bin"
     attachment.write_bytes(b"stable")
-    real_read = snapshot_writer._read_attachment_once
+    real_stage = snapshot_writer._stage_attachment_once
     attempts = 0
 
-    def unstable_twice(path):
+    def unstable_twice(path, root, staged):
         nonlocal attempts
         attempts += 1
-        return None if attempts < 3 else real_read(path)
+        return None if attempts < 3 else real_stage(path, root, staged)
 
-    monkeypatch.setattr(snapshot_writer, "_read_attachment_once", unstable_twice)
+    monkeypatch.setattr(snapshot_writer, "_stage_attachment_once", unstable_twice)
     out = tmp_path / "retry.tar"
     report = snapshot_writer.write_snapshot(
         src.db, src.settings.vault_path, out, force=False
@@ -156,17 +156,45 @@ def test_snapshot_retries_an_unstable_attachment(tmp_path, monkeypatch):
         assert archived.read() == b"stable"
 
 
+def test_snapshot_streams_large_attachment_without_path_read_bytes(tmp_path, monkeypatch):
+    src = _seed(_settings(tmp_path, "streaming"))
+    attachment = src.settings.vault_path / "large.bin"
+    content = b"0123456789abcdef" * (160 * 1024)
+    attachment.write_bytes(content)
+    real_os_read = snapshot_writer.os.read
+    read_sizes: list[int] = []
+
+    def forbid_read_bytes(path):
+        raise AssertionError(f"unbounded Path.read_bytes used for {path.name}")
+
+    def bounded_read(fd, size):
+        read_sizes.append(size)
+        return real_os_read(fd, size)
+
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+    monkeypatch.setattr(snapshot_writer.os, "read", bounded_read)
+    out = tmp_path / "streaming.tar"
+    snapshot_writer.write_snapshot(src.db, src.settings.vault_path, out, force=False)
+
+    assert read_sizes
+    assert max(read_sizes) <= 1024 * 1024
+    with tarfile.open(out, "r") as archive:
+        archived = archive.extractfile("vault/large.bin")
+        assert archived is not None
+        assert archived.read() == content
+
+
 def test_snapshot_fails_after_three_unstable_attachment_reads(tmp_path, monkeypatch):
     src = _seed(_settings(tmp_path, "unstable"))
     (src.settings.vault_path / "asset.bin").write_bytes(b"changing")
     attempts = 0
 
-    def always_unstable(path):
+    def always_unstable(path, root, staged):
         nonlocal attempts
         attempts += 1
         return None
 
-    monkeypatch.setattr(snapshot_writer, "_read_attachment_once", always_unstable)
+    monkeypatch.setattr(snapshot_writer, "_stage_attachment_once", always_unstable)
     out = tmp_path / "unstable.tar"
     with pytest.raises(RuntimeError, match="attachment changed"):
         snapshot_writer.write_snapshot(
@@ -215,6 +243,40 @@ def test_snapshot_rejects_unsafe_attachment_symlink(tmp_path):
         )
 
 
+@pytest.mark.parametrize("disable_nofollow", [False, True])
+def test_snapshot_rejects_attachment_replaced_by_symlink_after_path_check(
+    tmp_path, monkeypatch, disable_nofollow
+):
+    src = _seed(_settings(tmp_path, "symlink-race"))
+    attachment = src.settings.vault_path / "race.bin"
+    attachment.write_bytes(b"safe attachment")
+    outside = tmp_path / "outside-secret.bin"
+    secret = b"must never enter snapshot"
+    outside.write_bytes(secret)
+    real_resolve = Path.resolve
+    swapped = False
+    if disable_nofollow:
+        monkeypatch.setattr(snapshot_writer.os, "O_NOFOLLOW", 0)
+
+    def swap_after_resolve(path, *args, **kwargs):
+        nonlocal swapped
+        resolved = real_resolve(path, *args, **kwargs)
+        if path == attachment and not swapped:
+            attachment.unlink()
+            attachment.symlink_to(outside)
+            swapped = True
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", swap_after_resolve)
+    out = tmp_path / "symlink-race.tar"
+    with pytest.raises((RuntimeError, ValueError)):
+        snapshot_writer.write_snapshot(src.db, src.settings.vault_path, out, force=False)
+
+    assert swapped
+    assert not out.exists()
+    assert not Path(f"{out}.tmp").exists()
+
+
 def test_snapshot_rejects_duplicate_unicode_normalized_attachment_paths(tmp_path):
     src = _seed(_settings(tmp_path, "duplicate"))
     (src.settings.vault_path / "caf\N{LATIN SMALL LETTER E WITH ACUTE}.bin").write_bytes(b"one")
@@ -246,14 +308,14 @@ def test_snapshot_does_not_publish_an_archive_with_bad_file_hash(tmp_path, monke
     src = _seed(_settings(tmp_path, "hash-verification"))
     (src.settings.vault_path / "asset.bin").write_bytes(b"original")
     out = tmp_path / "hash-verification.tar"
-    real_add = snapshot_writer._add_bytes
+    real_add = snapshot_writer._add_staged_file
 
-    def corrupt_attachment(tar, path, data):
-        if path == "vault/asset.bin":
-            data = b"corrupted"
-        real_add(tar, path, data)
+    def corrupt_attachment(tar, file):
+        if file.path == "vault/asset.bin":
+            file.source.write_bytes(b"corrupted")
+        real_add(tar, file)
 
-    monkeypatch.setattr(snapshot_writer, "_add_bytes", corrupt_attachment)
+    monkeypatch.setattr(snapshot_writer, "_add_staged_file", corrupt_attachment)
     with pytest.raises(RuntimeError, match="snapshot file verification failed"):
         snapshot_writer.write_snapshot(src.db, src.settings.vault_path, out, force=False)
 
