@@ -513,9 +513,9 @@ def _apply_serve_overrides(settings, args):
     overrides = {}
     if args.host:
         overrides["host"] = args.host
-    if args.gui_port:
+    if args.gui_port is not None:
         overrides["gui_port"] = args.gui_port
-    if args.mcp_port:
+    if args.mcp_port is not None:
         overrides["mcp_port"] = args.mcp_port
     if not overrides:
         return settings

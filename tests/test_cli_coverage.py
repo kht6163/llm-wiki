@@ -1,6 +1,7 @@
 """Observable CLI boundary coverage for parser, orchestration, and shutdown paths."""
 from __future__ import annotations
 
+import asyncio
 import importlib.metadata
 import runpy
 import sqlite3
@@ -83,6 +84,26 @@ def test_parser_accepts_every_command_and_preserves_options():
     }
     assert parsed[6].include == ["*.md"] and parsed[6].no_embed is True
     assert parsed[10].older_than_days == 0 and parsed[10].no_vacuum is True
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        ([], "the following arguments are required: cmd"),
+        (["create-api-key"], "the following arguments are required: --username"),
+        (["import", "--from", "/src"], "the following arguments are required: --into"),
+        (["create-user", "--role", "owner"], "invalid choice: 'owner'"),
+        (["serve", "--gui-port", "not-a-port"], "invalid int value: 'not-a-port'"),
+    ],
+)
+def test_parser_errors_exit_two_and_write_usage_to_stderr(capsys, argv, message):
+    with pytest.raises(SystemExit) as exc_info:
+        _cli_impl._build_parser().parse_args(argv)
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert captured.out == ""
+    assert captured.err.startswith("usage: llm-wiki")
+    assert message in captured.err
 
 
 @pytest.mark.parametrize(
@@ -364,44 +385,58 @@ class _PruneDB:
 
 def test_prune_dry_run_skips_audit_and_vacuum(monkeypatch, capsys):
     db = _PruneDB()
-    docs = NS(prune_revisions=lambda **kwargs: {"deletable_revisions": 4, "keep": 2, **kwargs})
+    revision_calls = []
+    docs = NS(prune_revisions=lambda **kwargs: revision_calls.append(kwargs) or {"deletable_revisions": 4, "keep": 2})
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(db=db, docs=docs))
     monkeypatch.setattr(_cli_impl.audit, "prune", lambda *args, **kwargs: pytest.fail("audit pruning should be disabled"))
     assert _cli_impl._prune(NS(force=False, keep=2, older_than_days=0, no_vacuum=False)) == 0
+    assert revision_calls == [{"keep": 2, "apply": False}]
     assert "Dry run" in capsys.readouterr().out and db.sql == []
 
 
 def test_prune_applies_audit_and_optional_vacuum(monkeypatch, capsys):
     db = _PruneDB()
-    docs = NS(prune_revisions=lambda **kwargs: {"deletable_revisions": 4, "keep": 2, **kwargs})
+    revision_calls = []
+    docs = NS(prune_revisions=lambda **kwargs: revision_calls.append(kwargs) or {"deletable_revisions": 4, "keep": 2})
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(db=db, docs=docs))
     audit_calls = []
     monkeypatch.setattr(_cli_impl.audit, "prune", lambda db, **kwargs: audit_calls.append(kwargs) or {"deletable_events": 3, "cutoff": "2026-01-01"})
     assert _cli_impl._prune(NS(force=True, keep=2, older_than_days=30, no_vacuum=False)) == 0
+    assert revision_calls == [{"keep": 2, "apply": True}]
     assert audit_calls == [{"older_than_days": 30, "apply": True}] and db.sql == ["VACUUM"]
     assert "audit_log: 3" in capsys.readouterr().out
     db.sql.clear()
     assert _cli_impl._prune(NS(force=True, keep=2, older_than_days=30, no_vacuum=True)) == 0
+    assert revision_calls == [{"keep": 2, "apply": True}, {"keep": 2, "apply": True}]
+    assert audit_calls == [
+        {"older_than_days": 30, "apply": True},
+        {"older_than_days": 30, "apply": True},
+    ]
     assert db.sql == []
 
 
 @pytest.mark.parametrize(
-    ("report", "fragments"),
+    ("report", "quick", "fragments"),
     [
-        ({"ok": True, "check": "quick_check"}, ["integrity (quick_check): ok", "foreign keys: ok", "orphan vectors: ok"]),
+        ({"ok": True, "check": "quick_check"}, True, ["integrity (quick_check): ok", "foreign keys: ok", "orphan vectors: ok"]),
         ({"ok": False, "check": "integrity_check", "integrity": ["ok", "page corrupt"],
           "foreign_key_violations": [{"table": "chunks", "rowid": 4, "parent": "documents", "fkid": 0}],
-          "orphan_vectors": 2}, ["integrity (integrity_check): FAILED", "page corrupt", "table=chunks rowid=4", "orphan vectors: 2"]),
+          "orphan_vectors": 2}, False, ["integrity (integrity_check): FAILED", "page corrupt", "table=chunks rowid=4", "orphan vectors: 2"]),
         ({"ok": False, "check": "integrity_check", "integrity": ["ok"],
           "foreign_key_violations": [], "orphan_vectors": 0},
-         ["integrity (integrity_check): ok", "foreign keys: ok", "orphan vectors: ok"]),
+         False, ["integrity (integrity_check): ok", "foreign keys: ok", "orphan vectors: ok"]),
     ],
 )
-def test_db_check_reports_each_integrity_dimension(monkeypatch, capsys, report, fragments):
-    db = NS(integrity_check=lambda **kwargs: report, delete_orphan_vectors=lambda: 5)
+def test_db_check_reports_each_integrity_dimension(monkeypatch, capsys, report, quick, fragments):
+    integrity_calls = []
+    db = NS(
+        integrity_check=lambda **kwargs: integrity_calls.append(kwargs) or report,
+        delete_orphan_vectors=lambda: 5,
+    )
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(db=db))
     fix = report["ok"]
-    assert _cli_impl._db_check(NS(quick=True, fix_orphan_vectors=fix)) == (0 if report["ok"] else 1)
+    assert _cli_impl._db_check(NS(quick=quick, fix_orphan_vectors=fix)) == (0 if report["ok"] else 1)
+    assert integrity_calls == [{"quick": quick}]
     out = capsys.readouterr().out
     assert all(fragment in out for fragment in fragments)
     assert ("orphan vectors: removed 5" in out) is fix
@@ -512,6 +547,22 @@ def test_serve_overrides_revalidate_all_fields_and_preserve_original():
         _cli_impl._apply_serve_overrides(settings, _args(gui_port=8081))
 
 
+@pytest.mark.parametrize(("option", "field"), [("--gui-port", "gui_port"), ("--mcp-port", "mcp_port")])
+def test_explicit_zero_port_override_exits_with_configuration_error(monkeypatch, capsys, option, field):
+    settings = _settings()
+    monkeypatch.setattr("llm_wiki.config.get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda *args, **kwargs: pytest.fail("invalid port must fail before context creation"),
+    )
+    assert _cli_impl.run(["serve", option, "0"]) == 2
+    output = capsys.readouterr().out
+    assert "configuration error: Invalid --host/--gui-port/--mcp-port override" in output
+    assert f"{field} must be between 1 and 65535" in output
+
+
 @pytest.mark.asyncio
 async def test_mcp_http_app_exposes_body_limit_health_and_metrics(monkeypatch):
     app = Starlette()
@@ -561,10 +612,11 @@ def test_serve_warms_recovers_runs_both_and_stops_worker(monkeypatch, capsys):
     assert f"http://{settings.host}:{settings.gui_port}" in out
 
 
-def test_serve_no_recover_without_worker_still_cleans_up_after_server_error(monkeypatch):
+def test_serve_stops_started_worker_after_server_error(monkeypatch):
     settings = _settings()
+    worker = _Worker()
     docs = NS(recover_pending=lambda: pytest.fail("recovery disabled"), embed_pending=lambda: pytest.fail("recovery disabled"))
-    ctx = NS(docs=docs, embedder=NS(warm=lambda: None), embed_worker=None)
+    ctx = NS(docs=docs, embedder=NS(warm=lambda: None), embed_worker=worker)
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     monkeypatch.setattr(_cli_impl, "build_context", lambda *args, **kwargs: ctx)
     monkeypatch.setattr(_cli_impl, "create_web_app", lambda actual: "web")
@@ -574,6 +626,7 @@ def test_serve_no_recover_without_worker_still_cleans_up_after_server_error(monk
     monkeypatch.setattr(_cli_impl, "_serve_both", fail)
     with pytest.raises(RuntimeError, match="bind failed"):
         _cli_impl._serve(_args(no_recover=True))
+    assert worker.events == ["start", ("stop", settings.shutdown_grace_s)]
 
 
 def test_serve_normal_empty_recovery_without_worker_returns_cleanly(monkeypatch, capsys):
@@ -634,12 +687,46 @@ async def test_serve_both_builds_servers_and_first_then_second_signal(monkeypatc
     assert all(item[1]["timeout_graceful_shutdown"] == 5 for item in configs)
     assert all(item[1]["proxy_headers"] is True and item[1]["forwarded_allow_ips"] == "10.0.0.1" for item in configs)
     assert all(server.served for server in _Server.instances)
+    assert set(loop.handlers) == {_cli_impl.signal.SIGINT, _cli_impl.signal.SIGTERM}
+    assert loop.handlers[_cli_impl.signal.SIGINT] is loop.handlers[_cli_impl.signal.SIGTERM]
     shutdown = loop.handlers[next(iter(loop.handlers))]
     shutdown()
     assert all(server.should_exit and not server.force_exit for server in _Server.instances)
     shutdown()
     assert all(server.force_exit for server in _Server.instances)
     assert all(server.install_signal_handlers() is None for server in _Server.instances)
+
+
+class _BlockingServer(_Server):
+    ready = None
+    started = 0
+
+    async def serve(self):
+        self.served = True
+        type(self).started += 1
+        if type(self).started == 2:
+            type(self).ready.set()
+        while not self.should_exit:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_signals_change_both_servers_while_they_are_serving(monkeypatch):
+    _Server.instances.clear()
+    _BlockingServer.started = 0
+    _BlockingServer.ready = asyncio.Event()
+    loop = _Loop()
+    monkeypatch.setattr(_cli_impl.asyncio, "get_running_loop", lambda: loop)
+    monkeypatch.setattr(_cli_impl.uvicorn, "Config", lambda app, **kwargs: NS(app=app, **kwargs))
+    monkeypatch.setattr(_cli_impl.uvicorn, "Server", _BlockingServer)
+    task = asyncio.create_task(_cli_impl._serve_both(_settings(), "web", "mcp"))
+    await asyncio.wait_for(_BlockingServer.ready.wait(), timeout=1)
+    assert not task.done() and all(server.served for server in _Server.instances)
+    loop.handlers[_cli_impl.signal.SIGINT]()
+    assert all(server.should_exit and not server.force_exit for server in _Server.instances)
+    loop.handlers[_cli_impl.signal.SIGTERM]()
+    assert all(server.force_exit for server in _Server.instances)
+    await asyncio.wait_for(task, timeout=1)
 
 
 @pytest.mark.asyncio
@@ -656,6 +743,16 @@ def test_console_wrapper_forwards_argv(monkeypatch):
     from llm_wiki import cli
     monkeypatch.setattr(_cli_impl, "run", lambda argv: 23 if argv == ["db-check"] else 24)
     assert cli.main(["db-check"]) == 23
+
+
+def test_module_entrypoint_exits_with_main_result(monkeypatch):
+    from llm_wiki import cli
+    received = []
+    monkeypatch.setattr(_cli_impl, "run", lambda argv: received.append(argv) or 31)
+    with pytest.raises(SystemExit) as exc_info:
+        runpy.run_path(cli.__file__, run_name="__main__")
+    assert exc_info.value.code == 31
+    assert received == [None]
 
 
 def test_package_version_falls_back_without_installed_metadata(monkeypatch):
