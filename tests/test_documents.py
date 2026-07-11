@@ -70,7 +70,17 @@ def test_frontmatter_comment_does_not_replace_preserved_title_on_update(
     assert updated["title"] == "Explicit"
 
 
-def test_fenced_code_h1_does_not_replace_preserved_title_on_update(ctx, principals):
+@pytest.mark.parametrize(
+    "fenced",
+    [
+        "```sh\n# command\n```",
+        "~~~sh\n# command\n~~~",
+        "```sh\n# command",
+    ],
+)
+def test_fenced_code_h1_does_not_replace_preserved_title_on_update(
+    ctx, principals, fenced
+):
     docs, p = ctx.docs, principals["editor"]
     created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
 
@@ -78,7 +88,7 @@ def test_fenced_code_h1_does_not_replace_preserved_title_on_update(ctx, principa
         p,
         "note.md",
         created["version"],
-        "plain body changed\n\n```sh\n# command\n```",
+        f"plain body changed\n\n{fenced}",
         embed=False,
     )
 

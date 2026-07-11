@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from .util import MEDIA_EXTS
 
 FRONTMATTER_RE = re.compile(r"^---[ \t]*\n(.*?)\n---[ \t]*\n", re.DOTALL)
-FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
+FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
 WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
 MDLINK_RE = re.compile(r"\[([^\]\n]*)\]\(([^)\s]+)(?:[ \t]+\"[^\"]*\")?\)")
@@ -150,17 +151,44 @@ def _mask(text: str) -> str:
     link/tag regexes do not match inside them while character offsets stay aligned."""
     chars = list(text)
 
-    def blank(match: re.Match) -> None:
-        for k in range(match.start(), match.end()):
+    def blank_span(start: int, end: int) -> None:
+        for k in range(start, end):
             if chars[k] != "\n":
                 chars[k] = " "
 
     fm = FRONTMATTER_RE.match(text)
     if fm:
-        blank(fm)
-    for rx in (FENCE_RE, INLINE_CODE_RE):
-        for match in rx.finditer(text):
-            blank(match)
+        blank_span(fm.start(), fm.end())
+
+    offset = fm.end() if fm else 0
+    fence_start: int | None = None
+    fence_char = ""
+    fence_len = 0
+    for line in text[offset:].splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        if fence_start is None:
+            opening = FENCE_OPEN_RE.fullmatch(content)
+            if opening:
+                marker, info = opening.groups()
+                if marker[0] != "`" or "`" not in info:
+                    fence_start = offset
+                    fence_char = marker[0]
+                    fence_len = len(marker)
+        else:
+            closing = FENCE_CLOSE_RE.fullmatch(content)
+            if (
+                closing
+                and closing.group(1)[0] == fence_char
+                and len(closing.group(1)) >= fence_len
+            ):
+                blank_span(fence_start, offset + len(line))
+                fence_start = None
+        offset += len(line)
+    if fence_start is not None:
+        blank_span(fence_start, len(text))
+
+    for match in INLINE_CODE_RE.finditer(text):
+        blank_span(match.start(), match.end())
     return "".join(chars)
 
 
