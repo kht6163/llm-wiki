@@ -15,6 +15,63 @@ def test_fresh_db_stamped_and_has_audit_log(tmp_path):
         conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()  # table exists
 
 
+def test_projection_intent_tables_apply_to_current_stamped_database(tmp_path):
+    db = Database(tmp_path / "projection.db")
+    db.ensure_schema()
+    with db.writer() as conn:
+        conn.execute("DROP TABLE document_purge_intents")
+        conn.execute("DROP TABLE file_projection_cleanup")
+        assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
+
+    db.ensure_schema()
+    with db.writer() as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"file_projection_cleanup", "document_purge_intents"} <= tables
+        assert "idx_file_projection_cleanup_path" in _indexes(conn)
+
+        conn.execute(
+            "INSERT INTO documents(path,path_norm,title,version,content_hash,folder,"
+            "file_state,vector_dirty,is_deleted,created_at,updated_at) "
+            "VALUES('a.md','a.md','A',1,'hash','','pending',0,0,'now','now')"
+        )
+        doc_id = conn.execute(
+            "SELECT id FROM documents WHERE path_norm='a.md'"
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO file_projection_cleanup("
+                "doc_id,path,path_norm,expected_exists,expected_dev,expected_ino,"
+                "expected_size,expected_mtime_ns,expected_ctime_ns,queued_version,created_at) "
+                "VALUES(?,?,?,1,NULL,NULL,NULL,NULL,NULL,1,'now')",
+                (doc_id, "old.md", "old.md"),
+            )
+        conn.execute(
+            "INSERT INTO file_projection_cleanup("
+            "doc_id,path,path_norm,expected_exists,expected_dev,expected_ino,"
+            "expected_size,expected_mtime_ns,expected_ctime_ns,queued_version,created_at) "
+            "VALUES(?,?,?,0,NULL,NULL,NULL,NULL,NULL,1,'now')",
+            (doc_id, "old.md", "old.md"),
+        )
+        conn.execute(
+            "INSERT INTO document_purge_intents("
+            "doc_id,path,path_norm,version,actor,via,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (doc_id, "a.md", "a.md", 1, "admin", "web", "now"),
+        )
+        conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+        assert conn.execute(
+            "SELECT COUNT(*) FROM file_projection_cleanup"
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM document_purge_intents"
+        ).fetchone()[0] == 0
+
+
 def _indexes(conn) -> set[str]:
     return {r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type='index'")}

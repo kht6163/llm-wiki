@@ -86,6 +86,48 @@ CREATE INDEX IF NOT EXISTS idx_documents_dirty ON documents(vector_dirty);
 -- updated_at DESC) so it seeks instead of full-scanning + sorting the table.
 CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(is_deleted, updated_at DESC);
 
+-- A move can leave more than one historical path to remove.  Each intent carries the
+-- exact filesystem generation that may be unlinked; a changed or newly-owned path is
+-- preserved.  The reverse index supports reindex's path-first ownership lookup.
+CREATE TABLE IF NOT EXISTS file_projection_cleanup (
+  doc_id            INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  path              TEXT NOT NULL,
+  path_norm         TEXT NOT NULL,
+  expected_exists   INTEGER NOT NULL CHECK(expected_exists IN (0,1)),
+  expected_dev      INTEGER,
+  expected_ino      INTEGER,
+  expected_size     INTEGER,
+  expected_mtime_ns INTEGER,
+  expected_ctime_ns INTEGER,
+  queued_version    INTEGER NOT NULL,
+  created_at        TEXT NOT NULL,
+  PRIMARY KEY (doc_id, path_norm),
+  CHECK (
+    (expected_exists=0 AND expected_dev IS NULL AND expected_ino IS NULL
+      AND expected_size IS NULL AND expected_mtime_ns IS NULL
+      AND expected_ctime_ns IS NULL)
+    OR
+    (expected_exists=1 AND expected_dev IS NOT NULL AND expected_ino IS NOT NULL
+      AND expected_size IS NOT NULL AND expected_mtime_ns IS NOT NULL
+      AND expected_ctime_ns IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_file_projection_cleanup_path
+  ON file_projection_cleanup(path_norm);
+
+-- Permanent deletion is a two-phase operation because filesystem changes cannot be
+-- rolled back with SQLite.  The durable request fences ordinary projection and lets
+-- startup finish the same authorized purge after interruption.
+CREATE TABLE IF NOT EXISTS document_purge_intents (
+  doc_id     INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+  path       TEXT NOT NULL,
+  path_norm  TEXT NOT NULL,
+  version    INTEGER NOT NULL,
+  actor      TEXT NOT NULL,
+  via        TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 -- Explicitly-created folders. Folders are otherwise derived from document paths;
 -- this table lets an empty folder persist as a first-class organizational unit
 -- ("structure first, content later"). The DB is canonical; the vault directory is
