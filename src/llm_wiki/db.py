@@ -9,6 +9,7 @@ Concurrency model:
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -16,6 +17,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sqlite_vec
+
+from .embedding_contract import EMBEDDING_PIPELINE, EmbeddingBinding
 
 SCHEMA_VERSION = 11
 
@@ -268,6 +271,7 @@ class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self._write_lock = threading.RLock()
+        self._expected_embedding_binding: EmbeddingBinding | None = None
         # One reusable connection per thread. Opening a connection reloads the
         # sqlite-vec C extension and re-applies the PRAGMAs, so doing it per
         # operation is the single most pervasive overhead on read paths; caching
@@ -426,23 +430,133 @@ class Database:
                 f"chunk_id INTEGER PRIMARY KEY, embedding float[{int(dim)}] distance_metric=cosine)"
             )
 
-    def initialize(self, embedding_model: str, embedding_dim: int) -> None:
-        """Create the full schema and bind the embedding model. Refuses to start if
-        a different model (i.e. a different vector dimension) was used before."""
+    def initialize(
+        self,
+        embedding_model: str,
+        embedding_dim: int,
+        embedding_pipeline: str = EMBEDDING_PIPELINE,
+    ) -> EmbeddingBinding:
+        """Create the full schema and validate the process embedding binding."""
+        if embedding_dim <= 0:
+            raise ValueError("embedding dimension must be positive")
         self.ensure_schema()
         with self.writer() as conn:
-            existing = get_meta(conn, "embedding_model")
-            if existing is None:
+            values = {
+                key: get_meta(conn, key)
+                for key in (
+                    "embedding_model",
+                    "embedding_dim",
+                    "embedding_pipeline",
+                    "embedding_epoch",
+                )
+            }
+            model = values["embedding_model"]
+            raw_dim = values["embedding_dim"]
+            pipeline = values["embedding_pipeline"]
+            raw_epoch = values["embedding_epoch"]
+            table_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
+            ).fetchone()
+
+            if all(value is None for value in values.values()):
+                if table_row is not None:
+                    raise RuntimeError(
+                        "DB embedding binding metadata is missing while chunk_vectors "
+                        "already exists. Re-embed with `llm-wiki reindex --reembed` "
+                        "instead of inferring provenance for existing vectors."
+                    )
+                binding = EmbeddingBinding(
+                    embedding_model, embedding_dim, embedding_pipeline, 1
+                )
                 set_meta(conn, "embedding_model", embedding_model)
                 set_meta(conn, "embedding_dim", str(embedding_dim))
-            elif existing != embedding_model:
-                raise RuntimeError(
-                    f"DB was initialized with embedding model '{existing}' "
-                    f"(dim={get_meta(conn, 'embedding_dim')}); .env now requests "
-                    f"'{embedding_model}'. Re-embed with `llm-wiki reindex --reembed` "
-                    f"or restore the original model."
+                set_meta(conn, "embedding_pipeline", embedding_pipeline)
+                set_meta(conn, "embedding_epoch", "1")
+            else:
+                legacy = (
+                    model is not None
+                    and raw_dim is not None
+                    and pipeline is None
+                    and raw_epoch is None
                 )
-        self.ensure_vector_table(embedding_dim)
+                complete = all(value is not None for value in values.values())
+                if not (legacy or complete):
+                    raise RuntimeError(
+                        "Database embedding binding is corrupt: model, dimension, "
+                        "pipeline, and epoch must be stored together."
+                    )
+                assert model is not None and raw_dim is not None
+                if legacy:
+                    stored_pipeline = embedding_pipeline
+                    epoch_value = "1"
+                else:
+                    assert pipeline is not None and raw_epoch is not None
+                    stored_pipeline = pipeline
+                    epoch_value = raw_epoch
+
+                try:
+                    stored_dim = int(raw_dim)
+                    stored_epoch = int(epoch_value)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "Database embedding binding is corrupt: dimension and epoch "
+                        "must be valid integers."
+                    ) from exc
+                if stored_dim <= 0 or stored_epoch <= 0:
+                    raise RuntimeError(
+                        "Database embedding binding is corrupt: dimension and epoch "
+                        "must be positive integers."
+                    )
+
+                binding = EmbeddingBinding(
+                    model, stored_dim, stored_pipeline, stored_epoch
+                )
+                requested = EmbeddingBinding(
+                    embedding_model,
+                    embedding_dim,
+                    embedding_pipeline,
+                    stored_epoch,
+                )
+                if binding != requested:
+                    raise RuntimeError(
+                        f"DB embedding binding is {binding}; this process requests "
+                        f"{requested}. Re-embed with `llm-wiki reindex --reembed` "
+                        "or restore the original embedding configuration."
+                    )
+                if legacy:
+                    set_meta(conn, "embedding_pipeline", embedding_pipeline)
+                    set_meta(conn, "embedding_epoch", "1")
+
+            if table_row is None:
+                conn.execute(
+                    "CREATE VIRTUAL TABLE chunk_vectors USING vec0("
+                    f"chunk_id INTEGER PRIMARY KEY, embedding float[{embedding_dim}] "
+                    "distance_metric=cosine)"
+                )
+                conn.execute(
+                    "UPDATE documents SET vector_dirty=1 WHERE is_deleted=0"
+                )
+            else:
+                match = re.search(
+                    r"\bembedding\s+float\s*\[\s*(\d+)\s*\]",
+                    table_row["sql"] or "",
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    raise RuntimeError(
+                        "Database embedding binding is corrupt: chunk_vectors does "
+                        "not declare a readable embedding dimension."
+                    )
+                table_dim = int(match.group(1))
+                if table_dim != binding.dim:
+                    raise RuntimeError(
+                        f"DB embedding binding dimension is {binding.dim}, but "
+                        f"chunk_vectors uses {table_dim}. Re-embed with "
+                        "`llm-wiki reindex --reembed` to rebuild vector storage."
+                    )
+
+        self._expected_embedding_binding = binding
+        return binding
 
     def rebind_model(self, embedding_model: str, embedding_dim: int) -> None:
         """Re-point the DB at a (possibly new) embedding model: drop and recreate the

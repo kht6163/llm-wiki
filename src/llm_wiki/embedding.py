@@ -12,6 +12,8 @@ from typing import Any
 
 import sqlite_vec
 
+from .embedding_contract import EMBEDDING_PIPELINE
+
 # Query-embedding cache size. Search is read-dominant and the same queries recur
 # (autocomplete, repeated agent lookups, popular terms); a forward pass on CPU is the
 # dominant search latency, so a small LRU pays for itself. The model is fixed for the
@@ -21,6 +23,8 @@ _QUERY_CACHE_MAX = 512
 
 
 class Embedder:
+    pipeline = EMBEDDING_PIPELINE
+
     def __init__(self, model_name: str):
         self.model_name = model_name
         self._model = None

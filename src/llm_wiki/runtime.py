@@ -34,7 +34,7 @@ def build_context(settings: Settings | None = None, *, full: bool = True,
     db = Database(settings.db_path)
     embedder = get_embedder(settings.embedding_model)  # model loads lazily on first use
     if full:
-        db.initialize(settings.embedding_model, embedder.dim)
+        db.initialize(settings.embedding_model, embedder.dim, embedder.pipeline)
     else:
         db.ensure_schema()
     events = EventHub()
