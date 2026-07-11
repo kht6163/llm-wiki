@@ -21,6 +21,62 @@ def _seed(ctx, principals):
     docs.create(ed, "rootdoc.md", "# Root\n\n루트 문서 본문\n", embed=False)
 
 
+_FIXED_NOW = "2026-01-01T00:00:00Z"
+
+
+def _insert_doc(
+    conn, path, *, title=None, body="body", folder=None, deleted=False, tags=()
+):
+    doc_folder = path.rpartition("/")[0] if folder is None else folder
+    content_hash = f"hash:{path}"
+    cur = conn.execute(
+        "INSERT INTO documents(path, path_norm, title, content_hash, folder, "
+        "is_deleted, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
+        (
+            path,
+            path.lower(),
+            title or path,
+            content_hash,
+            doc_folder,
+            deleted,
+            _FIXED_NOW,
+            _FIXED_NOW,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO revisions(doc_id, version, body, title, content_hash, created_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (cur.lastrowid, 1, body, title or path, content_hash, _FIXED_NOW),
+    )
+    conn.executemany(
+        "INSERT INTO tags(doc_id, tag) VALUES(?,?)",
+        [(cur.lastrowid, tag) for tag in tags],
+    )
+    return cur.lastrowid
+
+
+def _full_header(total, site_title="W"):
+    return f"# {site_title}\n\n> 전체 코퍼스 export — 문서 {total}개.\n"
+
+
+def _full_candidate(path, title, body, *, tags=()):
+    tag_line = f"- 태그: {', '.join(sorted(tags))}\n" if tags else ""
+    return (
+        f"\n---\n\n# {title}\n\n"
+        f"- 경로: `{path}`\n"
+        f"{tag_line}"
+        f"- 수정: {_FIXED_NOW}\n\n"
+        f"{body.strip()}\n"
+    )
+
+
+def _full_marker(included, total):
+    return (
+        f"\n---\n\n> [truncated] {included}/{total} 문서만 포함되었습니다. "
+        "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n"
+    )
+
+
 # -- service: llms_index ---------------------------------------------------
 def test_llms_index_structure(ctx, principals):
     _seed(ctx, principals)
@@ -57,11 +113,38 @@ def test_llms_index_escapes_markdown_label(ctx, principals):
     assert r"[A \[B\] \\](/doc/odd.md/raw)" in text
 
 
-def test_llms_index_loads_current_bodies_with_one_join(ctx, principals):
-    _seed(ctx, principals)
-    ctx.docs.update(
-        principals["editor"], "guide/deep.md", 1, "# Deep\n\n최신 본문\n", embed=False
-    )
+def test_llms_index_batches_129_rows_and_loads_current_bodies_with_one_join(
+    ctx, monkeypatch
+):
+    with ctx.db.writer() as conn:
+        ids = [
+            _insert_doc(
+                conn,
+                f"batch/{i:03}.md",
+                title=f"Doc {i:03}",
+                body=f"body {i:03}",
+                tags=(f"tag-{i:03}",),
+            )
+            for i in range(129)
+        ]
+        conn.execute(
+            "UPDATE documents SET version=2 WHERE id=?",
+            (ids[-1],),
+        )
+        conn.execute(
+            "INSERT INTO revisions(doc_id, version, body, title, content_hash, created_at) "
+            "VALUES(?,2,?,?,?,?)",
+            (ids[-1], "latest body 128", "Doc 128", "hash:latest", _FIXED_NOW),
+        )
+
+    tag_batch_sizes = []
+    original_tags_for_ids = ctx.docs._tags_for_ids
+
+    def record_tag_batch(conn, ids):
+        tag_batch_sizes.append(len(ids))
+        return original_tags_for_ids(conn, ids)
+
+    monkeypatch.setattr(ctx.docs, "_tags_for_ids", record_tag_batch)
     statements = []
     with ctx.db.reader() as conn:
         conn.set_trace_callback(statements.append)
@@ -74,14 +157,130 @@ def test_llms_index_loads_current_bodies_with_one_join(ctx, principals):
         sql for sql in statements
         if "revisions" in sql.lower() and "body" in sql.lower()
     ]
-    assert "최신 본문" in text
-    assert "본문 첫 줄" not in text
+    assert "latest body 128" in text
+    assert "): body 128\n" not in text
+    assert tag_batch_sizes == [128, 1]
     assert len(body_queries) == 1
     assert "join revisions" in " ".join(body_queries[0].lower().split())
     assert not any(
         "select body from revisions where doc_id=" in " ".join(sql.lower().split())
         for sql in statements
     )
+
+
+def test_corpus_helpers_filter_folder_subtree_deleted_rows_and_sort(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "root-z.md")
+        _insert_doc(conn, "alpha/z.md")
+        _insert_doc(conn, "alpha/a.md")
+        _insert_doc(conn, "alpha/nested/b.md")
+        _insert_doc(conn, "beta/a.md")
+        _insert_doc(conn, "alpha/deleted.md", deleted=True)
+
+    with ctx.db.reader() as conn:
+        assert ctx.docs._corpus_count("/alpha/", conn=conn) == 3
+        alpha = list(ctx.docs._iter_corpus_docs("/alpha/", conn=conn))
+        all_docs = list(ctx.docs._iter_corpus_docs(conn=conn))
+
+    assert [doc["path"] for doc in alpha] == [
+        "alpha/a.md",
+        "alpha/z.md",
+        "alpha/nested/b.md",
+    ]
+    assert [doc["path"] for doc in all_docs] == [
+        "root-z.md",
+        "alpha/a.md",
+        "alpha/z.md",
+        "alpha/nested/b.md",
+        "beta/a.md",
+    ]
+
+
+def test_llms_index_normalizes_labels_and_description_without_changing_url(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(
+            conn,
+            "odd [x].md",
+            title="Title [x] \\\n Next",
+            folder="Folder [x] \\\n Next",
+            body="---\ndescription: first\t  second\n---\nbody",
+        )
+
+    text = ctx.docs.llms_index(site_title="Site [x] \\\n Next")
+
+    assert text.startswith("# Site \\[x\\] \\\\ Next\n")
+    assert "## Folder \\[x\\] \\\\ Next\n" in text
+    assert (
+        "- [Title \\[x\\] \\\\ Next](/doc/odd%20%5Bx%5D.md/raw): first second"
+        in text
+    )
+    full = ctx.docs.llms_full(site_title="Site [x] \\\n Next")
+    assert full["text"].startswith("# Site \\[x\\] \\\\ Next\n")
+    assert "\n# Title \\[x\\] \\\\ Next\n" in full["text"]
+    assert "- 경로: `odd [x].md`" in full["text"]
+
+
+@pytest.mark.parametrize("export_name", ["llms_index", "llms_full"])
+def test_corpus_export_keeps_count_and_rows_in_one_snapshot(
+    ctx, monkeypatch, export_name
+):
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "before.md", title="Before", body="before body")
+
+    original = ctx.docs._iter_corpus_docs
+
+    def interleaved(folder=None, batch_size=128, conn=None):
+        writer = ctx.db.connect()
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            _insert_doc(writer, "after.md", title="After", body="after body")
+            writer.execute("COMMIT")
+        finally:
+            writer.close()
+        if conn is None:
+            yield from original(folder, batch_size)
+        else:
+            yield from original(folder, batch_size, conn=conn)
+
+    monkeypatch.setattr(ctx.docs, "_iter_corpus_docs", interleaved)
+    result = getattr(ctx.docs, export_name)(site_title="W")
+
+    if export_name == "llms_index":
+        assert "문서 1개" in result
+        assert "[Before]" in result
+        assert "[After]" not in result
+    else:
+        assert result["total"] == result["included"] == 1
+        assert "before body" in result["text"]
+        assert "after body" not in result["text"]
+
+
+def test_corpus_snapshot_ends_owned_transaction_on_success_and_error(ctx):
+    with ctx.docs._corpus_read_snapshot() as conn:
+        assert conn.in_transaction
+    with ctx.db.reader() as conn:
+        assert not conn.in_transaction
+
+    with pytest.raises(RuntimeError, match="stop"):
+        with ctx.docs._corpus_read_snapshot() as conn:
+            assert conn.in_transaction
+            raise RuntimeError("stop")
+    with ctx.db.reader() as conn:
+        assert not conn.in_transaction
+
+
+def test_corpus_snapshot_does_not_finish_caller_transaction(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "before.md", title="Before")
+        with pytest.raises(RuntimeError, match="caller error"):
+            with ctx.docs._corpus_read_snapshot() as snapshot_conn:
+                assert snapshot_conn is conn
+                raise RuntimeError("caller error")
+        assert conn.in_transaction
+        assert "[Before]" in ctx.docs.llms_index(site_title="W")
+        assert conn.in_transaction
+        _insert_doc(conn, "after.md", title="After")
+    assert ctx.docs._corpus_count() == 2
 
 
 # -- service: llms_full ----------------------------------------------------
@@ -107,6 +306,28 @@ def test_llms_full_concatenates_and_strips_frontmatter(ctx, principals):
     assert "루트 문서 본문" in body
 
 
+def test_llms_full_populated_text_preserves_exact_newline_format(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(
+            conn,
+            "a.md",
+            title="A",
+            body="body",
+            tags=("beta", "alpha"),
+        )
+
+    res = ctx.docs.llms_full(site_title="W")
+
+    assert res == {
+        "text": _full_header(1) + _full_candidate(
+            "a.md", "A", "body", tags=("beta", "alpha")
+        ),
+        "included": 1,
+        "total": 1,
+        "truncated": False,
+    }
+
+
 def test_llms_full_truncates_on_budget(ctx, principals):
     _seed(ctx, principals)
     res = ctx.docs.llms_full(site_title="W", max_chars=10)
@@ -116,12 +337,126 @@ def test_llms_full_truncates_on_budget(ctx, principals):
 
 
 def test_llms_full_hard_caps_single_large_document(ctx, principals):
-    ctx.docs.create(
-        principals["editor"], "big.md", "# Big\n\n" + "가" * 5000, embed=False
-    )
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "big.md", title="Big", body="가" * 5000)
     res = ctx.docs.llms_full(site_title="W", max_chars=1000)
-    assert len(res["text"]) <= 1000
+    assert len(res["text"]) == 1000
+    assert res["included"] == res["total"] == 1
     assert res["truncated"] is True
+    assert res["text"].endswith(_full_marker(1, 1))
+
+
+def test_llms_full_budget_boundaries(ctx):
+    body = "x" * 200
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "a.md", title="A", body=body)
+
+    header = _full_header(1)
+    candidate = _full_candidate("a.md", "A", body)
+    marker_0 = _full_marker(0, 1)
+    marker_1 = _full_marker(1, 1)
+    full_text = header + candidate
+    cases = [
+        ("zero", 0, "", 0, True),
+        ("header-minus-one", len(header) - 1, header[:-1], 0, True),
+        ("exact-header", len(header), header, 0, True),
+        (
+            "marker-prefix",
+            len(header) + 8,
+            header + marker_0[:8],
+            0,
+            True,
+        ),
+        (
+            "below-first-partial",
+            len(header) + len(marker_0) + 1,
+            header + marker_0,
+            0,
+            True,
+        ),
+        (
+            "first-partial",
+            len(header) + len(marker_1) + 2,
+            header + candidate[:2] + marker_1,
+            1,
+            True,
+        ),
+        (
+            "one-short-of-fit",
+            len(full_text) - 1,
+            header + candidate[: len(candidate) - len(marker_1) - 1] + marker_1,
+            1,
+            True,
+        ),
+        ("exact-fit", len(full_text), full_text, 1, False),
+    ]
+
+    for case, budget, expected_text, included, truncated in cases:
+        result = ctx.docs.llms_full(site_title="W", max_chars=budget)
+        assert len(result["text"]) <= budget, case
+        assert result == {
+            "text": expected_text,
+            "included": included,
+            "total": 1,
+            "truncated": truncated,
+        }, case
+
+
+def test_llms_full_two_document_boundary(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "a.md", title="A", body="first")
+        _insert_doc(conn, "b.md", title="B", body="second" * 100)
+
+    header = _full_header(2)
+    first = _full_candidate("a.md", "A", "first")
+    second = _full_candidate("b.md", "B", "second" * 100)
+    marker = _full_marker(1, 2)
+    first_boundary = len(header) + len(first)
+
+    without_marker = ctx.docs.llms_full(site_title="W", max_chars=first_boundary)
+    assert len(without_marker["text"]) <= first_boundary
+    assert without_marker == {
+        "text": header + first,
+        "included": 1,
+        "total": 2,
+        "truncated": True,
+    }
+
+    marker_boundary = first_boundary + len(marker)
+    with_marker = ctx.docs.llms_full(site_title="W", max_chars=marker_boundary)
+    assert len(with_marker["text"]) <= marker_boundary
+    assert with_marker == {
+        "text": header + first + marker,
+        "included": 1,
+        "total": 2,
+        "truncated": True,
+    }
+
+    full_text = header + first + second
+    exact_fit = ctx.docs.llms_full(site_title="W", max_chars=len(full_text))
+    assert len(exact_fit["text"]) <= len(full_text)
+    assert exact_fit == {
+        "text": full_text,
+        "included": 2,
+        "total": 2,
+        "truncated": False,
+    }
+
+    marker_2 = _full_marker(2, 2)
+    one_short_budget = len(full_text) - 1
+    one_short = ctx.docs.llms_full(site_title="W", max_chars=one_short_budget)
+    assert len(one_short["text"]) <= one_short_budget
+    assert one_short == {
+        "text": (
+            header
+            + first
+            + second[: len(second) - len(marker_2) - 1]
+            + marker_2
+        ),
+        "included": 2,
+        "total": 2,
+        "truncated": True,
+    }
 
 
 def test_llms_full_clamps_negative_string_budget_to_zero(ctx, principals):

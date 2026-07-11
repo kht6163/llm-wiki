@@ -18,6 +18,7 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -856,10 +857,32 @@ class DocumentService:
             params=self.search_params)
 
     # ---- llms.txt corpus export (agent-facing site map / full ingest) ----
+    @contextmanager
+    def _corpus_read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Keep one read snapshot for an export without owning caller transactions."""
+        with self.db.reader() as conn:
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN")
+            try:
+                # A long reader is intentional here: totals and emitted rows must describe
+                # the same corpus even when a writer commits during a streamed iteration.
+                yield conn
+            finally:
+                if owned and conn.in_transaction:
+                    conn.execute("ROLLBACK")
+
     def _iter_corpus_docs(
-        self, folder: str | None = None, batch_size: int = 128
+        self,
+        folder: str | None = None,
+        batch_size: int = 128,
+        conn: sqlite3.Connection | None = None,
     ) -> Iterator[dict]:
         """Yield non-deleted documents in bounded batches, ordered folder→path."""
+        if conn is None:
+            with self.db.reader() as read_conn:
+                yield from self._iter_corpus_docs(folder, batch_size, conn=read_conn)
+            return
         q = (
             "SELECT d.id, d.path, d.title, d.folder, d.updated_at, r.body "
             "FROM documents d "
@@ -873,26 +896,29 @@ class DocumentService:
             params += [f, f + "/%"]
         q += " ORDER BY d.folder, d.path"
         batch_size = max(1, int(batch_size))
-        with self.db.reader() as conn:
-            cursor = conn.execute(q, params)
-            while rows := cursor.fetchmany(batch_size):
-                tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
-                for r in rows:
-                    yield {
-                        "path": r["path"], "title": r["title"] or r["path"],
-                        "folder": r["folder"] or "", "updated_at": r["updated_at"],
-                        "tags": tags_by.get(r["id"], []), "body": r["body"],
-                    }
+        cursor = conn.execute(q, params)
+        while rows := cursor.fetchmany(batch_size):
+            tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
+            for r in rows:
+                yield {
+                    "path": r["path"], "title": r["title"] or r["path"],
+                    "folder": r["folder"] or "", "updated_at": r["updated_at"],
+                    "tags": tags_by.get(r["id"], []), "body": r["body"],
+                }
 
-    def _corpus_count(self, folder: str | None = None) -> int:
+    def _corpus_count(
+        self, folder: str | None = None, conn: sqlite3.Connection | None = None
+    ) -> int:
+        if conn is None:
+            with self.db.reader() as read_conn:
+                return self._corpus_count(folder, conn=read_conn)
         q = "SELECT COUNT(*) FROM documents d WHERE d.is_deleted=0"
         params: list = []
         if folder:
             f = folder.strip("/")
             q += " AND (d.folder=? OR d.folder LIKE ?)"
             params += [f, f + "/%"]
-        with self.db.reader() as conn:
-            return int(conn.execute(q, params).fetchone()[0])
+        return int(conn.execute(q, params).fetchone()[0])
 
     @staticmethod
     def _one_line(value: object) -> str:
@@ -933,23 +959,24 @@ class DocumentService:
         an H2 section per folder listing each document as a markdown link to its raw
         (.md) source plus a short description — so any LLM, not just an MCP client,
         can discover what the knowledge base holds."""
-        total = self._corpus_count()
-        docs = self._iter_corpus_docs()
-        lines = [
-            f"# {self._md_label(site_title)}", "",
-            f"> 마크다운 지식베이스 — 문서 {total}개. "
-            "각 항목은 원문(.md) 링크이며, 전체 본문은 /llms-full.txt 로 한 번에 가져올 수 있습니다.",
-            "",
-        ]
-        for folder, group in groupby(docs, key=lambda d: d["folder"]):
-            lines.append(f"## {self._md_label(folder or '루트')}")
-            for d in group:
-                desc = self._one_line(self._doc_description(d["body"]))
-                url = self._doc_raw_url(d["path"], base_url)
-                title = self._md_label(d["title"])
-                lines.append(f"- [{title}]({url})" + (f": {desc}" if desc else ""))
-            lines.append("")
-        return "\n".join(lines).rstrip() + "\n"
+        with self._corpus_read_snapshot() as conn:
+            total = self._corpus_count(conn=conn)
+            docs = self._iter_corpus_docs(conn=conn)
+            lines = [
+                f"# {self._md_label(site_title)}", "",
+                f"> 마크다운 지식베이스 — 문서 {total}개. "
+                "각 항목은 원문(.md) 링크이며, 전체 본문은 /llms-full.txt 로 한 번에 가져올 수 있습니다.",
+                "",
+            ]
+            for folder, group in groupby(docs, key=lambda d: d["folder"]):
+                lines.append(f"## {self._md_label(folder or '루트')}")
+                for d in group:
+                    desc = self._one_line(self._doc_description(d["body"]))
+                    url = self._doc_raw_url(d["path"], base_url)
+                    title = self._md_label(d["title"])
+                    lines.append(f"- [{title}]({url})" + (f": {desc}" if desc else ""))
+                lines.append("")
+            return "\n".join(lines).rstrip() + "\n"
 
     def llms_full(self, *, site_title: str, max_chars: int = 2_000_000) -> dict:
         """Render the whole vault as one concatenated markdown document
@@ -958,58 +985,59 @@ class DocumentService:
         corpus in a single request. Emission stops once ``max_chars`` of content is
         reached (``truncated=True``), bounding the response for very large vaults."""
         limit = max(0, int(max_chars))
-        total = self._corpus_count()
-        parts = [
-            f"# {self._md_label(site_title)}\n\n"
-            f"> 전체 코퍼스 export — 문서 {total}개.\n"
-        ]
-        included = 0
-        truncated = False
+        with self._corpus_read_snapshot() as conn:
+            total = self._corpus_count(conn=conn)
+            parts = [
+                f"# {self._md_label(site_title)}\n\n"
+                f"> 전체 코퍼스 export — 문서 {total}개.\n"
+            ]
+            included = 0
+            truncated = False
 
-        def marker(count: int) -> str:
-            return (
-                f"\n---\n\n> [truncated] {count}/{total} 문서만 포함되었습니다. "
-                "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n"
-            )
+            def marker(count: int) -> str:
+                return (
+                    f"\n---\n\n> [truncated] {count}/{total} 문서만 포함되었습니다. "
+                    "나머지는 /llms.txt 색인이나 개별 문서로 가져오세요.\n"
+                )
 
-        size = len(parts[0])
-        if size <= limit:
-            for d in self._iter_corpus_docs():
-                body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
-                header = (f"---\n\n# {self._md_label(d['title'])}\n\n"
-                          f"- 경로: `{d['path']}`\n"
-                          + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
-                          + f"- 수정: {d['updated_at']}\n")
-                block = header + "\n" + body + "\n"
-                separator = "\n"
-                candidate = separator + block
-                if size + len(candidate) <= limit:
-                    parts.append(candidate)
-                    size += len(candidate)
-                    included += 1
-                    continue
+            size = len(parts[0])
+            if size <= limit:
+                for d in self._iter_corpus_docs(conn=conn):
+                    body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
+                    header = (f"---\n\n# {self._md_label(d['title'])}\n\n"
+                              f"- 경로: `{d['path']}`\n"
+                              + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
+                              + f"- 수정: {d['updated_at']}\n")
+                    block = header + "\n" + body + "\n"
+                    separator = "\n"
+                    candidate = separator + block
+                    if size + len(candidate) <= limit:
+                        parts.append(candidate)
+                        size += len(candidate)
+                        included += 1
+                        continue
 
-                remaining = limit - size
-                partial_marker = marker(included + 1)
-                block_budget = remaining - len(partial_marker)
-                if block_budget > len(separator):
-                    parts.append(candidate[:block_budget])
-                    included += 1
-                    parts.append(partial_marker)
-                else:
-                    parts.append(marker(included)[:remaining])
+                    remaining = limit - size
+                    partial_marker = marker(included + 1)
+                    block_budget = remaining - len(partial_marker)
+                    if block_budget > len(separator):
+                        parts.append(candidate[:block_budget])
+                        included += 1
+                        parts.append(partial_marker)
+                    else:
+                        parts.append(marker(included)[:remaining])
+                    truncated = True
+                    break
+            else:
                 truncated = True
-                break
-        else:
-            truncated = True
 
-        text = "".join(parts)
-        return {
-            "text": text[:limit],
-            "included": included,
-            "total": total,
-            "truncated": truncated or len(text) > limit,
-        }
+            text = "".join(parts)
+            return {
+                "text": text[:limit],
+                "included": included,
+                "total": total,
+                "truncated": truncated or len(text) > limit,
+            }
 
     def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
         """Resolve a wikilink/markdown target to an existing document path, or None."""
