@@ -288,6 +288,40 @@ def test_embed_doc_rejects_non_finite_output_without_changing_vectors(
     assert _vector_payloads(ctx, doc_id) == before
 
 
+def test_embed_doc_rejects_float32_overflow_before_writer(
+    ctx, principals, monkeypatch
+):
+    docs, p = ctx.docs, principals["editor"]
+    docs.create(p, "overflow.md", "# T\n\nalpha paragraph one")
+    doc_id = _doc_id(ctx, "overflow.md")
+    before = _vector_payloads(ctx, doc_id)
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET vector_dirty=1 WHERE id=?", (doc_id,))
+
+    def overflow_embed(texts):
+        return [
+            [1e39, *([0.1] * (ctx.embedder.dim - 1))]
+            for _text in texts
+        ]
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", overflow_embed)
+    writer_called = False
+
+    def unexpected_writer():
+        nonlocal writer_called
+        writer_called = True
+        raise AssertionError("writer must not open for a float32-overflowed vector")
+
+    monkeypatch.setattr(ctx.db, "writer", unexpected_writer)
+
+    with pytest.raises(ValueError, match="float32"):
+        indexing.embed_doc(ctx.db, ctx.embedder, doc_id)
+
+    assert writer_called is False
+    assert _dirty(ctx, doc_id) == 1
+    assert _vector_payloads(ctx, doc_id) == before
+
+
 def test_embed_doc_bounds_model_calls_by_batch_size(ctx, principals, monkeypatch):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "large.md", "placeholder")

@@ -8,6 +8,7 @@ from urllib.parse import quote
 import pytest
 from starlette.testclient import TestClient
 
+from llm_wiki.db import Database
 from llm_wiki.web import create_web_app
 
 
@@ -461,6 +462,63 @@ def test_readyz_reports_index_health(client):
     assert d["embedding_model"]
     assert d["broken_links"] >= 1 and d["pending_files"] == 0
     assert d["schema_version"] >= 4
+
+
+def test_readyz_rejects_stale_process_embedding_binding(client, ctx):
+    other = Database(ctx.settings.db_path)
+    other.initialize(
+        ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    other.rebind_model(
+        "test/different-same-dimension-model",
+        ctx.embedder.dim,
+        ctx.embedder.pipeline,
+    )
+
+    response = client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["binding_current"] is False
+    assert response.json()["ready"] is False
+
+
+def test_stale_embedding_search_returns_503_with_stable_code(client, ctx):
+    login(client, "alice")
+    create_doc(client, "stale-search.md", "# Stale\n\nembedding generation search")
+    other = Database(ctx.settings.db_path)
+    other.initialize(
+        ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    other.rebind_model(
+        "test/different-same-dimension-model",
+        ctx.embedder.dim,
+        ctx.embedder.pipeline,
+    )
+
+    response = client.get("/search?q=embedding+generation&mode=vector")
+
+    assert response.status_code == 503
+    assert response.headers["x-error-code"] == "embedding_unavailable"
+
+
+def test_stale_related_api_returns_503_with_stable_code(client, ctx):
+    login(client, "alice")
+    create_doc(client, "stale-related.md", "# Stale\n\nrelated generation")
+    other = Database(ctx.settings.db_path)
+    other.initialize(
+        ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    other.rebind_model(
+        "test/different-same-dimension-model",
+        ctx.embedder.dim,
+        ctx.embedder.pipeline,
+    )
+
+    response = client.get("/api/doc/stale-related.md/related")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "embedding_unavailable"
+    assert response.json()["error"]["suggested_action"] == "restart_service"
 
 
 def test_metrics_exposes_index_gauges(client):

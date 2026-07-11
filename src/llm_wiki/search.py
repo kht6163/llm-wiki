@@ -4,11 +4,17 @@ need normalizing.
 """
 from __future__ import annotations
 
+import math
 import re
 import time
 from dataclasses import asdict, dataclass
 
 from .embedding import Embedder
+from .embedding_contract import (
+    EMBEDDING_FLOAT32_MAX,
+    EmbeddingBinding,
+    EmbeddingBindingChanged,
+)
 from .markdown_utils import heading_slug
 from .metrics import SEARCH_LATENCY, SEARCH_QUERIES
 from .util import clamp_int
@@ -213,16 +219,43 @@ def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
     return [(r["doc_id"], r["rank"]) for r in rows]
 
 
-def _vector(conn, embedder: Embedder, query: str, limit: int) -> list[tuple[int, dict]]:
+def _prepare_query_vector(
+    db, embedder: Embedder, query: str
+) -> tuple[EmbeddingBinding, bytes]:
+    """Capture the process binding, then encode outside the SQLite read snapshot."""
+    expected = db.expected_embedding_binding()
+    actual_identity = (embedder.model_name, embedder.pipeline)
+    expected_identity = (expected.model, expected.pipeline)
+    if actual_identity != expected_identity:
+        raise EmbeddingBindingChanged(
+            f"Process embedder {actual_identity} does not match expected binding "
+            f"{expected_identity}."
+        )
+    try:
+        values = [float(value) for value in embedder.embed_query(query)]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("query embedding must contain numeric values") from exc
+    if len(values) != expected.dim:
+        raise ValueError(
+            "query embedding dimension does not match binding: "
+            f"expected {expected.dim}, got {len(values)}"
+        )
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("query embedding must contain only finite values")
+    if any(abs(value) > EMBEDDING_FLOAT32_MAX for value in values):
+        raise ValueError("query embedding values must fit the float32 range")
+    return expected, Embedder.serialize(values)
+
+
+def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
     """Vector KNN collapsed to one best chunk per document. Each value is a dict
     with the matched chunk's distance/heading/text/heading_path, its stable
     ``chunk_id`` and ``ordinal`` (a chunk address for read_chunk), and its
     ``char_start``/``char_end`` offsets (the exact body range, for deep-linking)."""
-    qv = embedder.embed_query(query)
     rows = conn.execute(
         "SELECT chunk_id, distance FROM chunk_vectors "
         "WHERE embedding MATCH ? AND k=? ORDER BY distance",
-        (Embedder.serialize(qv), limit),
+        (query_vector, limit),
     ).fetchall()
     if not rows:
         return []
@@ -273,8 +306,9 @@ def _rerank_boost(title: str | None, vi: dict | None, q_norm: str,
     return boost
 
 
-def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
+def _rank(conn, query: str, *, mode: str, k: int,
           folder: str | None, tags: list[str] | None,
+          query_vector: bytes | None = None,
           filters: QueryFilters = _NO_FILTERS,
           params: FusionParams = DEFAULT_FUSION):
     """Core retrieval+RRF fusion shared by ``search_page`` and ``assemble_context``.
@@ -291,7 +325,12 @@ def _rank(conn, embedder: Embedder, query: str, *, mode: str, k: int,
     # yields fewer distinct docs than chunks fetched. Over-fetch chunks so the
     # post-dedup/post-filter set still holds ~k distinct docs.
     k_vec = min(k * params.vector_factor, params.vector_cap)
-    vec_list = _vector(conn, embedder, query, k_vec) if mode in ("hybrid", "vector") else []
+    if mode in ("hybrid", "vector"):
+        if query_vector is None:
+            raise RuntimeError("vector search requires a prepared query embedding")
+        vec_list = _vector(conn, query_vector, k_vec)
+    else:
+        vec_list = []
 
     bm_rank = {doc_id: i + 1 for i, (doc_id, _) in enumerate(bm_list)}
     vec_rank = {doc_id: i + 1 for i, (doc_id, _) in enumerate(vec_list)}
@@ -474,9 +513,19 @@ def search_page(
             "Provide search terms; operators (title:/path:/has:) only refine a text query.")
     q_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
 
-    with db.reader() as conn:
-        scored, vec_info, match = _rank(conn, embedder, text, mode=mode, k=k,
-                                        folder=folder, tags=tags, filters=filters, params=params)
+    expected: EmbeddingBinding | None = None
+    query_vector: bytes | None = None
+    if mode in ("hybrid", "vector"):
+        expected, query_vector = _prepare_query_vector(db, embedder, text)
+
+    read_context = (
+        db.embedding_read_snapshot(expected) if expected is not None else db.reader()
+    )
+    with read_context as conn:
+        scored, vec_info, match = _rank(
+            conn, text, mode=mode, k=k, folder=folder, tags=tags,
+            query_vector=query_vector, filters=filters, params=params,
+        )
 
         # Batch-load the candidates' metadata (and, when a tag filter is active, their
         # tags) once up front instead of one SELECT per doc inside the loop — the loop
@@ -577,8 +626,18 @@ def search(
                        folder=folder, tags=tags, params=params)[0]
 
 
-def related_documents(conn, source_doc_id: int, *, k: int = 8,
+def related_documents(db, source_doc_id: int, *, k: int = 8,
                       max_src_chunks: int = 12) -> list[dict]:
+    """Run related-document vector reads in one binding-verified snapshot."""
+    expected = db.expected_embedding_binding()
+    with db.embedding_read_snapshot(expected) as conn:
+        return _related_documents(
+            conn, source_doc_id, k=k, max_src_chunks=max_src_chunks
+        )
+
+
+def _related_documents(conn, source_doc_id: int, *, k: int = 8,
+                       max_src_chunks: int = 12) -> list[dict]:
     """Documents most semantically similar to ``source_doc_id``, via the chunk
     vectors already in the index (no model forward pass — the stored source vectors
     are themselves the KNN queries). For each of the source's leading chunks we run a
@@ -751,13 +810,23 @@ def assemble_context(
             "Provide a question; operators (title:/path:/has:) only refine a text query.")
     q_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
 
+    expected: EmbeddingBinding | None = None
+    query_vector: bytes | None = None
+    if mode in ("hybrid", "vector"):
+        expected, query_vector = _prepare_query_vector(db, embedder, text)
+
     sources: list[dict] = []
     parts: list[str] = []
     total = 0
     truncated = False
-    with db.reader() as conn:
-        scored, vec_info, _match = _rank(conn, embedder, text, mode=mode, k=k,
-                                         folder=folder, tags=tags, filters=filters, params=params)
+    read_context = (
+        db.embedding_read_snapshot(expected) if expected is not None else db.reader()
+    )
+    with read_context as conn:
+        scored, vec_info, _match = _rank(
+            conn, text, mode=mode, k=k, folder=folder, tags=tags,
+            query_vector=query_vector, filters=filters, params=params,
+        )
         # One batched metadata (and tag) load for all candidates, not a SELECT per doc.
         scored_ids = [d for d, _ in scored]
         doc_meta = _docs_meta_for_ids(conn, scored_ids)

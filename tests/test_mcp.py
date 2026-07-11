@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import llm_wiki.mcp_server as mcp_mod
+from llm_wiki.db import Database
 from llm_wiki.mcp_server import _bearer_token, create_mcp_server
 from llm_wiki.services.auth import create_api_key
 from llm_wiki.services.errors import ForbiddenError
@@ -79,6 +80,7 @@ def test_error_envelope_shape():
 def test_error_suggested_actions_per_code():
     from llm_wiki.services.errors import (
         ConflictError,
+        EmbeddingUnavailableError,
         NotFoundError,
         RateLimitedError,
         ValidationError,
@@ -87,6 +89,13 @@ def test_error_suggested_actions_per_code():
     assert ValidationError("x").to_dict()["error"]["suggested_action"] == "fix_request"
     assert ConflictError("x").to_dict()["error"]["suggested_action"] == "re_read_and_retry"
     assert RateLimitedError("x").to_dict()["error"]["suggested_action"] == "retry_after"
+    unavailable = EmbeddingUnavailableError("x")
+    assert unavailable.http_status == 503
+    assert unavailable.to_dict()["error"] == {
+        "code": "embedding_unavailable",
+        "message": "x",
+        "suggested_action": "restart_service",
+    }
     # Per-instance extra coexists with the code-level hint.
     e = ConflictError("x", current_version=3).to_dict()["error"]
     assert e["suggested_action"] == "re_read_and_retry" and e["current_version"] == 3
@@ -184,6 +193,37 @@ async def test_error_envelope_carries_suggested_action(editor_mcp):
     assert nf["error"]["code"] == "not_found" and nf["error"]["suggested_action"] == "verify_path"
     val = _payload(await editor_mcp.call_tool("search_documents", {"query": "   "}))
     assert val["error"]["code"] == "validation" and val["error"]["suggested_action"] == "fix_request"
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("search_documents", {"query": "embedding generation", "mode": "vector"}),
+        ("assemble_context", {"question": "embedding generation", "mode": "vector"}),
+        ("get_related_documents", {"path": "stale.md", "limit": 5}),
+    ],
+)
+async def test_stale_embedding_tools_return_stable_unavailable_error(
+    editor_mcp, ctx, principals, tool, arguments
+):
+    ctx.docs.create(
+        principals["editor"], "stale.md", "# Stale\n\nembedding generation"
+    )
+    other = Database(ctx.settings.db_path)
+    other.initialize(
+        ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    other.rebind_model(
+        "test/different-same-dimension-model",
+        ctx.embedder.dim,
+        ctx.embedder.pipeline,
+    )
+
+    result = _payload(await editor_mcp.call_tool(tool, arguments))
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "embedding_unavailable"
+    assert result["error"]["suggested_action"] == "restart_service"
 
 
 async def test_create_then_read_roundtrip(editor_mcp):

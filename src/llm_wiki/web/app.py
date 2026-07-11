@@ -59,7 +59,13 @@ from ..services.auth import (
     revoke_api_key,
 )
 from ..services.documents import ATTACH_MAX_BYTES
-from ..services.errors import ConflictError, ForbiddenError, ValidationError, WikiError
+from ..services.errors import (
+    ConflictError,
+    ForbiddenError,
+    NotFoundError,
+    ValidationError,
+    WikiError,
+)
 from ..util import (
     PathError,
     clamp_int,
@@ -348,9 +354,15 @@ def create_web_app(app: AppContext) -> FastAPI:
         # handling (inline conflict re-render, flash-and-redirect) catch their own
         # WikiError before it reaches here. API routes get the structured envelope;
         # pages get the HTML error template at the error's HTTP status.
+        response: Response
         if request.url.path.startswith("/api/"):
-            return JSONResponse(exc.to_dict(), status_code=exc.http_status)
-        return render("error.html", request, status=exc.http_status, message=exc.message)
+            response = JSONResponse(exc.to_dict(), status_code=exc.http_status)
+        else:
+            response = render(
+                "error.html", request, status=exc.http_status, message=exc.message
+            )
+        response.headers["X-Error-Code"] = exc.code
+        return response
 
     @web.exception_handler(Exception)
     async def _on_unexpected(request: Request, exc: Exception):
@@ -422,18 +434,22 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.get("/readyz")
     def readyz():
-        # Readiness: DB reachable AND the embedding model loaded. Orchestrators
+        # Readiness: DB reachable, the embedding model loaded, AND this process's
+        # immutable embedding binding still current. Orchestrators
         # should route traffic only once this returns 200. Also surfaces index health
         # (embedding backlog / pending writes / broken links) for at-a-glance ops.
         details: dict = {}
+        binding_current = False
         try:
             details = collect_index_gauges(db)
-            ready = embedder.is_loaded
+            binding_current = db.embedding_binding_is_current()
+            ready = embedder.is_loaded and binding_current
         except Exception:
             ready = False
         code = 200 if ready else 503
         body = {
             "ok": ready, "ready": ready, "model_loaded": embedder.is_loaded,
+            "binding_current": binding_current,
             "embedding_model": embedder.model_name, **details,
         }
         # Surface background-embedding-worker health (running / consecutive failures /
@@ -870,7 +886,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         # related.js) so it stays off the synchronous critical path of the document view.
         try:
             related = docs.related(path, limit=6)["related"]
-        except WikiError:
+        except NotFoundError:
             related = []
         return JSONResponse({"ok": True, "related": related})
 

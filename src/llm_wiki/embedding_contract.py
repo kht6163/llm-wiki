@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 EMBEDDING_PIPELINE = "passage-input-v1"
+# Largest finite IEEE-754 binary32 value. sqlite-vec stores float32; accepting a
+# larger finite Python float would silently serialize it as +/-infinity.
+EMBEDDING_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
 
 
 @dataclass(frozen=True)

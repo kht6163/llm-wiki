@@ -16,7 +16,11 @@ from collections.abc import Callable
 
 from . import graph
 from .embedding import Embedder
-from .embedding_contract import EmbeddingBinding, EmbeddingBindingChanged
+from .embedding_contract import (
+    EMBEDDING_FLOAT32_MAX,
+    EmbeddingBinding,
+    EmbeddingBindingChanged,
+)
 from .markdown_utils import chunk_markdown, extract_links, parse_frontmatter
 from .metrics import (
     EMBED_CHUNKS,
@@ -191,6 +195,10 @@ def embed_doc(
                 if not all(math.isfinite(value) for value in values):
                     raise ValueError(
                         "embedding output vector must contain only finite values"
+                    )
+                if any(abs(value) > EMBEDDING_FLOAT32_MAX for value in values):
+                    raise ValueError(
+                        "embedding output vector values must fit the float32 range"
                     )
                 serialized.append((chunk_id, Embedder.serialize(values)))
             if on_batch is not None:

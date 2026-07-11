@@ -235,6 +235,46 @@ def test_verify_embedding_binding_requires_active_transaction(tmp_path):
             db.verify_embedding_binding(conn, binding)
 
 
+def test_embedding_read_snapshot_owns_and_closes_its_transaction(tmp_path):
+    db, binding = _initialize(tmp_path)
+
+    with db.embedding_read_snapshot(binding) as conn:
+        assert conn.in_transaction
+        assert get_meta(conn, "embedding_epoch") == "1"
+
+    with db.reader() as conn:
+        assert not conn.in_transaction
+
+
+def test_embedding_read_snapshot_nesting_preserves_outer_transaction(tmp_path):
+    db, binding = _initialize(tmp_path)
+
+    with db.embedding_read_snapshot(binding) as outer:
+        assert outer.in_transaction
+        with db.embedding_read_snapshot(binding) as inner:
+            assert inner is outer
+            assert inner.in_transaction
+        assert outer.in_transaction
+
+    with db.reader() as conn:
+        assert not conn.in_transaction
+
+
+def test_embedding_read_snapshot_does_not_own_writer_transaction(tmp_path):
+    db, binding = _initialize(tmp_path)
+
+    with db.writer() as conn:
+        with db.embedding_read_snapshot(binding) as snapshot:
+            assert snapshot is conn
+            snapshot.execute(
+                "INSERT INTO meta(k, v) VALUES('snapshot_writer_test', 'committed')"
+            )
+        assert conn.in_transaction
+
+    with db.reader() as conn:
+        assert get_meta(conn, "snapshot_writer_test") == "committed"
+
+
 def test_embed_doc_rejects_embedder_identity_before_model_call(tmp_path):
     db, _ = _initialize(tmp_path)
     doc_id = _insert_document(db, "identity.md")

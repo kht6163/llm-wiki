@@ -40,8 +40,7 @@ def test_related_respects_limit(ctx, principals):
 def test_related_empty_when_source_has_no_vectors(ctx):
     # A source with no chunk vectors (here: a non-existent doc id) yields no neighbors,
     # rather than raising.
-    with ctx.db.reader() as conn:
-        assert search.related_documents(conn, 10_000_000) == []
+    assert search.related_documents(ctx.db, 10_000_000) == []
 
 
 def test_related_missing_document_raises(ctx):

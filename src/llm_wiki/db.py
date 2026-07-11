@@ -579,15 +579,19 @@ class Database:
             raise RuntimeError(
                 "Embedding binding verification requires an active transaction."
             )
-        values = {
-            key: get_meta(conn, key)
-            for key in (
-                "embedding_model",
-                "embedding_dim",
-                "embedding_pipeline",
-                "embedding_epoch",
+        keys = (
+            "embedding_model",
+            "embedding_dim",
+            "embedding_pipeline",
+            "embedding_epoch",
+        )
+        values = dict.fromkeys(keys)
+        values.update({
+            row["k"]: row["v"]
+            for row in conn.execute(
+                "SELECT k, v FROM meta WHERE k IN (?, ?, ?, ?)", keys
             )
-        }
+        })
         try:
             current = EmbeddingBinding(
                 model=values["embedding_model"] or "",
@@ -603,6 +607,38 @@ class Database:
             raise EmbeddingBindingChanged(
                 f"Embedding binding changed from {expected} to {current}."
             )
+
+    @contextmanager
+    def embedding_read_snapshot(
+        self, expected: EmbeddingBinding
+    ) -> Iterator[sqlite3.Connection]:
+        """Yield one binding-verified SQLite read snapshot.
+
+        The thread-local connection can already belong to an outer transaction (for
+        example a nested vector read inside a writer). In that case this context only
+        verifies the binding and never commits or rolls back its caller's transaction.
+        Otherwise the binding read establishes the WAL snapshot and the context closes
+        the owned transaction with ``ROLLBACK`` after all vector/result reads finish.
+        """
+        with self.reader() as conn:
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN")
+            try:
+                self.verify_embedding_binding(conn, expected)
+                yield conn
+            finally:
+                if owned and conn.in_transaction:
+                    conn.execute("ROLLBACK")
+
+    def embedding_binding_is_current(self) -> bool:
+        """Whether DB metadata still matches this process's immutable binding."""
+        try:
+            expected = self.expected_embedding_binding()
+            with self.embedding_read_snapshot(expected):
+                return True
+        except EmbeddingBindingChanged:
+            return False
 
     def rebind_model(
         self,

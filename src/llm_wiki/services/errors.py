@@ -58,3 +58,9 @@ class RateLimitedError(WikiError):
     code = "rate_limited"
     http_status = 429
     suggested_action = "retry_after"  # backed off — pause and retry shortly
+
+
+class EmbeddingUnavailableError(WikiError):
+    code = "embedding_unavailable"
+    http_status = 503
+    suggested_action = "restart_service"

@@ -27,6 +27,7 @@ from urllib.parse import quote
 from .. import graph, indexing, search
 from ..db import Database
 from ..embedding import Embedder
+from ..embedding_contract import EmbeddingBindingChanged
 from ..markdown_utils import (
     SCHEME_RE,
     _mask,
@@ -59,6 +60,7 @@ from . import audit
 from .auth import Principal
 from .errors import (
     ConflictError,
+    EmbeddingUnavailableError,
     ForbiddenError,
     NotFoundError,
     ValidationError,
@@ -66,6 +68,11 @@ from .errors import (
 )
 
 log = logging.getLogger("llm_wiki.documents")
+
+_EMBEDDING_UNAVAILABLE_MESSAGE = (
+    "Embedding search is temporarily unavailable because this service is using "
+    "an outdated embedding generation. Restart the service and retry."
+)
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 # A markdown task-list line: "- [ ] ...", "* [x] ...", "1. [ ] ..." (captures the
@@ -828,22 +835,32 @@ class DocumentService:
         configured fusion tuning (``search_params``). The single entry point both the
         web and MCP surfaces go through so tuning is honored uniformly. ``since``/``until``
         bound hits by ``updated_at`` (recency filter)."""
-        return search.search_page(self.db, self.embedder, query, mode=mode, top_k=top_k,
-                                  folder=folder, tags=tags, since=since, until=until,
-                                  params=self.search_params)
+        try:
+            return search.search_page(
+                self.db, self.embedder, query, mode=mode, top_k=top_k,
+                folder=folder, tags=tags, since=since, until=until,
+                params=self.search_params,
+            )
+        except EmbeddingBindingChanged as exc:
+            raise EmbeddingUnavailableError(_EMBEDDING_UNAVAILABLE_MESSAGE) from exc
 
     def related(self, path: str, limit: int = 8) -> dict:
         """Documents semantically similar to this one (via the shared chunk-vector
         index). Empty list when the document has no embeddings yet."""
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
-        with self.db.reader() as conn:
-            d = conn.execute(
-                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
-            ).fetchone()
-            if not d:
-                raise NotFoundError("No document at this path.", path=rel)
-            items = search.related_documents(conn, d["id"], k=limit)
+        try:
+            expected = self.db.expected_embedding_binding()
+            with self.db.embedding_read_snapshot(expected) as conn:
+                d = conn.execute(
+                    "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0",
+                    (norm,),
+                ).fetchone()
+                if not d:
+                    raise NotFoundError("No document at this path.", path=rel)
+                items = search._related_documents(conn, d["id"], k=limit)
+        except EmbeddingBindingChanged as exc:
+            raise EmbeddingUnavailableError(_EMBEDDING_UNAVAILABLE_MESSAGE) from exc
         return {"path": rel, "related": items}
 
     def assemble_context(self, question: str, *, max_chars: int = 6000,
@@ -852,10 +869,14 @@ class DocumentService:
         """Retrieve + assemble citation-tagged context for a question (RAG primitive)."""
         if not question or not question.strip():
             raise ValidationError("question must not be empty.")
-        return search.assemble_context(
-            self.db, self.embedder, question, max_chars=max_chars,
-            max_sources=max_sources, mode=mode, folder=folder, tags=tags,
-            params=self.search_params)
+        try:
+            return search.assemble_context(
+                self.db, self.embedder, question, max_chars=max_chars,
+                max_sources=max_sources, mode=mode, folder=folder, tags=tags,
+                params=self.search_params,
+            )
+        except EmbeddingBindingChanged as exc:
+            raise EmbeddingUnavailableError(_EMBEDDING_UNAVAILABLE_MESSAGE) from exc
 
     # ---- llms.txt corpus export (agent-facing site map / full ingest) ----
     @contextmanager
