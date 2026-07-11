@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from llm_wiki import _cli_impl
+from llm_wiki import _cli_impl, indexing
+from llm_wiki.db import Database
 from llm_wiki.util import path_norm
 
 
@@ -152,6 +153,55 @@ def test_embed_pending_reembeds_crash_dirtied_docs(ctx, principals):
             "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id IN "
             "(SELECT id FROM chunks WHERE doc_id=?)", (doc_id,)).fetchone()[0]
     assert dirty == 0 and nvec == len(cids)
+
+
+def test_startup_sweep_recovers_rebind_interruption_without_vault_files(
+    ctx, principals
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "present.md", "# Present\n\nsearchable present body")
+    docs.create(editor, "db-only.md", "# DB only\n\nsearchable database body")
+    missing_file = ctx.settings.vault_path / "db-only.md"
+    missing_file.unlink()
+
+    # Model migration committed, then the process stopped before reindex/re-embed.
+    ctx.db.rebind_model(
+        ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    with ctx.db.reader() as conn:
+        interrupted = conn.execute(
+            "SELECT COUNT(*) AS live_docs, SUM(vector_dirty) AS dirty_docs "
+            "FROM documents WHERE is_deleted=0"
+        ).fetchone()
+        assert interrupted["live_docs"] == 2
+        assert interrupted["dirty_docs"] == 2
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 0
+
+    # A new serving process validates the binding and runs only its startup dirty
+    # sweep. It must not depend on reindex_all() or the projected Markdown file.
+    restarted_db = Database(ctx.settings.db_path)
+    restarted_db.initialize(
+        ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    assert indexing.embed_pending(restarted_db, ctx.embedder) == 2
+
+    with restarted_db.reader() as conn:
+        recovered = conn.execute(
+            "SELECT d.path, d.vector_dirty, COUNT(c.id) AS chunks, "
+            "COUNT(v.chunk_id) AS vectors "
+            "FROM documents d "
+            "LEFT JOIN chunks c ON c.doc_id=d.id "
+            "LEFT JOIN chunk_vectors v ON v.chunk_id=c.id "
+            "WHERE d.is_deleted=0 GROUP BY d.id ORDER BY d.id"
+        ).fetchall()
+    assert [(row["path"], row["vector_dirty"]) for row in recovered] == [
+        ("present.md", 0),
+        ("db-only.md", 0),
+    ]
+    assert all(
+        row["chunks"] > 0 and row["vectors"] == row["chunks"] for row in recovered
+    )
+    assert not missing_file.exists()
 
 
 def test_rebind_model_recreates_vector_table_at_new_dim(ctx):
