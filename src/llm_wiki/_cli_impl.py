@@ -583,6 +583,33 @@ def _apply_serve_overrides(settings, args):
         raise ConfigError(f"Invalid --host/--gui-port/--mcp-port override:\n{e}") from e
 
 
+def _create_mcp_http_app(ctx):
+    """Build the exact MCP ASGI app served by the CLI."""
+    mcp_app = create_mcp_server(ctx).streamable_http_app()
+    mcp_app.add_middleware(
+        RequestBodyLimitMiddleware, max_bytes=ctx.settings.request_max_bytes
+    )
+
+    # Unauthenticated health + metrics routes on the MCP app (for orchestrators /
+    # probes / Prometheus scraping the MCP port). The metrics registry is shared
+    # across both servers, so this exposes the same data as the web /metrics.
+    from starlette.responses import JSONResponse, Response
+    from starlette.routing import Route
+
+    from .metrics import render_latest
+
+    async def _mcp_health(_req):
+        return JSONResponse({"ok": True, "model_loaded": ctx.embedder.is_loaded})
+
+    async def _mcp_metrics(_req):
+        body, ctype = render_latest()
+        return Response(content=body, media_type=ctype)
+
+    mcp_app.router.routes.append(Route("/healthz", _mcp_health, methods=["GET"]))
+    mcp_app.router.routes.append(Route("/metrics", _mcp_metrics, methods=["GET"]))
+    return mcp_app
+
+
 def _serve(args) -> int:
     settings = _apply_serve_overrides(get_settings(), args)
 
@@ -607,28 +634,7 @@ def _serve(args) -> int:
         ctx.embed_worker.start()
 
     web_app = create_web_app(ctx)
-    mcp_app = create_mcp_server(ctx).streamable_http_app()
-    mcp_app.add_middleware(
-        RequestBodyLimitMiddleware, max_bytes=settings.request_max_bytes
-    )
-
-    # Unauthenticated health + metrics routes on the MCP app (for orchestrators /
-    # probes / Prometheus scraping the MCP port). The metrics registry is shared
-    # across both servers, so this exposes the same data as the web /metrics.
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Route
-
-    from .metrics import render_latest
-
-    async def _mcp_health(_req):
-        return JSONResponse({"ok": True, "model_loaded": ctx.embedder.is_loaded})
-
-    async def _mcp_metrics(_req):
-        body, ctype = render_latest()
-        return Response(content=body, media_type=ctype)
-
-    mcp_app.router.routes.append(Route("/healthz", _mcp_health, methods=["GET"]))
-    mcp_app.router.routes.append(Route("/metrics", _mcp_metrics, methods=["GET"]))
+    mcp_app = _create_mcp_http_app(ctx)
 
     print(f"Web UI : http://{settings.host}:{settings.gui_port}")
     print(f"MCP    : http://{settings.host}:{settings.mcp_port}/mcp  (Authorization: Bearer <api_key>)")

@@ -120,6 +120,7 @@ class RequestBodyLimitMiddleware:
 
         received = 0
         rejected = False
+        response_started = False
 
         async def limited_receive():
             nonlocal received, rejected
@@ -130,13 +131,18 @@ class RequestBodyLimitMiddleware:
                 received += len(message.get("body", b""))
                 if received > self.max_bytes:
                     rejected = True
-                    await self._reject(scope, receive, send)
+                    if not response_started:
+                        await self._reject(scope, receive, send)
                     return {"type": "http.disconnect"}
             return message
 
         async def limited_send(message):
-            if not rejected:
-                await send(message)
+            nonlocal response_started
+            if rejected and not response_started:
+                return
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
 
         try:
             await self.app(scope, limited_receive, limited_send)
