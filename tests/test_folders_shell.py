@@ -189,5 +189,10 @@ def test_view_page_shows_outline_panel_and_statusbar(client):
                               "csrf_token": _token(client, "/new")})
     html = client.get("/doc/doc.md").text
     assert 'id="outline"' in html and "/static/outline.js" in html
+    assert html.index('id="outline"') < html.index("/static/outline.js")
+    js = client.get("/static/outline.js").text
+    assert "location.hash" in js
+    assert 'behavior: "auto"' in js
+    assert "MutationObserver" in js
     assert "단어" in html  # status bar word count
     assert 'id="doc-rendered"' in html

@@ -58,12 +58,6 @@
   {% endif %}
   <div class="rendered" id="doc-rendered">{{ html|safe }}</div>
 </article>
-<script src="{{ static('vendor/hljs.bundle.js') }}"></script>
-<script src="{{ static('realtime.js') }}"></script>
-<script src="{{ static('outline.js') }}"></script>
-<script src="{{ static('tasks.js') }}"></script>
-<script src="{{ static('related.js') }}"></script>
-{% if user.can_write %}<script src="{{ static('props.js') }}"></script>{% endif %}
 {% endblock %}
 
 {% block right %}
@@ -98,4 +92,13 @@
 <span class="sb-stat">{{ stats.chars }} 자</span>
 <span class="sb-stat">백링크 {{ backlinks|length }}</span>
 <span class="sb-stat muted">v{{ doc.version }}</span>
+{% endblock %}
+
+{% block page_scripts %}
+<script src="{{ static('vendor/hljs.bundle.js') }}"></script>
+<script src="{{ static('realtime.js') }}"></script>
+<script src="{{ static('outline.js') }}"></script>
+<script src="{{ static('tasks.js') }}"></script>
+<script src="{{ static('related.js') }}"></script>
+{% if user.can_write %}<script src="{{ static('props.js') }}"></script>{% endif %}
 {% endblock %}

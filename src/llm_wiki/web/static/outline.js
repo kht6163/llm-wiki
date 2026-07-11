@@ -7,6 +7,7 @@
   var outline = document.getElementById("outline");
   if (!rendered || !outline) return;
   var spy = null;
+  var initialHashHandled = false;
   // Honour the OS reduced-motion preference for click-to-scroll (read live at click
   // time, not cached). Falls back to smooth if matchMedia is unavailable.
   var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
@@ -56,6 +57,17 @@
     heads.forEach(function (h) { spy.observe(h); });
   }
 
+  function revealInitialHash() {
+    if (initialHashHandled || !location.hash) return;
+    var id;
+    try { id = decodeURIComponent(location.hash.slice(1)); } catch (_) { id = location.hash.slice(1); }
+    var target = document.getElementById(id);
+    if (target) {
+      initialHashHandled = true;
+      target.scrollIntoView({ behavior: "auto", block: "start" });
+    }
+  }
+
   function build() {
     var heads = rendered.querySelectorAll("h1, h2, h3, h4, h5, h6");
     if (!heads.length) { outline.innerHTML = '<p class="muted">목차 없음</p>'; if (spy) spy.disconnect(); return; }
@@ -84,6 +96,7 @@
     outline.innerHTML = "";
     outline.appendChild(ul);
     setupSpy(map, headList);
+    revealInitialHash();
   }
 
   build();
