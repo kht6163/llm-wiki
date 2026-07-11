@@ -24,7 +24,7 @@ from .embedding_contract import (
     EmbeddingBindingChanged,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL CHECK(role IN ('admin','editor','viewer')),
   is_active     INTEGER NOT NULL DEFAULT 1,
+  credential_version INTEGER NOT NULL DEFAULT 1,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );
@@ -292,6 +293,10 @@ MIGRATIONS: list[tuple[int, str]] = [
     (10, "DROP INDEX IF EXISTS idx_tags_tag"),
     (11, "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor, id DESC)"),
     (12, "CREATE INDEX IF NOT EXISTS idx_documents_live_content_hash ON documents(content_hash) WHERE is_deleted=0"),
+    # v13: fence credential minting against a concurrent password change or account
+    # deactivation.  Those revocation boundaries increment this generation; a
+    # Principal resolved before the change can no longer create a late session/key.
+    (13, "ALTER TABLE users ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1"),
 ]
 
 

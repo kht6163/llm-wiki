@@ -46,6 +46,7 @@ from ..runtime import AppContext
 from ..services import audit
 from ..services import users as users_svc
 from ..services.auth import (
+    MAX_USERNAME_LEN,
     Principal,
     authenticate,
     create_api_key,
@@ -85,6 +86,7 @@ from .security import (
 
 _HERE = Path(__file__).parent
 _UPLOAD_CHUNK = 64 * 1024
+WS_SESSION_RECHECK_S = 30.0
 log = logging.getLogger("llm_wiki.web")
 
 # Explicit Content-Type for the (fixed, safe) attachment extension set so a served
@@ -334,10 +336,66 @@ def create_web_app(app: AppContext) -> FastAPI:
             raise _AuthRequired()
         return p
 
+    def audit_write_rejection(
+        request: Request,
+        principal: Principal,
+        exc: Exception,
+        *,
+        action: str = "write_rejected",
+        target: str | None = None,
+    ) -> None:
+        """Persist a rejected web write without copying request bodies or secrets."""
+        code = str(getattr(exc, "code", "bad_path"))
+        outcome = code if code in {"forbidden", "conflict"} else "error"
+        try:
+            audit.record_tx(
+                db,
+                actor=principal.username,
+                via="web",
+                action=action,
+                target=target or request.url.path,
+                outcome=outcome,
+                detail=f"code={code}",
+            )
+        except Exception:
+            # There is no state change to roll back on a rejected attempt. Preserve
+            # the original client error and surface the audit outage to operators.
+            log.exception("failed to audit rejected web write")
+
+    def write_action_for_path(path: str) -> str:
+        if path == "/new":
+            return "doc_create"
+        if path.startswith("/trash/") and path.endswith("/restore"):
+            return "doc_restore"
+        if path.startswith("/trash/") and path.endswith("/purge"):
+            return "doc_purge"
+        if path.startswith("/api/doc/") and path.endswith("/move"):
+            return "doc_move"
+        if path.startswith("/api/doc/"):
+            return "doc_update"
+        if path == "/api/upload":
+            return "attachment_upload"
+        if path.startswith("/doc/") and path.endswith("/delete"):
+            return "doc_delete"
+        if path.startswith("/doc/") and path.endswith("/edit"):
+            return "doc_update"
+        if path.startswith("/settings/keys"):
+            return "key_change"
+        return "write_rejected"
+
     @web.exception_handler(PathError)
     async def _on_path_error(request: Request, exc: PathError):
         # An unsafe/malformed path is a client error, not a 500. API routes get JSON;
         # pages get the HTML error template.
+        if request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+            principal = user(request)
+            if principal is not None:
+                audit_write_rejection(
+                    request,
+                    principal,
+                    exc,
+                    action=write_action_for_path(request.url.path),
+                )
         if request.url.path.startswith(("/api/", "/attachments/")):
             return JSONResponse({"ok": False, "error": "bad_path", "message": str(exc)}, status_code=400)
         return render("error.html", request, status=400, message=f"잘못된 경로입니다: {exc}")
@@ -354,6 +412,15 @@ def create_web_app(app: AppContext) -> FastAPI:
         # handling (inline conflict re-render, flash-and-redirect) catch their own
         # WikiError before it reaches here. API routes get the structured envelope;
         # pages get the HTML error template at the error's HTTP status.
+        if request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+            principal = user(request)
+            if principal is not None:
+                audit_write_rejection(
+                    request,
+                    principal,
+                    exc,
+                    action=write_action_for_path(request.url.path),
+                )
         response: Response
         if request.url.path.startswith("/api/"):
             response = JSONResponse(exc.to_dict(), status_code=exc.http_status)
@@ -391,7 +458,7 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.post("/login", response_class=HTMLResponse)
     def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
         ip = normalize_client_ip(request.client.host if request.client else None)
-        uname = (username or "").strip().lower()
+        uname = (username or "").strip().lower()[:MAX_USERNAME_LEN]
         # Throttle by client IP only. A per-username counter would let anyone lock a
         # known account (e.g. admin) out from its own clean IP just by spamming bad
         # passwords — the lockout itself becomes the DoS. Failed attempts are still
@@ -414,11 +481,16 @@ def create_web_app(app: AppContext) -> FastAPI:
                                 target=None, outcome="blocked", detail=f"ip={ip}")
             return render("login.html", request, status=401, error="Invalid username or password.")
         login_limiter.reset(ip_key)
-        audit.record_tx(db, actor=p.username, via="web", action="login", detail=f"ip={ip}")
         # Drop any pre-login session state (fixation hardening), then bind the new
         # session. A fresh CSRF token is minted on the next rendered page.
         request.session.clear()
-        request.session["sid"] = create_session(db, p.user_id)
+        request.session["sid"] = create_session(
+            db,
+            p,
+            audit_actor=p.username,
+            audit_via="web",
+            audit_detail=f"ip={ip}",
+        )
         return RedirectResponse("/", status_code=303)
 
     @web.get("/logout")
@@ -588,6 +660,7 @@ def create_web_app(app: AppContext) -> FastAPI:
             docs.restore(p, path)
             request.session["flash"] = f"복원했습니다: {path}"
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_restore", target=path)
             request.session["flash"] = f"복원 실패: {e.message}"
         return RedirectResponse("/trash", status_code=303)
 
@@ -597,6 +670,7 @@ def create_web_app(app: AppContext) -> FastAPI:
             docs.purge(p, path)
             request.session["flash"] = f"완전히 삭제했습니다: {path}"
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_purge", target=path)
             request.session["flash"] = f"삭제 실패: {e.message}"
         return RedirectResponse("/trash", status_code=303)
 
@@ -750,12 +824,14 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             doc = docs.create(p, path, content, title=title or None)
         except PathError as e:
+            audit_write_rejection(request, p, e, action="doc_create", target=path)
             # Stay on the form with the typed content preserved (an invalid path is a
             # field error, not a dead end) instead of bouncing to the global error page.
             return render("edit.html", request, status=400, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
                           error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.list_folders())
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_create", target=path)
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
                           error=e.message, can_write=p.can_write, folders=docs.list_folders())
@@ -778,15 +854,18 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             doc = docs.update(p, path, base_version, content, title=title or None)
         except ConflictError as e:
+            audit_write_rejection(request, p, e, action="doc_update", target=path)
             return render("edit.html", request, status=409, is_new=False, path=path, title=title,
                           content=content, base_version=e.extra.get("current_version"),
                           conflict=e.extra, error=None, can_write=p.can_write,
                           conflict_diff=_diff_lines(content, e.extra.get("current_content") or ""))
         except PathError as e:
+            audit_write_rejection(request, p, e, action="doc_update", target=path)
             return render("edit.html", request, status=400, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
                           error=f"잘못된 경로입니다: {e}", can_write=p.can_write)
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_update", target=path)
             return render("edit.html", request, status=e.http_status, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
                           error=e.message, can_write=p.can_write)
@@ -798,6 +877,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             docs.delete(p, path, base_version)
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_delete", target=path)
             request.session["flash"] = f"Delete failed: {e.message}"
             return RedirectResponse("/doc/" + quote(path), status_code=303)
         return RedirectResponse("/", status_code=303)
@@ -847,10 +927,12 @@ def create_web_app(app: AppContext) -> FastAPI:
                          p: Principal = Depends(require_user)):
         try:
             doc = docs.restore_revision(p, path, version)
-        except ConflictError:
+        except ConflictError as e:
+            audit_write_rejection(request, p, e, action="doc_restore", target=path)
             request.session["flash"] = "복원 실패: 그 사이 다른 변경이 있었습니다. 다시 시도하세요."
             return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
         except WikiError as e:
+            audit_write_rejection(request, p, e, action="doc_restore", target=path)
             request.session["flash"] = f"복원 실패: {e.message}"
             return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
         request.session["flash"] = f"v{version} 내용으로 복원했습니다 (현재 v{doc['version']})."
@@ -907,14 +989,36 @@ def create_web_app(app: AppContext) -> FastAPI:
         key_limiter.record_failure(key_key)  # count this mint toward the window
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
-        token = create_api_key(db, p.user_id, name)
-        audit.record_tx(db, actor=p.username, via="web", action="key_mint", target=name)
+        token = create_api_key(
+            db,
+            p,
+            name,
+            audit_actor=p.username,
+            audit_via="web",
+        )
         return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=token)
 
     @web.post("/settings/keys/{key_id}/revoke")
     def settings_revoke_key(key_id: int, request: Request, p: Principal = Depends(require_user)):
-        revoke_api_key(db, p.user_id, key_id)
-        audit.record_tx(db, actor=p.username, via="web", action="key_revoke", target=str(key_id))
+        try:
+            revoke_api_key(
+                db,
+                p,
+                key_id,
+                audit_actor=p.username,
+                audit_via="web",
+            )
+        except WikiError as e:
+            audit.record_tx(
+                db,
+                actor=p.username,
+                via="web",
+                action="key_revoke",
+                target=str(key_id),
+                outcome="error",
+                detail=e.message,
+            )
+            request.session["flash"] = e.message
         return RedirectResponse("/settings", status_code=303)
 
     # ---- admin (require_admin dependency: 403 for non-admins, redirect if anon) ----
@@ -926,10 +1030,24 @@ def create_web_app(app: AppContext) -> FastAPI:
     def admin_create(request: Request, username: str = Form(...), password: str = Form(...),
                      role: str = Form("editor"), p: Principal = Depends(require_admin)):
         try:
-            create_user(db, username, password, role)
-            audit.record_tx(db, actor=p.username, via="web", action="user_create",
-                            target=username, detail=f"role={role}")
+            create_user(
+                db,
+                username,
+                password,
+                role,
+                audit_actor=p.username,
+                audit_via="web",
+            )
         except WikiError as e:
+            audit.record_tx(
+                db,
+                actor=p.username,
+                via="web",
+                action="user_create",
+                target=(username or "")[:MAX_USERNAME_LEN],
+                outcome="error",
+                detail=e.message,
+            )
             request.session["flash"] = e.message
         return RedirectResponse("/admin/users", status_code=303)
 
@@ -937,9 +1055,13 @@ def create_web_app(app: AppContext) -> FastAPI:
     def admin_role(uid: int, request: Request, role: str = Form(...),
                    p: Principal = Depends(require_admin)):
         try:
-            users_svc.set_role(db, uid, role)
-            audit.record_tx(db, actor=p.username, via="web", action="role_change",
-                            target=str(uid), detail=f"role={role}")
+            users_svc.set_role(
+                db,
+                uid,
+                role,
+                audit_actor=p.username,
+                audit_via="web",
+            )
         except WikiError as e:
             audit.record_tx(db, actor=p.username, via="web", action="role_change",
                             target=str(uid), outcome="error", detail=e.message)
@@ -950,9 +1072,13 @@ def create_web_app(app: AppContext) -> FastAPI:
     def admin_active(uid: int, request: Request, active: int = Form(...),
                      p: Principal = Depends(require_admin)):
         try:
-            users_svc.set_active(db, uid, bool(active))
-            audit.record_tx(db, actor=p.username, via="web", action="user_active",
-                            target=str(uid), detail=f"active={bool(active)}")
+            users_svc.set_active(
+                db,
+                uid,
+                bool(active),
+                audit_actor=p.username,
+                audit_via="web",
+            )
         except WikiError as e:
             audit.record_tx(db, actor=p.username, via="web", action="user_active",
                             target=str(uid), outcome="error", detail=e.message)
@@ -963,8 +1089,13 @@ def create_web_app(app: AppContext) -> FastAPI:
     def admin_password(uid: int, request: Request, password: str = Form(...),
                        p: Principal = Depends(require_admin)):
         try:
-            users_svc.set_password(db, uid, password)
-            audit.record_tx(db, actor=p.username, via="web", action="password_change", target=str(uid))
+            users_svc.set_password(
+                db,
+                uid,
+                password,
+                audit_actor=p.username,
+                audit_via="web",
+            )
         except WikiError as e:
             audit.record_tx(db, actor=p.username, via="web", action="password_change",
                             target=str(uid), outcome="error", detail=e.message)
@@ -974,8 +1105,12 @@ def create_web_app(app: AppContext) -> FastAPI:
     @web.post("/admin/users/{uid}/delete")
     def admin_delete(uid: int, request: Request, p: Principal = Depends(require_admin)):
         try:
-            users_svc.delete_user(db, uid)
-            audit.record_tx(db, actor=p.username, via="web", action="user_delete", target=str(uid))
+            users_svc.delete_user(
+                db,
+                uid,
+                audit_actor=p.username,
+                audit_via="web",
+            )
         except WikiError as e:
             audit.record_tx(db, actor=p.username, via="web", action="user_delete",
                             target=str(uid), outcome="error", detail=e.message)
@@ -991,7 +1126,8 @@ def create_web_app(app: AppContext) -> FastAPI:
         if origin and urlsplit(origin).netloc != websocket.url.netloc:
             await websocket.close(code=1008)  # cross-origin -> reject (WS hijack guard)
             return
-        if not principal_from_session(db, websocket.session.get("sid")):
+        sid = websocket.session.get("sid")
+        if not principal_from_session(db, sid):
             await websocket.close(code=1008)  # not authenticated
             return
         await websocket.accept()
@@ -1004,7 +1140,17 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             while True:
                 getev = asyncio.ensure_future(q.get())
-                done, _ = await asyncio.wait({recv, getev}, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    {recv, getev},
+                    timeout=WS_SESSION_RECHECK_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not done:
+                    getev.cancel()
+                    if not principal_from_session(db, sid):
+                        await websocket.close(code=1008)
+                        break
+                    continue
                 if recv in done:
                     getev.cancel()
                     # Retrieve the result so an unexpected receive failure (a network
@@ -1015,6 +1161,13 @@ def create_web_app(app: AppContext) -> FastAPI:
                     if exc is not None and not isinstance(exc, WebSocketDisconnect):
                         log.warning("websocket receive failed: %s", exc, exc_info=exc)
                     break  # any inbound frame/disconnect ends this read-only channel
+                # Password changes and account deactivation delete the backing web
+                # session.  The handshake check alone would leave an already-open
+                # socket authorized forever, so revalidate before releasing each
+                # event and close rather than disclose post-revocation changes.
+                if not principal_from_session(db, sid):
+                    await websocket.close(code=1008)
+                    break
                 await websocket.send_json(getev.result())
         except WebSocketDisconnect:
             pass

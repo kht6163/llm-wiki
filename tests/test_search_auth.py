@@ -510,7 +510,7 @@ def test_password_and_api_key_auth(ctx, principals):
     assert authenticate(ctx.db, "alice", "wrong") is None
 
     # api key auth round-trip
-    token = create_api_key(ctx.db, principals["viewer"].user_id, "test-key")
+    token = create_api_key(ctx.db, principals["viewer"], "test-key")
     pr = principal_from_api_key(ctx.db, token)
     assert pr is not None and pr.username == "bob" and pr.role == "viewer"
     assert pr.can_write is False

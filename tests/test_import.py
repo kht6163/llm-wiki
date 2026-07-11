@@ -19,7 +19,7 @@ from llm_wiki.services.errors import ForbiddenError, ValidationError
 def _imp(principals) -> Principal:
     """An editor principal carrying the importer's surface tag."""
     e = principals["editor"]
-    return Principal(e.user_id, e.username, "editor", via="cli-import")
+    return Principal(e.user_id, e.username, "editor", via="cli")
 
 
 def _write(root: Path, rel: str, content: str) -> Path:
@@ -41,7 +41,7 @@ def test_import_creates_docs_via_create(ctx, principals, tmp_path):
     assert a["version"] == 1 and "alpha" in a["content"]
     assert docs.get("notes/sub/b.md")["title"] == "B"
     rev = docs.revisions("notes/a.md")["revisions"][0]
-    assert rev["op"] == "create" and rev["via"] == "cli-import" and rev["author"] == "alice"
+    assert rev["op"] == "create" and rev["via"] == "cli" and rev["author"] == "alice"
     assert (ctx.settings.vault_path / "notes" / "a.md").exists()  # projected to disk
 
 
@@ -323,12 +323,38 @@ def _imp_args(**over) -> SimpleNamespace:
 
 def test_cli_import_happy_path_exit_0(ctx, principals, tmp_path, monkeypatch):
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
+    monkeypatch.setattr(_cli_impl, "_os_actor", lambda: "cli:test-operator")
     src = tmp_path / "src"
     _write(src, "a.md", "# A\n\nx")
     rc = _cli_impl._import(_imp_args(from_=str(src), into="imp"))
     assert rc == 0 and ctx.docs.exists("imp/a.md")
-    # attributed to an admin over the cli-import surface
-    assert ctx.docs.revisions("imp/a.md")["revisions"][0]["via"] == "cli-import"
+    revision = ctx.docs.revisions("imp/a.md")["revisions"][0]
+    assert revision["via"] == "cli"
+    assert revision["author"] is None
+    with ctx.db.reader() as conn:
+        doc = conn.execute(
+            "SELECT created_by, updated_by FROM documents WHERE path_norm=?",
+            ("imp/a.md",),
+        ).fetchone()
+    assert doc["created_by"] is None and doc["updated_by"] is None
+    events = audit.recent(
+        ctx.db,
+        actor="cli:test-operator",
+        via="cli",
+        action="doc_create",
+    )
+    assert len(events) == 1 and events[0]["target"] == "imp/a.md"
+
+
+def test_cli_import_does_not_require_wiki_user(ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
+    monkeypatch.setattr(_cli_impl, "_os_actor", lambda: "cli:test-operator")
+    src = tmp_path / "src"
+    _write(src, "a.md", "# A\n\nx")
+
+    rc = _cli_impl._import(_imp_args(from_=str(src), into="imp"))
+
+    assert rc == 0 and ctx.docs.exists("imp/a.md")
 
 
 def test_cli_import_overwrite_requires_force(ctx, principals, tmp_path, monkeypatch):

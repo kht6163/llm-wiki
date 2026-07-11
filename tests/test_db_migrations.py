@@ -129,6 +129,21 @@ def test_old_version_is_bumped_to_current(tmp_path):
         assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
 
 
+def test_v13_adds_user_credential_version(tmp_path):
+    db = Database(tmp_path / "credential-version.db")
+    db.ensure_schema()
+    with db.writer() as conn:
+        conn.execute("ALTER TABLE users DROP COLUMN credential_version")
+        set_meta(conn, "schema_version", "12")
+
+    db.ensure_schema()
+
+    with db.reader() as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+        assert "credential_version" in columns
+        assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
+
+
 def test_migration_failure_is_atomic_and_resumable(tmp_path, monkeypatch):
     # A failing migration must roll back its own DDL and leave schema_version at the
     # last fully-applied step — never a half-migrated DB — and a re-run must resume.

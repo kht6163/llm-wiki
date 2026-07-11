@@ -96,3 +96,21 @@ def test_audit_recent_excludes_security_events_from_doc_scope(ctx, principals):
     assert all(e["action"] != "login_failed" for e in scoped)
     # …but the unfiltered feed (admin view) still has it.
     assert any(e["action"] == "login_failed" for e in audit.recent(ctx.db))
+
+
+def test_audit_fields_are_defensively_bounded(ctx):
+    audit.record_tx(
+        ctx.db,
+        actor="a" * 10_000,
+        via="v" * 10_000,
+        action="x" * 10_000,
+        target="t" * 10_000,
+        outcome="o" * 10_000,
+        detail="d" * 20_000,
+    )
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT length(actor),length(via),length(action),length(target),"
+            "length(outcome),length(detail) FROM audit_log ORDER BY id DESC"
+        ).fetchone()
+    assert tuple(row) == (128, 32, 64, 4096, 32, 4096)

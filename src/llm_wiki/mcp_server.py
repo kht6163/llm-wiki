@@ -10,6 +10,7 @@ import binascii
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
 import anyio
@@ -170,8 +171,38 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             )
         return p
 
+    def _audit_write_failure(
+        principal: Principal,
+        *,
+        action: str | None,
+        target: str | None,
+        outcome: str,
+    ) -> None:
+        """Persist a rejected MCP write without copying request/error payloads.
+
+        Document services already audit successful writes in their own transaction.
+        Only pre-commit, structured rejections belong here; keeping ``detail`` empty
+        prevents document bodies, API keys, and error context from reaching the log.
+        """
+        if action is None or outcome not in {"forbidden", "conflict", "validation", "not_found"}:
+            return
+        try:
+            audit.record_tx(
+                db,
+                actor=principal.username,
+                via="mcp",
+                action=action,
+                target=target,
+                outcome=outcome,
+            )
+        except Exception:
+            # Auditing must never replace the original structured tool error.
+            log.exception("failed to audit rejected mcp write action=%s", action)
+
     async def _call(ctx: Context, fn: Callable[[Principal], Any], tool: str = "?",
-                    shape: Callable[[dict], dict] | None = None) -> dict:
+                    shape: Callable[[dict], dict] | None = None, *,
+                    audit_action: str | None = None,
+                    audit_target: str | None = None) -> dict:
         token = _bearer_token(ctx)
         ip_key = f"ip:{_client_ip(ctx)}"
         rid = _request_id(ctx)
@@ -183,6 +214,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             t0 = time.monotonic()
             actor = (token or "")[:12] or "-"  # key prefix only — never log the full token
             outcome = "ok"
+            principal: Principal | None = None
             try:
                 if not auth_limiter.allowed(ip_key):
                     outcome = "rate_limited"
@@ -209,10 +241,23 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 res = fn(principal)
                 if isinstance(res, dict) and res.get("ok") is False:
                     outcome = res.get("error", {}).get("code", "error")
+                    _audit_write_failure(
+                        principal,
+                        action=audit_action,
+                        target=audit_target,
+                        outcome=outcome,
+                    )
                     return shape(res) if shape else res
                 return res
             except WikiError as e:
                 outcome = e.code
+                if principal is not None:
+                    _audit_write_failure(
+                        principal,
+                        action=audit_action,
+                        target=audit_target,
+                        outcome=outcome,
+                    )
                 d = e.to_dict()
                 return shape(d) if shape else d
             except Exception:
@@ -403,7 +448,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                     "until": until, "has_more": len(items) >= limit, "documents": items}
         return await _call(ctx, fn, "list_recent_changes")
 
-    @mcp.tool(description="Recent document activity across the whole vault (newest first): who/what "
+    @mcp.tool(description="Recent document activity across the whole vault (editor/admin only, "
+                          "newest first): who/what "
                           "created, edited, moved, deleted, reconciled, or uploaded — and over which "
                           "surface ('via' is web=human, mcp=agent, cli). Unlike list_recent_changes "
                           "(current docs by updated_at) this includes deletes/moves and the human-vs-"
@@ -425,7 +471,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         actor: Annotated[str | None,
                          Field(description="Restrict to one actor (username).")] = None,
     ) -> dict:
-        def fn(_p: Principal) -> dict:
+        def fn(p: Principal) -> dict:
+            if not p.can_write:
+                raise ForbiddenError("Activity is available to editors and admins only.")
             if action is not None and action not in audit.DOC_ACTIONS:
                 raise ValidationError(
                     f"action must be one of {audit.DOC_ACTIONS} (security events are not exposed).")
@@ -584,7 +632,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(
             docs.create(p, path, content, title, tags), return_content)}, "create_document",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_create", audit_target=path)
 
     @mcp.tool(description="Replace a document's full body (editor/admin only; viewer gets "
                           "'forbidden'). base_version is REQUIRED; if it does not match the "
@@ -601,7 +650,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.update(
             p, path, base_version, content, title, tags), return_content)}, "update_document",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Find-and-replace in a document (token-cheap edit; editor/admin only). "
                           "mode='literal' (default) matches a substring; mode='regex' matches a "
@@ -627,7 +677,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.patch(
             p, path, find, replace, base_version=base_version, count=count,
             mode=mode, occurrence=occurrence), return_content)}, "patch_document",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Append a text block to a document (editor/admin only) — the natural "
                           "journaling primitive for logs/daily notes. With 'ensure_heading' the "
@@ -652,7 +703,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_to_document(
             p, path, text, ensure_heading=ensure_heading, base_version=base_version,
             idempotency_key=idempotency_key), return_content)}, "append_to_document",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Restore a past revision's content as a new edit (editor/admin only) — a "
                           "one-call server-side undo. The old body is loaded server-side (it never "
@@ -668,7 +720,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.restore_revision(
             p, path, version, base_version=base_version), return_content)}, "restore_revision",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Replace the body under a heading (the heading line is kept; "
                           "editor/admin only). Token-cheap; reads latest server-side. When several "
@@ -687,7 +740,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.replace_section(
             p, path, heading, text, base_version=base_version, occurrence=occurrence),
             return_content)}, "replace_section",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Append text to the end of a heading's section (before the next "
                           "same/higher heading; editor/admin only). Token-cheap. When several "
@@ -705,7 +759,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.append_section(
             p, path, heading, text, base_version=base_version, occurrence=occurrence),
             return_content)}, "append_section",
-            shape=lambda d: _shape_conflict(d, return_content))
+            shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Add and/or remove tags on a document without rewriting its body "
                           "(editor/admin only). Adjusts the frontmatter 'tags' list; returns the "
@@ -717,7 +772,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         remove: Annotated[list[str] | None, Field(description="Tags to remove.")] = None,
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **docs.patch_tags(p, path, add=add, remove=remove)},
-                           "patch_tags")
+                           "patch_tags", audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Set or replace a single frontmatter property without rewriting the body "
                           "(editor/admin only) — e.g. status, aliases, due, author. 'value' is a "
@@ -737,7 +792,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.set_property(
             p, path, key, value, base_version=base_version), return_content)},
-            "set_document_property", shape=lambda d: _shape_conflict(d, return_content))
+            "set_document_property", shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Remove a single frontmatter property from a document (editor/admin only); "
                           "no-op if absent. 'title'/'tags' are managed elsewhere and rejected. "
@@ -751,7 +807,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.remove_property(
             p, path, key, base_version=base_version), return_content)},
-            "remove_document_property", shape=lambda d: _shape_conflict(d, return_content))
+            "remove_document_property", shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Replace the WHOLE editable frontmatter property set in one revision "
                           "(editor/admin only) — keys you OMIT are REMOVED, keys you include are "
@@ -777,7 +834,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             return {"ok": True, **_shape_write(
                 docs.replace_properties(p, path, props, base_version=base_version), return_content)}
         return await _call(ctx, fn, "set_document_properties",
-                           shape=lambda d: _shape_conflict(d, return_content))
+                           shape=lambda d: _shape_conflict(d, return_content),
+                           audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Flip one markdown task checkbox (- [ ] <-> - [x]) and save through the "
                           "optimistic-locking update (editor/admin only) — tick off daily-note / "
@@ -798,7 +856,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.toggle_task(
             p, path, line=line, index=index, base_version=base_version), return_content)},
-            "toggle_task", shape=lambda d: _shape_conflict(d, return_content))
+            "toggle_task", shape=lambda d: _shape_conflict(d, return_content),
+            audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Open today's (or a given date's) daily note, creating it if absent — the "
                           "journaling entry point. Reading an existing note works for any role; "
@@ -815,22 +874,26 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                   Field(description="'full' echoes the body; 'metadata' (default) "
                                         "omits it, giving a char count.")] = "metadata",
     ) -> dict:
+        target_date = date or datetime.now(UTC).strftime("%Y-%m-%d")
+        target = f"{folder.rstrip('/') + '/' if folder else ''}{target_date}.md"
         return await _call(ctx, lambda p: {"ok": True, **_shape_write(
-            docs.daily_note(p, date, folder=folder), return_content)},
-            "get_or_create_daily_note")
+            docs.daily_note(p, target_date, folder=folder), return_content)},
+            "get_or_create_daily_note", audit_action="doc_create", audit_target=target)
 
     @mcp.tool(description="Create an empty folder so it persists as an organizational unit before "
                           "it holds any documents (editor/admin only) — 'structure first, content "
                           "later'. Fails 'conflict' if a folder already exists there (including one "
                           "implied by existing documents), 'validation' on an empty path.")
     async def create_folder(ctx: Context, path: str) -> dict:
-        return await _call(ctx, lambda p: docs.create_folder(p, path), "create_folder")
+        return await _call(ctx, lambda p: docs.create_folder(p, path), "create_folder",
+                           audit_action="folder_create", audit_target=path)
 
     @mcp.tool(description="Delete an empty folder and its empty subfolders (editor/admin only). "
                           "Refuses with 'validation' if any document still lives under it (move or "
                           "delete those first); 'not_found' if there is no such folder.")
     async def delete_folder(ctx: Context, path: str) -> dict:
-        return await _call(ctx, lambda p: docs.delete_folder(p, path), "delete_folder")
+        return await _call(ctx, lambda p: docs.delete_folder(p, path), "delete_folder",
+                           audit_action="folder_delete", audit_target=path)
 
     @mcp.tool(description="List the documents YOU (this API key's user) have pinned as "
                           "favourites, title-sorted. Favourites are per-user. Pair with "
@@ -871,7 +934,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             audit.record_tx(db, actor=p.username, via="mcp", action="attachment_upload",
                             target=res["path"])
             return {"ok": True, **res}
-        return await _call(ctx, fn, "upload_attachment")
+        return await _call(ctx, fn, "upload_attachment",
+                           audit_action="attachment_upload", audit_target=filename)
 
     @mcp.tool(description="Rename one frontmatter tag across the WHOLE vault (editor/admin only): "
                           "every document tagged 'old' is retagged 'new'. Each document is its own "
@@ -879,7 +943,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "list is rewritten — tags written inline as #hashtags in the body are "
                           "left as-is. Returns {dest, sources, docs_affected, docs_changed}.")
     async def rename_tag(ctx: Context, old: str, new: str) -> dict:
-        return await _call(ctx, lambda p: docs.rename_tag(p, old, new), "rename_tag")
+        return await _call(ctx, lambda p: docs.rename_tag(p, old, new), "rename_tag",
+                           audit_action="doc_update", audit_target=f"tag:{old} -> {new}")
 
     @mcp.tool(description="Merge several frontmatter tags into one across the whole vault "
                           "(editor/admin only): every document tagged with any of 'sources' is "
@@ -890,7 +955,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         sources: Annotated[list[str], Field(description="Tags to fold into 'dest'.")],
         dest: Annotated[str, Field(description="The surviving tag.")],
     ) -> dict:
-        return await _call(ctx, lambda p: docs.merge_tags(p, sources, dest), "merge_tags")
+        return await _call(
+            ctx,
+            lambda p: docs.merge_tags(p, sources, dest),
+            "merge_tags",
+            audit_action="doc_update",
+            audit_target=f"tags:{','.join(sources)} -> {dest}",
+        )
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
                           "re-resolving links (editor/admin only). Fails 'conflict' if the "
@@ -910,7 +981,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             return await _call(ctx, lambda _p: {"ok": True, "dry_run": True,
                                **docs.move_preview(path, new_path)}, "move_document")
         return await _call(ctx, lambda p: {"ok": True, **docs.move(
-            p, path, new_path, fix_references=fix_references)}, "move_document")
+            p, path, new_path, fix_references=fix_references)}, "move_document",
+            audit_action="doc_move", audit_target=f"{path} -> {new_path}")
 
     @mcp.tool(description="Rewrite the link TEXT in other documents that pointed at 'old_path' so "
                           "it points at 'new_path' (editor/admin only) — the cleanup a move leaves "
@@ -921,15 +993,18 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "not fatal.")
     async def rename_references(ctx: Context, old_path: str, new_path: str) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **docs.rename_references(p, old_path, new_path)},
-                           "rename_references")
+                           "rename_references", audit_action="doc_update",
+                           audit_target=f"{old_path} -> {new_path}")
 
     @mcp.tool(description="Delete (soft) a document (editor/admin only). Pass base_version to "
                           "guard against deleting a version you haven't seen. Returns "
                           "{ok, path, deleted: true} on success.")
     async def delete_document(ctx: Context, path: str, base_version: int | None = None) -> dict:
-        return await _call(ctx, lambda p: docs.delete(p, path, base_version), "delete_document")
+        return await _call(ctx, lambda p: docs.delete(p, path, base_version), "delete_document",
+                           audit_action="doc_delete", audit_target=path)
 
-    @mcp.tool(description="List soft-deleted documents (the trash), most-recently-deleted first. "
+    @mcp.tool(description="List soft-deleted documents (editor/admin only; the trash), "
+                          "most-recently-deleted first. "
                           "Each carries path/title/version/folder and when/by whom it was deleted. "
                           "Feed a path to restore_document (undo) or purge_document (permanent).")
     async def list_trash(
@@ -937,7 +1012,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         limit: Annotated[int, Field(ge=1, le=1000, description="Max entries (1..1000).")] = 100,
         offset: Annotated[int, Field(ge=0, description="Paging offset.")] = 0,
     ) -> dict:
-        def fn(_p: Principal) -> dict:
+        def fn(p: Principal) -> dict:
+            if not p.can_write:
+                raise ForbiddenError("Trash is available to editors and admins only.")
             items = docs.list_deleted(limit=limit, offset=offset)
             return {"ok": True, "count": len(items), "offset": offset, "documents": items}
         return await _call(ctx, fn, "list_trash")
@@ -947,13 +1024,15 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "pre-delete body. Fails 'validation' if it isn't deleted, 'not_found' "
                           "if there's no such path.")
     async def restore_document(ctx: Context, path: str) -> dict:
-        return await _call(ctx, lambda p: docs.restore(p, path), "restore_document")
+        return await _call(ctx, lambda p: docs.restore(p, path), "restore_document",
+                           audit_action="doc_restore", audit_target=path)
 
     @mcp.tool(description="Permanently delete a TRASHED document and ALL its history (admin only) — "
                           "there is no undo. Refuses a live document with 'validation' (soft-delete "
                           "it first); 'not_found' if there's no such path.")
     async def purge_document(ctx: Context, path: str) -> dict:
-        return await _call(ctx, lambda p: docs.purge(p, path), "purge_document")
+        return await _call(ctx, lambda p: docs.purge(p, path), "purge_document",
+                           audit_action="doc_purge", audit_target=path)
 
     def _apply_op(principal: Principal, raw: dict) -> dict:
         """Dispatch one batch operation to the matching single-document service call
@@ -1015,6 +1094,58 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             return docs.restore_revision(principal, path, raw["version"],
                                          base_version=raw.get("base_version"))
         raise ValidationError(f"unknown op {op!r}.")
+
+    _BATCH_AUDIT_ACTIONS = {
+        "create": "doc_create",
+        "update": "doc_update",
+        "patch": "doc_update",
+        "replace_section": "doc_update",
+        "append_section": "doc_update",
+        "append": "doc_update",
+        "patch_tags": "doc_update",
+        "toggle_task": "doc_update",
+        "set_properties": "doc_update",
+        "rename_references": "doc_update",
+        "move": "doc_move",
+        "delete": "doc_delete",
+        "restore": "doc_update",
+        "create_folder": "folder_create",
+        "delete_folder": "folder_delete",
+    }
+
+    def _batch_audit_metadata(raw: dict) -> tuple[str | None, str | None]:
+        """Extract only operation kind and paths; never copy body/property payloads."""
+        op = raw.get("op")
+        action = _BATCH_AUDIT_ACTIONS.get(op) if isinstance(op, str) else None
+        path = raw.get("old_path") or raw.get("path")
+        target = path if isinstance(path, str) else None
+        if op in {"move", "rename_references"} and isinstance(raw.get("new_path"), str):
+            target = f"{target or '?'} -> {raw['new_path']}"
+        return action, target
+
+    def _audit_batch_failure(principal: Principal, raw: dict, outcome: str) -> None:
+        action, target = _batch_audit_metadata(raw)
+        _audit_write_failure(
+            principal,
+            action=action,
+            target=target,
+            outcome=outcome,
+        )
+
+    def _audit_forbidden_batch(principal: Principal, operations: list[dict[str, Any]]) -> None:
+        """Audit a whole RBAC-rejected batch in O(1) rows/writer transactions."""
+        if len(operations) == 1 and isinstance(operations[0], dict):
+            _audit_batch_failure(principal, operations[0], "forbidden")
+            return
+        first_target: str | None = None
+        if operations and isinstance(operations[0], dict):
+            _, first_target = _batch_audit_metadata(operations[0])
+        _audit_write_failure(
+            principal,
+            action="batch_write",
+            target=f"count={len(operations)} first={first_target or '-'}",
+            outcome="forbidden",
+        )
 
     _LIVE_DOC_OPS = {"update", "patch", "replace_section", "append_section", "append",
                      "patch_tags", "toggle_task", "set_properties", "delete", "move"}
@@ -1091,6 +1222,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     ) -> dict:
         def fn(principal: Principal) -> dict:
             if not principal.can_write:
+                if not dry_run and 0 < len(operations) <= 100:
+                    _audit_forbidden_batch(principal, operations)
                 raise ForbiddenError(f"Role '{principal.role}' cannot modify documents.")
             if not operations:
                 raise ValidationError("operations must be a non-empty list.")
@@ -1116,12 +1249,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                     results.append({"op": op, "path": res.get("path", path), "ok": True,
                                     "version": res.get("version")})
                 except WikiError as e:
+                    _audit_batch_failure(principal, raw, e.code)
                     shaped = _shape_conflict(e.to_dict(), return_content)
                     results.append({"op": op, "path": path, "ok": False, "error": shaped["error"]})
                     if stop_on_error:
                         break
                 except Exception as e:  # bad op shape (missing field, unsafe path, …)
                     log.warning("edit_documents op=%s path=%s rejected: %s", op, path, e)
+                    _audit_batch_failure(principal, raw, "validation")
                     results.append({"op": op, "path": path, "ok": False,
                                     "error": {"code": "validation", "message": str(e)[:200] or "invalid operation"}})
                     if stop_on_error:

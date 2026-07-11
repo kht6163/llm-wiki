@@ -185,6 +185,25 @@ def test_bad_password_is_401(client):
     assert r.status_code == 401 and "Invalid" in r.text
 
 
+def test_oversized_login_actor_is_bounded_in_audit(client, ctx):
+    username = "x" * 10_000
+    r = client.post(
+        "/login",
+        data={
+            "username": username,
+            "password": "wrongpassword",
+            "csrf_token": _token(client, "/login"),
+        },
+    )
+    assert r.status_code == 401
+    with ctx.db.reader() as conn:
+        actor_len = conn.execute(
+            "SELECT length(actor) FROM audit_log "
+            "WHERE action='login_failed' ORDER BY id DESC"
+        ).fetchone()[0]
+    assert actor_len <= 128
+
+
 def test_viewer_cannot_create_admin_can(client):
     login(client, "bob")  # viewer
     r = create_doc(client, "viewer-try.md", "nope")
@@ -692,6 +711,33 @@ def test_api_key_minted_in_response_not_session(client):
     assert full not in client.get("/settings").text
 
 
+def test_key_revoke_does_not_report_success_for_another_users_key(
+    client, ctx, principals
+):
+    from llm_wiki.services.auth import create_api_key, principal_from_api_key
+
+    owner_key = create_api_key(ctx.db, principals["viewer"], "owned-by-viewer")
+    with ctx.db.reader() as conn:
+        key_id = conn.execute(
+            "SELECT id FROM api_keys WHERE key_prefix=?", (owner_key[:12],)
+        ).fetchone()[0]
+
+    login(client, "alice")
+    response = client.post(
+        f"/settings/keys/{key_id}/revoke",
+        data={"csrf_token": _token(client, "/settings")},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert principal_from_api_key(ctx.db, owner_key) is not None
+    with ctx.db.reader() as conn:
+        rows = conn.execute(
+            "SELECT outcome FROM audit_log WHERE actor='alice' "
+            "AND action='key_revoke' ORDER BY id"
+        ).fetchall()
+    assert [row["outcome"] for row in rows] == ["error"]
+
+
 # -- batch A: metrics ------------------------------------------------------
 def test_metrics_endpoint_exposes_prometheus(client):
     login(client, "admin")
@@ -828,6 +874,42 @@ def test_ws_receives_create_event(client, ctx, principals):
     assert ev["type"] == "doc_changed" and ev["op"] == "create" and ev["path"] == "fresh.md"
 
 
+def test_ws_stops_delivering_after_session_is_revoked(client, ctx, principals):
+    """A password change must invalidate an already-open realtime channel too."""
+    from starlette.websockets import WebSocketDisconnect
+
+    from llm_wiki.services import users as users_svc
+
+    login(client, "admin")
+    with client.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        users_svc.set_password(ctx.db, principals["admin"].user_id, "newsecret12")
+        ctx.docs.create(principals["editor"], "after-revoke.md", "# Revoked")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_periodically_closes_an_expired_session(ctx, principals, monkeypatch):
+    import importlib
+
+    from starlette.websockets import WebSocketDisconnect
+
+    web_app_module = importlib.import_module("llm_wiki.web.app")
+    monkeypatch.setattr(web_app_module, "WS_SESSION_RECHECK_S", 0.01)
+    isolated = TestClient(create_web_app(ctx))
+    login(isolated, "admin")
+
+    with isolated.websocket_connect("/ws") as ws:
+        assert ws.receive_json()["type"] == "ready"
+        with ctx.db.writer() as conn:
+            conn.execute(
+                "UPDATE sessions SET expires_at='2000-01-01T00:00:00Z' WHERE user_id=?",
+                (principals["admin"].user_id,),
+            )
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
 def test_list_page_has_realtime_hook(client):
     login(client, "admin")
     html = client.get("/").text
@@ -946,6 +1028,46 @@ def test_user_mod_failure_is_audited(client, ctx):
     assert r.status_code == 303
     rows = audit.recent(ctx.db, action="role_change")
     assert any(x["outcome"] == "error" for x in rows)
+
+
+def test_rejected_document_writes_are_audited_without_content(client, ctx):
+    login(client, "bob")
+    forbidden_body = "sensitive forbidden body"
+    forbidden = client.post(
+        "/new",
+        data={
+            "path": "forbidden.md",
+            "content": forbidden_body,
+            "csrf_token": _token(client, "/new"),
+        },
+    )
+    assert forbidden.status_code == 403
+
+    client.cookies.clear()
+    login(client, "alice")
+    create_doc(client, "duplicate.md", "original")
+    conflict_body = "sensitive conflicting body"
+    conflict = client.post(
+        "/new",
+        data={
+            "path": "duplicate.md",
+            "content": conflict_body,
+            "csrf_token": _token(client, "/new"),
+        },
+    )
+    assert conflict.status_code == 409
+
+    with ctx.db.reader() as conn:
+        rows = conn.execute(
+            "SELECT actor,target,outcome,detail FROM audit_log "
+            "WHERE action='doc_create' AND outcome!='ok' ORDER BY id"
+        ).fetchall()
+    assert [(row["actor"], row["target"], row["outcome"]) for row in rows] == [
+        ("bob", "forbidden.md", "forbidden"),
+        ("alice", "duplicate.md", "conflict"),
+    ]
+    serialized = " ".join(str(value) for row in rows for value in row)
+    assert forbidden_body not in serialized and conflict_body not in serialized
 
 
 def test_csp_uses_script_nonce_not_unsafe_inline(client):

@@ -14,13 +14,17 @@ from argon2 import PasswordHasher
 
 from ..db import Database, get_meta, set_meta
 from ..util import now_iso
-from .errors import ValidationError
+from . import audit
+from .errors import NotFoundError, ValidationError
 
 ROLES = ("admin", "editor", "viewer")
 ROLE_RANK = {"viewer": 0, "editor": 1, "admin": 2}
 SESSION_TTL_DAYS = 14
 API_KEY_PREFIX_LEN = 12
 MIN_PASSWORD_LEN = 8
+MAX_USERNAME_LEN = 128
+MAX_PASSWORD_LEN = 1024
+MAX_API_KEY_NAME_LEN = 128
 
 _ph = PasswordHasher()
 
@@ -37,6 +41,7 @@ class Principal:
     username: str
     role: str
     via: str = "?"  # surface that resolved this identity: web | mcp | cli
+    credential_version: int = 1
 
     @property
     def can_write(self) -> bool:
@@ -62,58 +67,145 @@ def verify_password(stored_hash: str, password: str) -> bool:
 def _validate_new_user(username: str, password: str, role: str) -> None:
     if not username or not username.strip():
         raise ValidationError("username is required")
+    if len(username) > MAX_USERNAME_LEN:
+        raise ValidationError(f"username must be at most {MAX_USERNAME_LEN} characters")
+    if any(ord(char) < 32 or ord(char) == 127 for char in username):
+        raise ValidationError("username cannot contain control characters")
     if role not in ROLES:
         raise ValidationError(f"role must be one of {ROLES}")
     if not password or len(password) < MIN_PASSWORD_LEN:
         raise ValidationError(f"password must be at least {MIN_PASSWORD_LEN} characters")
+    if len(password) > MAX_PASSWORD_LEN:
+        raise ValidationError(f"password must be at most {MAX_PASSWORD_LEN} characters")
 
 
-def create_user(db: Database, username: str, password: str, role: str = "editor") -> int:
+def _record_success(
+    conn,
+    *,
+    audit_actor: str | None,
+    audit_via: str | None,
+    action: str,
+    target: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Record a success only when the caller supplied an audit surface.
+
+    The helper deliberately accepts the caller's existing connection so the security
+    change and its audit row either both commit or both roll back.
+    """
+    if audit_via is not None:
+        audit.record(
+            conn,
+            actor=audit_actor,
+            via=audit_via,
+            action=action,
+            target=target,
+            detail=detail,
+        )
+
+
+def create_user(
+    db: Database,
+    username: str,
+    password: str,
+    role: str = "editor",
+    *,
+    audit_actor: str | None = None,
+    audit_via: str | None = None,
+) -> int:
     username = username.strip()
     _validate_new_user(username, password, role)
     now = now_iso()
+    password_hash = hash_password(password)
     with db.writer() as conn:
         if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
             raise ValidationError(f"user '{username}' already exists")
         cur = conn.execute(
             "INSERT INTO users(username, password_hash, role, is_active, created_at, updated_at) "
             "VALUES(?,?,?,1,?,?)",
-            (username, hash_password(password), role, now, now),
+            (username, password_hash, role, now, now),
         )
         assert cur.lastrowid is not None
+        _record_success(
+            conn,
+            audit_actor=audit_actor,
+            audit_via=audit_via,
+            action="user_create",
+            target=username,
+            detail=f"role={role}",
+        )
         return cur.lastrowid
 
 
 def authenticate(db: Database, username: str, password: str) -> Principal | None:
+    username = username.strip()
+    # Reject an oversized password before Argon2 work. Unknown oversized usernames
+    # skip Argon2 after the indexed lookup below; the web/audit layers cap the value
+    # before persistence. Existing legacy long usernames remain able to sign in.
+    if len(password) > MAX_PASSWORD_LEN:
+        return None
     with db.reader() as conn:
         row = conn.execute(
-            "SELECT id, username, role, password_hash FROM users WHERE username=? AND is_active=1",
-            (username.strip(),),
+            "SELECT id, username, role, password_hash, credential_version "
+            "FROM users WHERE username=? AND is_active=1",
+            (username,),
         ).fetchone()
     if row is None:
+        # New accounts are bounded, but an older database may contain a legacy
+        # username above today's limit. Query it exactly for compatibility; only a
+        # non-existent oversized name skips the dummy Argon2 work.
+        if len(username) > MAX_USERNAME_LEN:
+            return None
         # Spend equivalent Argon2 work so response time doesn't reveal whether the
         # username exists (the result is discarded).
         verify_password(_DUMMY_PASSWORD_HASH, password)
         return None
     if not verify_password(row["password_hash"], password):
         return None
-    return Principal(row["id"], row["username"], row["role"])
+    return Principal(
+        row["id"],
+        row["username"],
+        row["role"],
+        credential_version=row["credential_version"],
+    )
 
 
 # -- web sessions ----------------------------------------------------------
-def create_session(db: Database, user_id: int) -> str:
+def create_session(
+    db: Database,
+    principal: Principal,
+    *,
+    audit_actor: str | None = None,
+    audit_via: str | None = None,
+    audit_detail: str | None = None,
+) -> str:
     sid = secrets.token_urlsafe(32)
     now = datetime.now(UTC)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     expires = (now + timedelta(days=SESSION_TTL_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
     with db.writer() as conn:
+        # Fence the INSERT with the exact credential generation that authenticate()
+        # observed. A password change/deactivation between verification and this writer
+        # transaction advances the generation, so a stale Principal cannot mint access.
+        if not conn.execute(
+            "SELECT 1 FROM users WHERE id=? AND is_active=1 AND credential_version=?",
+            (principal.user_id, principal.credential_version),
+        ).fetchone():
+            raise ValidationError("the authenticated user is no longer eligible for a session")
         # Opportunistic GC: expired rows are otherwise only filtered at read time and
         # would accumulate forever. Login is infrequent and the table is small, so a
         # sweep here keeps it bounded without a separate scheduled job.
         conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (now_str,))
         conn.execute(
             "INSERT INTO sessions(id, user_id, created_at, expires_at) VALUES(?,?,?,?)",
-            (sid, user_id, now_str, expires),
+            (sid, principal.user_id, now_str, expires),
+        )
+        _record_success(
+            conn,
+            audit_actor=audit_actor or principal.username,
+            audit_via=audit_via,
+            action="login",
+            detail=audit_detail,
         )
     return sid
 
@@ -124,11 +216,22 @@ def principal_from_session(db: Database, sid: str | None) -> Principal | None:
     now = now_iso()
     with db.reader() as conn:
         row = conn.execute(
-            "SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id=s.user_id "
+            "SELECT u.id, u.username, u.role, u.credential_version "
+            "FROM sessions s JOIN users u ON u.id=s.user_id "
             "WHERE s.id=? AND s.expires_at > ? AND u.is_active=1",
             (sid, now),
         ).fetchone()
-    return Principal(row["id"], row["username"], row["role"], via="web") if row else None
+    return (
+        Principal(
+            row["id"],
+            row["username"],
+            row["role"],
+            via="web",
+            credential_version=row["credential_version"],
+        )
+        if row
+        else None
+    )
 
 
 def delete_session(db: Database, sid: str | None) -> None:
@@ -160,15 +263,43 @@ def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def create_api_key(db: Database, user_id: int, name: str) -> str:
+def create_api_key(
+    db: Database,
+    principal: Principal,
+    name: str,
+    *,
+    audit_actor: str | None = None,
+    audit_via: str | None = None,
+    audit_detail: str | None = None,
+) -> str:
     """Mint a new API key; the raw token is returned ONCE (only its hash is stored)."""
     token = "lw_" + secrets.token_urlsafe(32)
     prefix = token[:API_KEY_PREFIX_LEN]
+    key_name = (name or "key").strip() or "key"
+    if len(key_name) > MAX_API_KEY_NAME_LEN:
+        raise ValidationError(
+            f"API key name must be at most {MAX_API_KEY_NAME_LEN} characters"
+        )
     with db.writer() as conn:
+        # Same generation fence as session minting: a key requested from a stale web
+        # session cannot recreate access after password-change revocation commits.
+        if not conn.execute(
+            "SELECT 1 FROM users WHERE id=? AND is_active=1 AND credential_version=?",
+            (principal.user_id, principal.credential_version),
+        ).fetchone():
+            raise ValidationError("the authenticated user is no longer eligible for an API key")
         conn.execute(
             "INSERT INTO api_keys(user_id, name, key_prefix, key_hash, created_at) "
             "VALUES(?,?,?,?,?)",
-            (user_id, (name or "key").strip(), prefix, _hash_token(token), now_iso()),
+            (principal.user_id, key_name, prefix, _hash_token(token), now_iso()),
+        )
+        _record_success(
+            conn,
+            audit_actor=audit_actor or principal.username,
+            audit_via=audit_via,
+            action="key_mint",
+            target=prefix,
+            detail=audit_detail,
         )
     return token
 
@@ -179,7 +310,8 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
     prefix = raw[:API_KEY_PREFIX_LEN]
     with db.reader() as conn:
         row = conn.execute(
-            "SELECT k.id, k.key_hash, u.id AS uid, u.username, u.role "
+            "SELECT k.id, k.key_hash, u.id AS uid, u.username, u.role, "
+            "u.credential_version "
             "FROM api_keys k JOIN users u ON u.id=k.user_id "
             "WHERE k.key_prefix=? AND k.revoked_at IS NULL AND u.is_active=1",
             (prefix,),
@@ -188,8 +320,17 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
         return None
     if _should_stamp_last_used(row["id"]):
         with db.writer() as conn:
-            conn.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (now_iso(), row["id"]))
-    return Principal(row["uid"], row["username"], row["role"], via="mcp")
+            conn.execute(
+                "UPDATE api_keys SET last_used_at=? WHERE id=? AND revoked_at IS NULL",
+                (now_iso(), row["id"]),
+            )
+    return Principal(
+        row["uid"],
+        row["username"],
+        row["role"],
+        via="mcp",
+        credential_version=row["credential_version"],
+    )
 
 
 def list_api_keys(db: Database, user_id: int) -> list[dict]:
@@ -202,12 +343,40 @@ def list_api_keys(db: Database, user_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def revoke_api_key(db: Database, user_id: int, key_id: int) -> None:
+def revoke_api_key(
+    db: Database,
+    principal: Principal,
+    key_id: int,
+    *,
+    audit_actor: str | None = None,
+    audit_via: str | None = None,
+) -> str:
     with db.writer() as conn:
-        conn.execute(
+        row = conn.execute(
+            "SELECT k.key_prefix FROM api_keys k JOIN users u ON u.id=k.user_id "
+            "WHERE k.id=? AND k.user_id=? AND k.revoked_at IS NULL "
+            "AND u.is_active=1 AND u.credential_version=?",
+            (key_id, principal.user_id, principal.credential_version),
+        ).fetchone()
+        if row is None:
+            # Deliberately do not distinguish another user's key from a missing or
+            # already-revoked one, and never write a false outcome='ok' audit row.
+            raise NotFoundError("active API key not found")
+        changed = conn.execute(
             "UPDATE api_keys SET revoked_at=? WHERE id=? AND user_id=? AND revoked_at IS NULL",
-            (now_iso(), key_id, user_id),
+            (now_iso(), key_id, principal.user_id),
         )
+        if changed.rowcount != 1:
+            raise NotFoundError("active API key not found")
+        prefix = str(row["key_prefix"])
+        _record_success(
+            conn,
+            audit_actor=audit_actor or principal.username,
+            audit_via=audit_via,
+            action="key_revoke",
+            target=prefix,
+        )
+        return prefix
 
 
 # -- credential-change invalidation (conn-scoped; run inside the caller's txn) ---

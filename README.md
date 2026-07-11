@@ -92,7 +92,7 @@ streamable-http 엔드포인트 `http://<HOST>:<MCP_PORT>/mcp`에 **`Authorizati
 uv run llm-wiki create-api-key --username admin --name my-agent
 ```
 
-> **키 수명 정책**: API 키에는 시간 기반 만료가 없습니다(장수명 에이전트 사용성 우선). 대신 해당 사용자의 **비밀번호가 변경**되거나 **계정이 비활성화**되면 그 사용자의 모든 키가 자동 폐기되고 웹 세션도 함께 무효화됩니다. 개별 키는 웹 `설정 > API 키`에서 폐기할 수 있습니다.
+> **키 수명 정책**: API 키에는 시간 기반 만료가 없습니다(장수명 에이전트 사용성 우선). 대신 해당 사용자의 **비밀번호가 변경**되거나 **계정이 비활성화**되면 그 사용자의 모든 키가 자동 폐기되고 웹 세션도 함께 무효화됩니다. 비활성 계정에는 새 키를 발급할 수 없으며, 개별 키는 웹 `설정 > API 키`에서 폐기할 수 있습니다.
 
 제공 MCP 툴:
 
@@ -109,6 +109,7 @@ uv run llm-wiki create-api-key --username admin --name my-agent
 | `get_outline(path)` | 읽기 | 헤딩 목록 `{level, text, line}`(섹션 편집 대상 탐색) |
 | `list_documents(folder?, tag?, …)` | 읽기 | 문서 목록. `count`/`total`/`has_more`/`sort`로 페이징 |
 | `list_recent_changes(limit?, since?, until?)` | 읽기 | 최근 수정 문서(ISO 날짜 범위 필터) |
+| `list_activity(…)` / `list_trash(…)` | 편집 | 문서 활동 감사 피드 / 삭제 문서 목록. 삭제자·행위자 메타데이터 보호를 위해 `editor` 이상만 허용 |
 | `list_broken_links(limit?)` | 읽기 | 저장소 전체 미해석(깨진) 링크 목록 |
 | `get_tags()` | 읽기 | 태그 목록 + 사용 횟수(필터용 어휘 탐색) |
 | `get_links(path)` / `get_backlinks(path)` | 읽기 | 나가는/들어오는 링크 |
@@ -162,6 +163,8 @@ uv run llm-wiki import --from ~/Obsidian/MyVault --into notes \
 ```
 
 `--on-conflict`(skip|overwrite|rename) · `--import-attachments`(이미지/첨부 복사 + 링크 재작성) · `--no-recurse` · `--no-embed`(나중에 `reindex --reembed`)를 지원합니다. `--on-conflict overwrite`는 파괴적이라 `--force`가 필요합니다.
+
+CLI 가져오기는 특정 위키 사용자로 로그인한 작업이 아니므로 리비전 작성자는 비워 두고, 감사 로그에는 실제 OS 실행자와 `via=cli`를 기록합니다.
 
 ## 백업 / 복원
 

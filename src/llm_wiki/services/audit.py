@@ -24,18 +24,50 @@ DOC_ACTIONS: tuple[str, ...] = (
     "doc_restore", "doc_purge", "doc_reconcile", "attachment_upload",
 )
 
+_FIELD_LIMITS = {
+    "actor": 128,
+    "via": 32,
+    "action": 64,
+    "target": 4096,
+    "outcome": 32,
+    "detail": 4096,
+}
+
+
+def _bounded(value: str | None, field: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value)[: _FIELD_LIMITS[field]]
+    # Audit rows are also mirrored to the application log. Neutralize ASCII control
+    # characters so attacker-controlled actor/target values cannot forge log lines.
+    return "".join("?" if ord(char) < 32 or ord(char) == 127 else char for char in text)
+
 
 def record(conn, *, actor: str | None, via: str, action: str,
            target: str | None = None, outcome: str = "ok", detail: str | None = None) -> None:
     """Insert one audit row on an EXISTING write connection (atomic with the change
     it records). Use inside a docs/users write transaction."""
+    safe_actor = _bounded(actor or "-", "actor")
+    safe_via = _bounded(via, "via")
+    safe_action = _bounded(action, "action")
+    safe_target = _bounded(target, "target")
+    safe_outcome = _bounded(outcome, "outcome")
+    safe_detail = _bounded(detail, "detail")
     conn.execute(
         "INSERT INTO audit_log(ts, actor, via, action, target, outcome, detail) "
         "VALUES(?,?,?,?,?,?,?)",
-        (now_iso(), actor or "-", via, action, target, outcome, detail),
+        (
+            now_iso(),
+            safe_actor,
+            safe_via,
+            safe_action,
+            safe_target,
+            safe_outcome,
+            safe_detail,
+        ),
     )
     log.info("audit action=%s actor=%s via=%s target=%s outcome=%s",
-             action, actor or "-", via, target, outcome)
+             safe_action, safe_actor, safe_via, safe_target, safe_outcome)
 
 
 def record_tx(db: Database, **kw) -> None:

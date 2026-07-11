@@ -2,6 +2,7 @@
 envelope, and end-to-end tool calls (auth gate, RBAC, conflict, rate limit) driven
 through the real FastMCP tool wrappers."""
 import json
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -104,7 +105,7 @@ def test_error_suggested_actions_per_code():
 # -- end-to-end tool calls -------------------------------------------------
 @pytest.fixture
 def editor_mcp(ctx, principals, monkeypatch):
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
     return create_mcp_server(ctx)
 
@@ -120,6 +121,16 @@ def _audit_count(ctx, action):
     with ctx.db.reader() as conn:
         return conn.execute(
             "SELECT COUNT(*) FROM audit_log WHERE action=?", (action,)).fetchone()[0]
+
+
+def _audit_rows(ctx, *, action: str, target: str) -> list[dict]:
+    with ctx.db.reader() as conn:
+        rows = conn.execute(
+            "SELECT actor, via, action, target, outcome, detail FROM audit_log "
+            "WHERE action=? AND target=? ORDER BY id",
+            (action, target),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 async def test_mcp_auth_failure_audited_once_at_threshold(ctx, monkeypatch):
@@ -382,11 +393,318 @@ async def test_rename_references_tool(editor_mcp):
 
 
 async def test_viewer_write_forbidden(ctx, principals, monkeypatch):
-    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    vkey = create_api_key(ctx.db, principals["viewer"], "vk")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("create_document", {"path": "x.md", "content": "nope"}))
     assert d["ok"] is False and d["error"]["code"] == "forbidden"
+
+
+async def test_viewer_cannot_list_activity_or_trash(ctx, principals, monkeypatch):
+    vkey = create_api_key(ctx.db, principals["viewer"], "viewer-read-key")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
+    mcp = create_mcp_server(ctx)
+
+    activity = _payload(await mcp.call_tool("list_activity", {}))
+    trash = _payload(await mcp.call_tool("list_trash", {}))
+
+    assert activity["ok"] is False and activity["error"]["code"] == "forbidden"
+    assert trash["ok"] is False and trash["error"]["code"] == "forbidden"
+
+
+async def test_mcp_write_failures_are_audited_without_sensitive_data(
+    ctx, principals, monkeypatch,
+):
+    attempted_body = "TOP-SECRET-ATTEMPT"
+    viewer_key = create_api_key(ctx.db, principals["viewer"], "viewer-write-key")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: viewer_key)
+    viewer_mcp = create_mcp_server(ctx)
+
+    forbidden = _payload(await viewer_mcp.call_tool(
+        "create_document", {"path": "private.md", "content": attempted_body}))
+    assert forbidden["ok"] is False and forbidden["error"]["code"] == "forbidden"
+    forbidden_rows = _audit_rows(ctx, action="doc_create", target="private.md")
+    assert forbidden_rows == [{
+        "actor": "bob",
+        "via": "mcp",
+        "action": "doc_create",
+        "target": "private.md",
+        "outcome": "forbidden",
+        "detail": None,
+    }]
+    assert attempted_body not in json.dumps(forbidden_rows)
+    assert viewer_key not in json.dumps(forbidden_rows)
+
+    editor_key = create_api_key(ctx.db, principals["editor"], "editor-write-key")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: editor_key)
+    editor_mcp = create_mcp_server(ctx)
+    current_body = "TOP-SECRET-CURRENT"
+    created = _payload(await editor_mcp.call_tool(
+        "create_document", {"path": "confidential.md", "content": current_body}))
+    assert created["ok"] is True
+
+    conflict = _payload(await editor_mcp.call_tool("update_document", {
+        "path": "confidential.md", "base_version": 0, "content": attempted_body,
+    }))
+    assert conflict["ok"] is False and conflict["error"]["code"] == "conflict"
+    conflict_rows = _audit_rows(ctx, action="doc_update", target="confidential.md")
+    assert conflict_rows == [{
+        "actor": "alice",
+        "via": "mcp",
+        "action": "doc_update",
+        "target": "confidential.md",
+        "outcome": "conflict",
+        "detail": None,
+    }]
+    serialized = json.dumps(conflict_rows)
+    assert attempted_body not in serialized
+    assert current_body not in serialized
+    assert editor_key not in serialized
+
+    updated = _payload(await editor_mcp.call_tool("update_document", {
+        "path": "confidential.md", "base_version": 1, "content": "safe replacement",
+    }))
+    assert updated["ok"] is True
+    assert [row["outcome"] for row in _audit_rows(
+        ctx, action="doc_update", target="confidential.md",
+    )] == ["conflict", "ok"]
+
+
+async def test_mcp_validation_and_not_found_write_failures_are_audited(
+    ctx, principals, monkeypatch,
+):
+    editor_key = create_api_key(ctx.db, principals["editor"], "rejected-writes")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: editor_key)
+    mcp = create_mcp_server(ctx)
+
+    validation = _payload(await mcp.call_tool("patch_document", {
+        "path": "validation.md", "find": "", "replace": "ignored",
+    }))
+    missing = _payload(await mcp.call_tool("update_document", {
+        "path": "missing.md", "base_version": 1, "content": "ignored",
+    }))
+
+    assert validation["ok"] is False and validation["error"]["code"] == "validation"
+    assert missing["ok"] is False and missing["error"]["code"] == "not_found"
+    assert _audit_rows(ctx, action="doc_update", target="validation.md") == [{
+        "actor": "alice", "via": "mcp", "action": "doc_update",
+        "target": "validation.md", "outcome": "validation", "detail": None,
+    }]
+    assert _audit_rows(ctx, action="doc_update", target="missing.md") == [{
+        "actor": "alice", "via": "mcp", "action": "doc_update",
+        "target": "missing.md", "outcome": "not_found", "detail": None,
+    }]
+
+
+async def test_default_daily_note_failure_audits_resolved_utc_date(
+    ctx, principals, monkeypatch,
+):
+    fixed_now = datetime(2035, 2, 3, 0, 0, tzinfo=UTC)
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz):
+            assert tz is UTC
+            return fixed_now
+
+    monkeypatch.setattr(mcp_mod, "datetime", FixedDatetime)
+    seen_dates = []
+    original_daily_note = ctx.docs.daily_note
+
+    def capture_daily_note(principal, date=None, *, folder="daily"):
+        seen_dates.append(date)
+        return original_daily_note(principal, date, folder=folder)
+
+    monkeypatch.setattr(ctx.docs, "daily_note", capture_daily_note)
+    viewer_key = create_api_key(ctx.db, principals["viewer"], "default-daily")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: viewer_key)
+    mcp = create_mcp_server(ctx)
+
+    result = _payload(await mcp.call_tool("get_or_create_daily_note", {}))
+
+    assert result["ok"] is False and result["error"]["code"] == "forbidden"
+    assert seen_dates == ["2035-02-03"]
+    assert _audit_rows(ctx, action="doc_create", target="daily/2035-02-03.md") == [{
+        "actor": "bob", "via": "mcp", "action": "doc_create",
+        "target": "daily/2035-02-03.md", "outcome": "forbidden", "detail": None,
+    }]
+
+
+async def test_all_rejected_mcp_write_tools_use_safe_audit_metadata(
+    ctx, principals, monkeypatch,
+):
+    secret = "DO-NOT-AUDIT-THIS-PAYLOAD"
+    viewer_key = create_api_key(ctx.db, principals["viewer"], "viewer-all-writes")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: viewer_key)
+    mcp = create_mcp_server(ctx)
+    cases = [
+        ("patch_document", {"path": "patch.md", "find": "old", "replace": secret},
+         "doc_update", "patch.md"),
+        ("append_to_document", {"path": "append.md", "text": secret},
+         "doc_update", "append.md"),
+        ("restore_revision", {"path": "revision.md", "version": 1},
+         "doc_update", "revision.md"),
+        ("replace_section", {"path": "replace.md", "heading": "H", "text": secret},
+         "doc_update", "replace.md"),
+        ("append_section", {"path": "section.md", "heading": "H", "text": secret},
+         "doc_update", "section.md"),
+        ("patch_tags", {"path": "tags.md", "add": ["private"]},
+         "doc_update", "tags.md"),
+        ("set_document_property", {"path": "property.md", "key": "status", "value": secret},
+         "doc_update", "property.md"),
+        ("remove_document_property", {"path": "remove-property.md", "key": "status"},
+         "doc_update", "remove-property.md"),
+        ("set_document_properties", {"path": "properties.md", "properties": {"status": secret}},
+         "doc_update", "properties.md"),
+        ("toggle_task", {"path": "task.md", "index": 0},
+         "doc_update", "task.md"),
+        ("get_or_create_daily_note", {"date": "2026-07-12", "folder": "daily"},
+         "doc_create", "daily/2026-07-12.md"),
+        ("move_document", {"path": "old.md", "new_path": "new.md"},
+         "doc_move", "old.md -> new.md"),
+        ("rename_references", {"old_path": "before.md", "new_path": "after.md"},
+         "doc_update", "before.md -> after.md"),
+        ("delete_document", {"path": "delete.md"},
+         "doc_delete", "delete.md"),
+        ("restore_document", {"path": "restore.md"},
+         "doc_restore", "restore.md"),
+        ("purge_document", {"path": "purge.md"},
+         "doc_purge", "purge.md"),
+        ("rename_tag", {"old": "private", "new": "public"},
+         "doc_update", "tag:private -> public"),
+        ("merge_tags", {"sources": ["one", "two"], "dest": "merged"},
+         "doc_update", "tags:one,two -> merged"),
+        ("create_folder", {"path": "new-folder"},
+         "folder_create", "new-folder"),
+        ("delete_folder", {"path": "old-folder"},
+         "folder_delete", "old-folder"),
+        ("upload_attachment", {"filename": "private.pdf", "content_base64": "eA=="},
+         "attachment_upload", "private.pdf"),
+    ]
+
+    for tool, arguments, action, target in cases:
+        result = _payload(await mcp.call_tool(tool, arguments))
+        assert result["ok"] is False and result["error"]["code"] == "forbidden", tool
+        assert _audit_rows(ctx, action=action, target=target) == [{
+            "actor": "bob",
+            "via": "mcp",
+            "action": action,
+            "target": target,
+            "outcome": "forbidden",
+            "detail": None,
+        }], tool
+
+    serialized = json.dumps(_audit_rows(ctx, action="doc_update", target="patch.md"))
+    assert secret not in serialized
+    assert viewer_key not in serialized
+
+
+async def test_edit_documents_audits_per_operation_failures(ctx, principals, monkeypatch):
+    secret = "BATCH-SECRET-CONTENT"
+    editor_key = create_api_key(ctx.db, principals["editor"], "batch-editor")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: editor_key)
+    mcp = create_mcp_server(ctx)
+    assert _payload(await mcp.call_tool(
+        "create_document", {"path": "batch-existing.md", "content": "current"}))[
+            "ok"] is True
+    assert _payload(await mcp.call_tool(
+        "create_document", {"path": "batch-update.md", "content": "current"}))[
+            "ok"] is True
+
+    result = _payload(await mcp.call_tool("edit_documents", {
+        "operations": [
+            {"op": "create", "path": "batch-existing.md", "content": secret},
+            {"op": "update", "path": "batch-update.md", "base_version": 0,
+             "content": secret},
+        ],
+        "stop_on_error": False,
+    }))
+    assert result["ok"] is True and result["failed"] == 2
+    create_rows = _audit_rows(ctx, action="doc_create", target="batch-existing.md")
+    update_rows = _audit_rows(ctx, action="doc_update", target="batch-update.md")
+    assert [row["outcome"] for row in create_rows] == ["ok", "conflict"]
+    assert [row["outcome"] for row in update_rows] == ["conflict"]
+    assert create_rows[-1]["detail"] is None and update_rows[-1]["detail"] is None
+
+    preview = _payload(await mcp.call_tool("edit_documents", {
+        "operations": [{
+            "op": "update", "path": "batch-update.md", "base_version": 0,
+            "content": secret,
+        }],
+        "dry_run": True,
+    }))
+    assert preview["ok"] is True
+    assert preview["results"][0]["ok"] is False
+    assert preview["results"][0]["error"]["code"] == "conflict"
+    assert [row["outcome"] for row in _audit_rows(
+        ctx, action="doc_update", target="batch-update.md",
+    )] == ["conflict"]
+
+    viewer_key = create_api_key(ctx.db, principals["viewer"], "batch-viewer")
+    monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: viewer_key)
+    viewer_mcp = create_mcp_server(ctx)
+    forbidden = _payload(await viewer_mcp.call_tool("edit_documents", {
+        "operations": [{"op": "create", "path": "batch-private.md", "content": secret}],
+    }))
+    assert forbidden["ok"] is False and forbidden["error"]["code"] == "forbidden"
+    assert _audit_rows(ctx, action="doc_create", target="batch-private.md") == [{
+        "actor": "bob",
+        "via": "mcp",
+        "action": "doc_create",
+        "target": "batch-private.md",
+        "outcome": "forbidden",
+        "detail": None,
+    }]
+
+    empty = _payload(await viewer_mcp.call_tool("edit_documents", {"operations": []}))
+    oversized = _payload(await viewer_mcp.call_tool("edit_documents", {
+        "operations": [
+            {"op": "create", "path": f"too-many-{index}.md", "content": secret}
+            for index in range(101)
+        ],
+    }))
+    assert empty["ok"] is False and empty["error"]["code"] == "forbidden"
+    assert oversized["ok"] is False and oversized["error"]["code"] == "forbidden"
+
+    max_batch = _payload(await viewer_mcp.call_tool("edit_documents", {
+        "operations": [
+            {"op": "create", "path": f"max-batch-{index}.md", "content": secret}
+            for index in range(100)
+        ],
+    }))
+    assert max_batch["ok"] is False and max_batch["error"]["code"] == "forbidden"
+    assert _audit_rows(
+        ctx,
+        action="batch_write",
+        target="count=100 first=max-batch-0.md",
+    ) == [{
+        "actor": "bob",
+        "via": "mcp",
+        "action": "batch_write",
+        "target": "count=100 first=max-batch-0.md",
+        "outcome": "forbidden",
+        "detail": None,
+    }]
+    with ctx.db.reader() as conn:
+        expanded_rows = conn.execute(
+            "SELECT COUNT(*) FROM audit_log WHERE actor='bob' "
+            "AND target LIKE 'max-batch-%'"
+        ).fetchone()[0]
+    assert expanded_rows == 0
+
+    preview = _payload(await viewer_mcp.call_tool("edit_documents", {
+        "operations": [{"op": "create", "path": "preview-only.md", "content": secret}],
+        "dry_run": True,
+    }))
+    assert preview["ok"] is False and preview["error"]["code"] == "forbidden"
+    assert _audit_rows(ctx, action="doc_create", target="preview-only.md") == []
+
+    serialized = json.dumps(create_rows + update_rows + _audit_rows(
+        ctx, action="doc_create", target="batch-private.md",
+    ))
+    assert secret not in serialized
+    assert editor_key not in serialized
+    assert viewer_key not in serialized
 
 
 async def test_get_document_info_metadata_only(editor_mcp):
@@ -586,7 +904,7 @@ async def test_internal_error_returns_structured_envelope(ctx, principals, monke
     # A non-WikiError raised inside a tool body must still reach the agent as the
     # structured {ok:false, error:{code:"internal"}} envelope, not a raw protocol
     # error, and must not leak internals.
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
 
     def boom():
@@ -633,7 +951,7 @@ async def test_delete_nonempty_folder_rejected_tool(editor_mcp):
 
 
 async def test_folder_tools_forbidden_for_viewer(ctx, principals, monkeypatch):
-    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    vkey = create_api_key(ctx.db, principals["viewer"], "vk")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("create_folder", {"path": "X"}))
@@ -698,7 +1016,7 @@ async def test_edit_documents_batch_new_ops(editor_mcp):
 async def test_internal_error_envelope_carries_request_id(ctx, principals, monkeypatch):
     # The structured internal-error envelope includes the correlation id so an agent
     # can quote it and an operator can grep straight to the failing call's log line.
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
 
     def boom():
@@ -714,7 +1032,7 @@ async def test_internal_error_envelope_carries_request_id(ctx, principals, monke
 # -- shortlist: daily note, trash, dry-run, search enrichment --------------
 @pytest.fixture
 def admin_mcp(ctx, principals, monkeypatch):
-    key = create_api_key(ctx.db, principals["admin"].user_id, "adminkey")
+    key = create_api_key(ctx.db, principals["admin"], "adminkey")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
     return create_mcp_server(ctx)
 
@@ -857,7 +1175,7 @@ async def test_upload_attachment_rejects_bad_base64(editor_mcp):
 
 async def test_upload_attachment_forbidden_for_viewer(ctx, principals, monkeypatch):
     import base64
-    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    vkey = create_api_key(ctx.db, principals["viewer"], "vk")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("upload_attachment",
@@ -890,7 +1208,7 @@ async def test_merge_tags_folds_sources(editor_mcp):
 
 
 async def test_rename_tag_forbidden_for_viewer(ctx, principals, monkeypatch):
-    vkey = create_api_key(ctx.db, principals["viewer"].user_id, "vk")
+    vkey = create_api_key(ctx.db, principals["viewer"], "vk")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: vkey)
     mcp = create_mcp_server(ctx)
     d = _payload(await mcp.call_tool("rename_tag", {"old": "a", "new": "b"}))

@@ -12,6 +12,7 @@ import sqlite3
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import cast
 
 import uvicorn
 from pydantic import ValidationError
@@ -186,12 +187,14 @@ def _create_admin(args) -> int:
         return 1
     username = args.username or input("Admin username: ").strip()
     password = args.password or getpass.getpass("Password: ")
-    uid = create_user(ctx.db, username, password, "admin")
-    # Mirror the web admin path's audit trail (action=user_create) so account creation
-    # is traceable on EVERY surface, not just the UI — credential changes are the most
-    # security-sensitive thing the CLI does.
-    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="user_create",
-                    target=username, detail="role=admin")
+    uid = create_user(
+        ctx.db,
+        username,
+        password,
+        "admin",
+        audit_actor=_os_actor(),
+        audit_via="cli",
+    )
     print(f"Created admin '{username}' (id={uid}).")
     return 0
 
@@ -200,9 +203,14 @@ def _create_user(args) -> int:
     ctx = build_context(full=False)
     username = args.username or input("Username: ").strip()
     password = args.password or getpass.getpass("Password: ")
-    uid = create_user(ctx.db, username, password, args.role)
-    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="user_create",
-                    target=username, detail=f"role={args.role}")
+    uid = create_user(
+        ctx.db,
+        username,
+        password,
+        args.role,
+        audit_actor=_os_actor(),
+        audit_via="cli",
+    )
     print(f"Created user '{username}' (id={uid}, role={args.role}).")
     return 0
 
@@ -210,15 +218,29 @@ def _create_user(args) -> int:
 def _create_api_key(args) -> int:
     ctx = build_context(full=False)
     with ctx.db.reader() as conn:
-        row = conn.execute("SELECT id FROM users WHERE username=?", (args.username,)).fetchone()
+        row = conn.execute(
+            "SELECT id,username,role,credential_version FROM users "
+            "WHERE username=? AND is_active=1",
+            (args.username,),
+        ).fetchone()
     if not row:
-        print(f"No such user: {args.username}")
+        print(f"No such active user: {args.username}")
         return 1
-    token = create_api_key(ctx.db, row["id"], args.name)
-    # Minting a key is a credential event the web path audits (action=key_mint); record
-    # it from the CLI too so a leaked-key investigation can see CLI-minted keys.
-    audit.record_tx(ctx.db, actor=_os_actor(), via="cli", action="key_mint",
-                    target=args.name, detail=f"user={args.username}")
+    principal = Principal(
+        row["id"],
+        row["username"],
+        row["role"],
+        via="cli",
+        credential_version=row["credential_version"],
+    )
+    token = create_api_key(
+        ctx.db,
+        principal,
+        args.name,
+        audit_actor=_os_actor(),
+        audit_via="cli",
+        audit_detail=f"user={args.username}",
+    )
     print(token)
     print("(store this now — it is not shown again)", flush=True)
     return 0
@@ -282,7 +304,7 @@ _IMPORT_LABELS = {"create": "CREATE", "revive": "REVIVE", "skip": "SKIP",
 
 def _import(args) -> int:
     """Thin wrapper over DocumentService.import_from_directory: validate the source,
-    gate destructive overwrite, attribute to an admin/editor, then print the report."""
+    gate destructive overwrite, attribute to the local CLI operator, then print the report."""
     src = Path(args.from_).expanduser()
     if not src.is_dir():
         print(f"configuration error: source directory not found: {src}")
@@ -298,17 +320,10 @@ def _import(args) -> int:
         print(f"configuration error: --from overlaps the vault (self-import): {src}")
         return 2
 
-    # Attribute the import to a real user so revisions/audit carry an author (prefer
-    # an admin); via='cli-import' distinguishes a bulk import from manual CLI edits.
-    with ctx.db.reader() as conn:
-        row = conn.execute(
-            "SELECT id, username, role FROM users WHERE is_active=1 AND role IN ('admin','editor') "
-            "ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, id LIMIT 1").fetchone()
-    if not row:
-        print("error: no admin or editor user to attribute the import to; run "
-              "'create-admin' first.")
-        return 1
-    principal = Principal(row["id"], row["username"], row["role"], via="cli-import")
+    # The host CLI is a trusted write surface, but no wiki user authenticated this
+    # command. Keep nullable user FKs anonymous instead of impersonating whichever
+    # admin/editor happens to sort first; the audit actor identifies the OS operator.
+    principal = Principal(cast(int, None), _os_actor(), "editor", via="cli")
 
     kwargs: dict = dict(
         into=args.into, on_conflict=args.on_conflict, recurse=not args.no_recurse,

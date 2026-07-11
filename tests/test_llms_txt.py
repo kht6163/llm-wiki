@@ -612,7 +612,7 @@ def test_llms_txt_via_session(ctx, principals, client):
 
 def test_llms_full_via_bearer_api_key(ctx, principals, client):
     _seed(ctx, principals)
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     r = client.get("/llms-full.txt", headers={"Authorization": f"Bearer {key}"})
     assert r.status_code == 200
     assert "첫 문장입니다." in r.text
@@ -628,7 +628,7 @@ def test_raw_md_link_fetchable_by_bearer_agent(ctx, principals, client):
     # The whole point of /llms.txt: an agent that fetched the index with its API key
     # must be able to GET each linked raw (.md) with the SAME key (was session-only).
     _seed(ctx, principals)
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     hdr = {"Authorization": f"Bearer {key}"}
     idx = client.get("/llms.txt", headers=hdr)
     assert idx.status_code == 200
@@ -648,7 +648,7 @@ def _payload(out):
 
 @pytest.fixture
 def editor_mcp(ctx, principals, monkeypatch):
-    key = create_api_key(ctx.db, principals["editor"].user_id, "agent")
+    key = create_api_key(ctx.db, principals["editor"], "agent")
     monkeypatch.setattr(mcp_mod, "_bearer_token", lambda _c: key)
     return create_mcp_server(ctx)
 

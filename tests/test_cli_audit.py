@@ -57,7 +57,8 @@ def test_create_api_key_audited(tmp_path, monkeypatch):
     assert rc == 0
     rows = _rows(ctx, "key_mint")
     assert len(rows) == 1
-    assert rows[0]["via"] == "cli" and rows[0]["target"] == "laptop"
+    assert rows[0]["via"] == "cli"
+    assert rows[0]["target"].startswith("lw_") and len(rows[0]["target"]) == 12
     assert rows[0]["detail"] == "user=root"
 
 
@@ -66,4 +67,23 @@ def test_create_api_key_unknown_user_not_audited(tmp_path, monkeypatch):
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
     rc = _cli_impl._create_api_key(SimpleNamespace(username="ghost", name="laptop"))
     assert rc == 1
+    assert _rows(ctx, "key_mint") == []
+
+
+def test_create_api_key_inactive_user_not_minted_or_audited(tmp_path, monkeypatch):
+    ctx = _ctx(tmp_path)
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
+    _cli_impl._create_admin(
+        SimpleNamespace(username="root", password="secret12", force=False)
+    )
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE users SET is_active=0 WHERE username='root'")
+
+    rc = _cli_impl._create_api_key(
+        SimpleNamespace(username="root", name="inactive-key")
+    )
+
+    assert rc == 1
+    with ctx.db.reader() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM api_keys").fetchone()[0] == 0
     assert _rows(ctx, "key_mint") == []
