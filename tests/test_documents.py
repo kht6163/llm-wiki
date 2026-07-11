@@ -53,6 +53,76 @@ def test_content_title_replaces_preserved_title_on_update(ctx, principals):
     assert updated["title"] == "Derived"
 
 
+def test_frontmatter_comment_does_not_replace_preserved_title_on_update(
+    ctx, principals
+):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
+
+    updated = docs.update(
+        p,
+        "note.md",
+        created["version"],
+        "---\n# comment\nstatus: draft\n---\nplain body changed",
+        embed=False,
+    )
+
+    assert updated["title"] == "Explicit"
+
+
+def test_fenced_code_h1_does_not_replace_preserved_title_on_update(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
+
+    updated = docs.update(
+        p,
+        "note.md",
+        created["version"],
+        "plain body changed\n\n```sh\n# command\n```",
+        embed=False,
+    )
+
+    assert updated["title"] == "Explicit"
+
+
+def test_content_title_preserves_inline_code_on_update(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
+
+    updated = docs.update(
+        p,
+        "note.md",
+        created["version"],
+        "# Install `uv`\n\nplain body changed",
+        embed=False,
+    )
+
+    assert updated["title"] == "Install `uv`"
+
+
+def test_frontmatter_title_replaces_preserved_title_on_update(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+    created = docs.create(p, "note.md", "plain body", title="Explicit", embed=False)
+
+    updated = docs.update(
+        p,
+        "note.md",
+        created["version"],
+        "---\ntitle: Frontmatter\n---\nplain body changed",
+        embed=False,
+    )
+
+    assert updated["title"] == "Frontmatter"
+
+
+def test_create_title_falls_back_to_heading_at_any_level(ctx, principals):
+    docs, p = ctx.docs, principals["editor"]
+
+    created = docs.create(p, "note.md", "## Secondary\n\nplain body", embed=False)
+
+    assert created["title"] == "Secondary"
+
+
 @pytest.mark.parametrize(
     ("content", "expected_tags"),
     [

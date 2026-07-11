@@ -168,9 +168,11 @@ def derive_content_title(meta: dict, body: str) -> str | None:
     title = meta.get("title")
     if isinstance(title, str) and title.strip():
         return title.strip()
-    for hm in HEADING_RE.finditer(body):
+    for hm in HEADING_RE.finditer(_mask(body)):
         if hm.group(1) == "#":
-            return hm.group(2).strip()
+            raw_hm = HEADING_RE.fullmatch(body[hm.start():hm.end()])
+            if raw_hm:
+                return raw_hm.group(2).strip()
     return None
 
 
