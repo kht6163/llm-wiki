@@ -5,12 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
-import io
 import json
 import signal
 import sqlite3
 import tarfile
-import tempfile
 from pathlib import Path
 from typing import cast
 
@@ -25,7 +23,7 @@ from .services import audit
 from .services import users as users_svc
 from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
-from .util import now_iso
+from .snapshot import write_snapshot
 from .web import create_web_app
 from .web.security import RequestBodyLimitMiddleware
 
@@ -466,45 +464,11 @@ def _snapshot(args) -> int:
     if out.exists() and not args.force:
         print(f"refusing to overwrite existing file (use --force): {out}")
         return 1
-    out.parent.mkdir(parents=True, exist_ok=True)
     vault = Path(ctx.settings.vault_path)
-
-    with ctx.db.reader() as conn:
-        schema_version = get_meta(conn, "schema_version")
-        manifest = {
-            "format": SNAPSHOT_FORMAT,
-            "format_version": 1,
-            "schema_version": int(schema_version) if schema_version else None,
-            "embedding_model": get_meta(conn, "embedding_model"),
-            "embedding_dim": (lambda v: int(v) if v else None)(get_meta(conn, "embedding_dim")),
-            "doc_count": conn.execute(
-                "SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0],
-            "created_at": now_iso(),
-        }
-
-    with tempfile.TemporaryDirectory() as td:
-        snap_db = Path(td) / "wiki.db"
-        # VACUUM INTO: a transactionally-consistent copy even with WAL active.
-        with ctx.db.reader() as conn:
-            conn.execute("VACUUM INTO ?", (str(snap_db),))
-        files = 0
-        with tarfile.open(out, "w") as tar:
-            tar.add(snap_db, arcname="wiki.db")
-            if vault.exists():
-                for f in sorted(vault.rglob("*")):
-                    rel = f.relative_to(vault)
-                    if rel.parts and rel.parts[0] == ".tmp":  # scratch dir for atomic writes
-                        continue
-                    if f.is_file():
-                        tar.add(f, arcname=str(Path("vault") / rel))
-                        files += 1
-            data = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-            info = tarfile.TarInfo("manifest.json")
-            info.size = len(data)
-            tar.addfile(info, io.BytesIO(data))
+    report = write_snapshot(ctx.db, vault, out, force=args.force)
     print(f"Snapshot written to {out}")
-    print(f"  schema v{manifest['schema_version']} · {manifest['doc_count']} docs · "
-          f"{files} vault file(s) · model {manifest['embedding_model']}")
+    print(f"  schema v{report.schema_version} · {report.doc_count} docs · "
+          f"{report.file_count} vault file(s) · model {report.embedding_model}")
     return 0
 
 
