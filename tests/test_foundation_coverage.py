@@ -208,11 +208,26 @@ def test_event_drop_warning_is_throttled(monkeypatch, caplog):
     assert q.get_nowait() == "existing"
 
 
-def test_logging_defaults_and_named_logger():
+def test_logging_defaults_and_named_logger(monkeypatch):
+    configured = []
+    monkeypatch.setattr("llm_wiki.logconf.dictConfig", configured.append)
+
     configure_logging("", "")
+
+    assert configured[0]["handlers"] == {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "std",
+            "filters": ["request_id"],
+        }
+    }
+    assert configured[0]["loggers"]["llm_wiki"] == {
+        "handlers": ["console"],
+        "level": "INFO",
+        "propagate": False,
+    }
     logger = get_logger("foundation")
     assert logger.name == "llm_wiki.foundation"
-    assert logging.getLogger("llm_wiki").level == logging.INFO
 
 
 def test_rate_limiter_threshold_expiry_and_reset(monkeypatch):
@@ -231,15 +246,33 @@ def test_rate_limiter_threshold_expiry_and_reset(monkeypatch):
     assert "client" not in limiter._hits
 
 
-class _Rows:
-    def __init__(self, values):
-        self.values = iter(values)
+_GAUGE_QUERIES = [
+    "SELECT COUNT(*) FROM documents WHERE is_deleted=0",
+    "SELECT COUNT(*) FROM documents WHERE vector_dirty=1 AND is_deleted=0",
+    "SELECT COUNT(*) FROM documents WHERE file_state='pending' AND is_deleted=0",
+    (
+        "SELECT COUNT(*) FROM links l JOIN documents d ON d.id=l.src_doc_id "
+        "WHERE l.is_resolved=0 AND d.is_deleted=0"
+    ),
+]
 
-    def execute(self, _query):
+
+class _Rows:
+    def __init__(self, results):
+        self.results = dict(zip(_GAUGE_QUERIES, results, strict=True))
+        self.queries = []
+        self.current = None
+
+    def execute(self, query):
+        normalized = " ".join(query.split())
+        assert normalized in self.results, f"unexpected gauge SQL: {normalized}"
+        self.queries.append(normalized)
+        self.current = self.results[normalized]
         return self
 
     def fetchone(self):
-        return [next(self.values)]
+        assert self.current is not None
+        return [self.current]
 
 
 class _DB:
@@ -256,7 +289,8 @@ def test_collect_index_gauges_updates_returned_state_and_metrics(
     schema_version, expected, monkeypatch
 ):
     monkeypatch.setattr(metrics, "get_meta", lambda _conn, _key: schema_version)
-    stats = metrics.collect_index_gauges(_DB([4, 3, 2, 1]))
+    db = _DB([4, 3, 2, 1])
+    stats = metrics.collect_index_gauges(db)
     assert stats == {
         "documents": 4,
         "vector_dirty": 3,
@@ -270,6 +304,7 @@ def test_collect_index_gauges_updates_returned_state_and_metrics(
     assert metrics.BROKEN_LINKS._value.get() == 1
     if expected is not None:
         assert metrics.SCHEMA_VERSION._value.get() == expected
+    assert db.conn.queries == _GAUGE_QUERIES
 
 
 def test_render_latest_returns_prometheus_payload():
@@ -284,6 +319,13 @@ async def test_prometheus_middleware_records_success_and_failure():
     request = _request()
     request.scope["route"] = SimpleNamespace(path="/foundation")
     success_before = metrics.HTTP_REQUESTS.labels("GET", "/foundation", "204")._value.get()
+    latency = metrics.HTTP_LATENCY.labels("GET", "/foundation")
+    latency_before = next(
+        sample.value
+        for family in latency.collect()
+        for sample in family.samples
+        if sample.name == "llmwiki_http_request_duration_seconds_count"
+    )
 
     async def succeed(_request):
         return PlainTextResponse("", 204)
@@ -294,6 +336,13 @@ async def test_prometheus_middleware_records_success_and_failure():
         metrics.HTTP_REQUESTS.labels("GET", "/foundation", "204")._value.get()
         == success_before + 1
     )
+    latency_after_success = next(
+        sample.value
+        for family in latency.collect()
+        for sample in family.samples
+        if sample.name == "llmwiki_http_request_duration_seconds_count"
+    )
+    assert latency_after_success == latency_before + 1
 
     failure_before = metrics.HTTP_REQUESTS.labels("GET", "/foundation", "500")._value.get()
 
@@ -306,6 +355,13 @@ async def test_prometheus_middleware_records_success_and_failure():
         metrics.HTTP_REQUESTS.labels("GET", "/foundation", "500")._value.get()
         == failure_before + 1
     )
+    latency_after_failure = next(
+        sample.value
+        for family in latency.collect()
+        for sample in family.samples
+        if sample.name == "llmwiki_http_request_duration_seconds_count"
+    )
+    assert latency_after_failure == latency_after_success + 1
 
 
 def test_wiki_error_serialization_and_recovery_hint_override():
