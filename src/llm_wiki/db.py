@@ -18,7 +18,11 @@ from pathlib import Path
 
 import sqlite_vec
 
-from .embedding_contract import EMBEDDING_PIPELINE, EmbeddingBinding
+from .embedding_contract import (
+    EMBEDDING_PIPELINE,
+    EmbeddingBinding,
+    EmbeddingBindingChanged,
+)
 
 SCHEMA_VERSION = 11
 
@@ -558,24 +562,120 @@ class Database:
         self._expected_embedding_binding = binding
         return binding
 
-    def rebind_model(self, embedding_model: str, embedding_dim: int) -> None:
-        """Re-point the DB at a (possibly new) embedding model: drop and recreate the
-        vector table at the new dimension and update the ``meta`` binding. ``initialize``
-        deliberately *refuses* a model change (the vector dim is fixed once chosen); this
-        is the supported migration path, driven by ``reindex --reembed``. It only resets
-        the binding + (empty) vector storage — the caller MUST re-embed every document
-        afterwards (``reindex_all(reembed=True)``)."""
+    def expected_embedding_binding(self) -> EmbeddingBinding:
+        """Return the immutable embedding generation expected by this process."""
+        binding = self._expected_embedding_binding
+        if binding is None:
+            raise RuntimeError(
+                "Embedding binding is not initialized for this Database instance."
+            )
+        return binding
+
+    def verify_embedding_binding(
+        self, conn: sqlite3.Connection, expected: EmbeddingBinding
+    ) -> None:
+        """Fence a transaction against a process-local embedding generation."""
+        if not conn.in_transaction:
+            raise RuntimeError(
+                "Embedding binding verification requires an active transaction."
+            )
+        values = {
+            key: get_meta(conn, key)
+            for key in (
+                "embedding_model",
+                "embedding_dim",
+                "embedding_pipeline",
+                "embedding_epoch",
+            )
+        }
+        try:
+            current = EmbeddingBinding(
+                model=values["embedding_model"] or "",
+                dim=int(values["embedding_dim"] or ""),
+                pipeline=values["embedding_pipeline"] or "",
+                epoch=int(values["embedding_epoch"] or ""),
+            )
+        except ValueError as exc:
+            raise EmbeddingBindingChanged(
+                "Database embedding binding is incomplete or invalid."
+            ) from exc
+        if current != expected:
+            raise EmbeddingBindingChanged(
+                f"Embedding binding changed from {expected} to {current}."
+            )
+
+    def rebind_model(
+        self,
+        embedding_model: str,
+        embedding_dim: int,
+        embedding_pipeline: str,
+    ) -> EmbeddingBinding:
+        """Atomically create a new embedding generation and dirty live documents."""
         if embedding_dim <= 0:
             raise ValueError("embedding dimension must be positive")
         self.ensure_schema()
         with self.writer() as conn:
+            values = {
+                key: get_meta(conn, key)
+                for key in (
+                    "embedding_model",
+                    "embedding_dim",
+                    "embedding_pipeline",
+                    "embedding_epoch",
+                )
+            }
+            model = values["embedding_model"]
+            dim = values["embedding_dim"]
+            pipeline = values["embedding_pipeline"]
+            raw_epoch = values["embedding_epoch"]
+            if all(value is None for value in values.values()):
+                previous_epoch = 0
+            elif (
+                model is not None
+                and dim is not None
+                and pipeline is None
+                and raw_epoch is None
+            ):
+                previous_epoch = 1
+            elif all(value is not None for value in values.values()):
+                assert raw_epoch is not None
+                try:
+                    previous_epoch = int(raw_epoch)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Database embedding epoch must be a valid integer before rebind."
+                    ) from exc
+                if previous_epoch <= 0:
+                    raise RuntimeError(
+                        "Database embedding epoch must be positive before rebind."
+                    )
+            else:
+                raise RuntimeError(
+                    "Database embedding binding is partial: model, dimension, "
+                    "pipeline, and epoch must be stored together."
+                )
+            binding = EmbeddingBinding(
+                embedding_model,
+                embedding_dim,
+                embedding_pipeline,
+                previous_epoch + 1,
+            )
             conn.execute("DROP TABLE IF EXISTS chunk_vectors")
             conn.execute(
                 f"CREATE VIRTUAL TABLE chunk_vectors USING vec0("
                 f"chunk_id INTEGER PRIMARY KEY, embedding float[{int(embedding_dim)}] distance_metric=cosine)"
             )
-            set_meta(conn, "embedding_model", embedding_model)
-            set_meta(conn, "embedding_dim", str(embedding_dim))
+            conn.execute(
+                "UPDATE documents SET vector_dirty="
+                "CASE WHEN is_deleted=0 THEN 1 ELSE 0 END"
+            )
+            set_meta(conn, "embedding_model", binding.model)
+            set_meta(conn, "embedding_dim", str(binding.dim))
+            set_meta(conn, "embedding_pipeline", binding.pipeline)
+            set_meta(conn, "embedding_epoch", str(binding.epoch))
+
+        self._expected_embedding_binding = binding
+        return binding
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

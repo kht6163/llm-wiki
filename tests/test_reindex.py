@@ -1,7 +1,10 @@
 """External-edit reconciliation + crash recovery (batch B). These paths had no
 coverage and guard the "DB is canonical; .md is a projection" invariant."""
+from types import SimpleNamespace
+
 import pytest
 
+from llm_wiki import _cli_impl
 from llm_wiki.util import path_norm
 
 
@@ -158,7 +161,7 @@ def test_rebind_model_recreates_vector_table_at_new_dim(ctx):
     from llm_wiki.db import get_meta
     from llm_wiki.embedding import Embedder
 
-    ctx.db.rebind_model("fake/other-model", 16)
+    ctx.db.rebind_model("fake/other-model", 16, ctx.embedder.pipeline)
     with ctx.db.reader() as conn:
         assert get_meta(conn, "embedding_model") == "fake/other-model"
         assert get_meta(conn, "embedding_dim") == "16"
@@ -170,13 +173,38 @@ def test_rebind_model_recreates_vector_table_at_new_dim(ctx):
         assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 1
 
 
+def test_cli_reindex_reembed_passes_current_embedding_pipeline(ctx, monkeypatch):
+    original_rebind = ctx.db.rebind_model
+    rebind_args = []
+    build_args = []
+
+    def rebind(model, dim, pipeline):
+        rebind_args.append((model, dim, pipeline))
+        return original_rebind(model, dim, pipeline)
+
+    def build_context(**kwargs):
+        build_args.append(kwargs)
+        return ctx
+
+    monkeypatch.setattr(ctx.db, "rebind_model", rebind)
+    monkeypatch.setattr(_cli_impl, "build_context", build_context)
+
+    assert _cli_impl._reindex(SimpleNamespace(reembed=True)) == 0
+    assert build_args == [{"full": False}]
+    assert rebind_args == [
+        (ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline)
+    ]
+
+
 def test_reindex_reembed_after_rebind_repopulates_vectors(ctx, principals):
     # The `reindex --reembed` flow rebinds the model (drops + recreates the vector table)
     # then re-embeds every document. Simulate it here with the SAME model (no dim change):
     # the re-embed must not crash and must repopulate chunk_vectors.
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "v.md", "# Vec\n\nsearchable 문서 본문 내용 here")
-    ctx.db.rebind_model(ctx.settings.embedding_model, ctx.embedder.dim)
+    ctx.db.rebind_model(
+        ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline
+    )
     with ctx.db.reader() as conn:
         assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 0  # dropped
     res = docs.reindex_all(reembed=True)
@@ -200,7 +228,9 @@ def test_initialize_refuses_model_change_but_rebind_recovers(ctx, principals):
     with pytest.raises(RuntimeError):
         ctx.db.initialize(ctx.settings.embedding_model, ctx.embedder.dim)
     # rebind + reembed recovers: the binding flips to the configured model and vectors rebuild.
-    ctx.db.rebind_model(ctx.settings.embedding_model, ctx.embedder.dim)
+    ctx.db.rebind_model(
+        ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline
+    )
     res = docs.reindex_all(reembed=True)
     assert res["embedded"] >= 1
     with ctx.db.reader() as conn:

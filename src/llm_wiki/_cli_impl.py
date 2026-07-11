@@ -239,7 +239,9 @@ def _reindex(args) -> int:
         if prev_model and prev_model != ctx.settings.embedding_model:
             print(f"Rebinding embedding model: {prev_model} (dim {prev_dim}) -> "
                   f"{ctx.settings.embedding_model} (dim {new_dim})")
-        ctx.db.rebind_model(ctx.settings.embedding_model, new_dim)
+        ctx.db.rebind_model(
+            ctx.settings.embedding_model, new_dim, ctx.embedder.pipeline
+        )
         print("Reindexing vault (re-embedding all documents)…")
     else:
         ctx = build_context(full=True)

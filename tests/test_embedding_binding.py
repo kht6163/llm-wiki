@@ -1,9 +1,12 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 
 from llm_wiki.db import Database, get_meta
 from llm_wiki.embedding import Embedder
+from llm_wiki.embedding_contract import EmbeddingBinding, EmbeddingBindingChanged
 
 MODEL = "test/embedding-model"
 DIM = 3
@@ -203,3 +206,234 @@ def test_missing_vector_table_recovery_rolls_back_when_dirty_marking_fails(tmp_p
                 "SELECT k, v FROM meta WHERE k LIKE 'embedding_%' ORDER BY k"
             ).fetchall()
         ) == binding_before
+
+
+def test_rebind_same_binding_tuple_increments_epoch(tmp_path):
+    db, original = _initialize(tmp_path)
+
+    rebound = db.rebind_model(MODEL, DIM, PIPELINE)
+
+    expected = EmbeddingBinding(MODEL, DIM, PIPELINE, original.epoch + 1)
+    assert rebound == expected
+    assert db.expected_embedding_binding() == expected
+    with db.reader() as conn:
+        conn.execute("BEGIN")
+        try:
+            assert get_meta(conn, "embedding_epoch") == str(expected.epoch)
+            db.verify_embedding_binding(conn, expected)
+        finally:
+            conn.execute("ROLLBACK")
+
+
+def test_verify_embedding_binding_requires_active_transaction(tmp_path):
+    db, binding = _initialize(tmp_path)
+
+    with db.reader() as conn:
+        assert not conn.in_transaction
+        with pytest.raises(RuntimeError, match="active transaction"):
+            db.verify_embedding_binding(conn, binding)
+
+
+def test_rebind_without_any_binding_starts_at_epoch_one(tmp_path):
+    db = Database(tmp_path / "wiki.db")
+    db.ensure_schema()
+
+    rebound = db.rebind_model(MODEL, DIM, PIPELINE)
+
+    assert rebound == EmbeddingBinding(MODEL, DIM, PIPELINE, 1)
+
+
+def test_rebind_legacy_model_and_dimension_advances_logical_epoch_one(tmp_path):
+    db, _ = _initialize(tmp_path)
+    with db.writer() as conn:
+        conn.execute("DELETE FROM meta WHERE k IN ('embedding_pipeline', 'embedding_epoch')")
+    db.close()
+    legacy = Database(tmp_path / "wiki.db")
+
+    rebound = legacy.rebind_model(MODEL, DIM, PIPELINE)
+
+    assert rebound == EmbeddingBinding(MODEL, DIM, PIPELINE, 2)
+
+
+def test_rebind_stores_new_binding_tuple_in_meta_and_local_token(tmp_path):
+    db, _ = _initialize(tmp_path)
+
+    rebound = db.rebind_model("test/new-model", DIM + 1, "passage-input-v2")
+
+    expected = EmbeddingBinding("test/new-model", DIM + 1, "passage-input-v2", 2)
+    assert rebound == expected
+    assert db.expected_embedding_binding() == expected
+    with db.reader() as conn:
+        stored = dict(
+            conn.execute(
+                "SELECT k, v FROM meta WHERE k LIKE 'embedding_%' ORDER BY k"
+            ).fetchall()
+        )
+    assert stored == {
+        "embedding_dim": str(DIM + 1),
+        "embedding_epoch": "2",
+        "embedding_model": "test/new-model",
+        "embedding_pipeline": "passage-input-v2",
+    }
+
+
+@pytest.mark.parametrize(
+    "present_keys",
+    [
+        ("embedding_model",),
+        ("embedding_dim",),
+        ("embedding_pipeline",),
+        ("embedding_epoch",),
+        ("embedding_model", "embedding_pipeline"),
+        ("embedding_model", "embedding_epoch"),
+        ("embedding_dim", "embedding_pipeline"),
+        ("embedding_dim", "embedding_epoch"),
+        ("embedding_pipeline", "embedding_epoch"),
+        ("embedding_model", "embedding_dim", "embedding_pipeline"),
+        ("embedding_model", "embedding_dim", "embedding_epoch"),
+        ("embedding_model", "embedding_pipeline", "embedding_epoch"),
+        ("embedding_dim", "embedding_pipeline", "embedding_epoch"),
+    ],
+)
+def test_rebind_rejects_partial_binding_states(tmp_path, present_keys):
+    db, original = _initialize(tmp_path)
+    all_keys = {
+        "embedding_model",
+        "embedding_dim",
+        "embedding_pipeline",
+        "embedding_epoch",
+    }
+    with db.writer() as conn:
+        for key in all_keys - set(present_keys):
+            conn.execute("DELETE FROM meta WHERE k=?", (key,))
+
+    with pytest.raises(RuntimeError, match="embedding binding"):
+        db.rebind_model(MODEL, DIM, PIPELINE)
+
+    assert db.expected_embedding_binding() == original
+
+
+def test_sequential_rebinds_from_different_instances_use_distinct_epochs(tmp_path):
+    db_a, epoch_one = _initialize(tmp_path)
+    db_b = Database(tmp_path / "wiki.db")
+    assert db_b.initialize(MODEL, DIM, PIPELINE) == epoch_one
+
+    epoch_two = db_a.rebind_model(MODEL, DIM, PIPELINE)
+    epoch_three = db_b.rebind_model(MODEL, DIM, PIPELINE)
+
+    assert (epoch_two.epoch, epoch_three.epoch) == (2, 3)
+
+
+def test_concurrent_rebinds_from_different_instances_serialize_epochs(tmp_path):
+    db_a, epoch_one = _initialize(tmp_path)
+    db_b = Database(tmp_path / "wiki.db")
+    assert db_b.initialize(MODEL, DIM, PIPELINE) == epoch_one
+    barrier = Barrier(2)
+
+    def rebind(db):
+        barrier.wait()
+        return db.rebind_model(MODEL, DIM, PIPELINE)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(rebind, (db_a, db_b)))
+
+    assert sorted(binding.epoch for binding in results) == [2, 3]
+
+
+def test_rebind_empties_vectors_and_resets_live_and_deleted_dirty_states(tmp_path):
+    db, _ = _initialize(tmp_path)
+    live_id = _insert_document(db, "live.md")
+    deleted_id = _insert_document(db, "deleted.md", deleted=True)
+    with db.writer() as conn:
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+            (101, Embedder.serialize([0.1] * DIM)),
+        )
+        conn.execute(
+            "UPDATE documents SET vector_dirty=1 WHERE id=?", (deleted_id,)
+        )
+
+    db.rebind_model(MODEL, DIM, PIPELINE)
+
+    with db.reader() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 0
+        states = dict(
+            conn.execute(
+                "SELECT id, vector_dirty FROM documents WHERE id IN (?, ?)",
+                (live_id, deleted_id),
+            ).fetchall()
+        )
+    assert states == {live_id: 1, deleted_id: 0}
+
+
+def test_rebind_rolls_back_vectors_binding_and_dirty_flags_on_failure(tmp_path):
+    db, original = _initialize(tmp_path)
+    live_id = _insert_document(db, "live.md")
+    deleted_id = _insert_document(db, "deleted.md", deleted=True)
+    with db.writer() as conn:
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+            (101, Embedder.serialize([0.1] * DIM)),
+        )
+        conn.execute(
+            "UPDATE documents SET vector_dirty=1 WHERE id=?", (deleted_id,)
+        )
+        binding_before = dict(
+            conn.execute(
+                "SELECT k, v FROM meta WHERE k LIKE 'embedding_%' ORDER BY k"
+            ).fetchall()
+        )
+        table_before = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='chunk_vectors'"
+        ).fetchone()[0]
+        states_before = dict(
+            conn.execute(
+                "SELECT id, vector_dirty FROM documents WHERE id IN (?, ?)",
+                (live_id, deleted_id),
+            ).fetchall()
+        )
+        conn.execute(
+            "CREATE TRIGGER fail_rebind_dirty_update "
+            "BEFORE UPDATE OF vector_dirty ON documents "
+            "BEGIN SELECT RAISE(ABORT, 'forced rebind dirty failure'); END"
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced rebind dirty failure"):
+        db.rebind_model("test/new-model", DIM + 1, "passage-input-v2")
+
+    assert db.expected_embedding_binding() == original
+    with db.reader() as conn:
+        assert conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name='chunk_vectors'"
+        ).fetchone()[0] == table_before
+        assert conn.execute("SELECT COUNT(*) FROM chunk_vectors").fetchone()[0] == 1
+        assert dict(
+            conn.execute(
+                "SELECT k, v FROM meta WHERE k LIKE 'embedding_%' ORDER BY k"
+            ).fetchall()
+        ) == binding_before
+        assert dict(
+            conn.execute(
+                "SELECT id, vector_dirty FROM documents WHERE id IN (?, ?)",
+                (live_id, deleted_id),
+            ).fetchall()
+        ) == states_before
+
+
+def test_rebind_updates_only_calling_database_expected_token(tmp_path):
+    db_a, epoch_one = _initialize(tmp_path)
+    db_b = Database(tmp_path / "wiki.db")
+    assert db_b.initialize(MODEL, DIM, PIPELINE) == epoch_one
+
+    epoch_two = db_b.rebind_model(MODEL, DIM, PIPELINE)
+
+    assert epoch_two.epoch == epoch_one.epoch + 1
+    assert db_a.expected_embedding_binding() == epoch_one
+    assert db_b.expected_embedding_binding() == epoch_two
+    with db_a.reader() as conn:
+        conn.execute("BEGIN")
+        try:
+            with pytest.raises(EmbeddingBindingChanged):
+                db_a.verify_embedding_binding(conn, epoch_one)
+        finally:
+            conn.execute("ROLLBACK")
