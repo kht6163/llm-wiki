@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import sqlite3
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -315,6 +315,28 @@ class Database:
                     pass
                 raise
 
+    @contextmanager
+    def _embedding_binding_writer(
+        self,
+    ) -> Iterator[tuple[sqlite3.Connection, Callable[[EmbeddingBinding], None]]]:
+        """Publish a staged local binding after its transaction commits.
+
+        The outer re-entrant lock keeps the commit and process-local token update
+        in the same serialization order as other binding changes on this instance.
+        """
+        staged: EmbeddingBinding | None = None
+
+        def stage(binding: EmbeddingBinding) -> None:
+            nonlocal staged
+            staged = binding
+
+        with self._write_lock:
+            with self.writer() as conn:
+                yield conn, stage
+            if staged is None:
+                raise RuntimeError("Embedding binding transaction did not stage a token.")
+            self._expected_embedding_binding = staged
+
     def close(self) -> None:
         """Close this thread's cached connection (mainly for tests/teardown)."""
         conn = getattr(self._local, "conn", None)
@@ -444,7 +466,7 @@ class Database:
         if embedding_dim <= 0:
             raise ValueError("embedding dimension must be positive")
         self.ensure_schema()
-        with self.writer() as conn:
+        with self._embedding_binding_writer() as (conn, stage_binding):
             values = {
                 key: get_meta(conn, key)
                 for key in (
@@ -559,7 +581,7 @@ class Database:
                         "`llm-wiki reindex --reembed` to rebuild vector storage."
                     )
 
-        self._expected_embedding_binding = binding
+            stage_binding(binding)
         return binding
 
     def expected_embedding_binding(self) -> EmbeddingBinding:
@@ -650,7 +672,7 @@ class Database:
         if embedding_dim <= 0:
             raise ValueError("embedding dimension must be positive")
         self.ensure_schema()
-        with self.writer() as conn:
+        with self._embedding_binding_writer() as (conn, stage_binding):
             values = {
                 key: get_meta(conn, key)
                 for key in (
@@ -710,7 +732,7 @@ class Database:
             set_meta(conn, "embedding_pipeline", binding.pipeline)
             set_meta(conn, "embedding_epoch", str(binding.epoch))
 
-        self._expected_embedding_binding = binding
+            stage_binding(binding)
         return binding
 
 

@@ -1,6 +1,6 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event, RLock, get_ident
 
 import pytest
 
@@ -12,6 +12,52 @@ from llm_wiki.embedding_contract import EmbeddingBinding, EmbeddingBindingChange
 MODEL = "test/embedding-model"
 DIM = 3
 PIPELINE = "passage-input-v1"
+
+
+class _PauseAfterFirstUnlock:
+    """Force a context switch immediately after one thread releases its RLock."""
+
+    def __init__(self):
+        self._lock = RLock()
+        self._depth: dict[int, int] = {}
+        self._first_thread: int | None = None
+        self._paused = False
+        self.first_unlocked = Event()
+        self.resume_first = Event()
+
+    def acquire(self, *args, **kwargs):
+        acquired = self._lock.acquire(*args, **kwargs)
+        if acquired:
+            thread_id = get_ident()
+            if self._first_thread is None:
+                self._first_thread = thread_id
+            self._depth[thread_id] = self._depth.get(thread_id, 0) + 1
+        return acquired
+
+    def release(self):
+        thread_id = get_ident()
+        depth = self._depth[thread_id] - 1
+        if depth:
+            self._depth[thread_id] = depth
+        else:
+            del self._depth[thread_id]
+        self._lock.release()
+        if (
+            thread_id == self._first_thread
+            and depth == 0
+            and not self._paused
+        ):
+            self._paused = True
+            self.first_unlocked.set()
+            if not self.resume_first.wait(timeout=5):
+                raise TimeoutError("second binding update did not finish")
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback):
+        self.release()
 
 
 def _initialize(tmp_path) -> tuple[Database, object]:
@@ -405,6 +451,35 @@ def test_concurrent_rebinds_from_different_instances_serialize_epochs(tmp_path):
         results = list(pool.map(rebind, (db_a, db_b)))
 
     assert sorted(binding.epoch for binding in results) == [2, 3]
+
+
+@pytest.mark.parametrize("first_operation", ["initialize", "rebind"])
+def test_same_instance_expected_binding_follows_transaction_commit_order(
+    tmp_path, monkeypatch, first_operation
+):
+    db, _ = _initialize(tmp_path)
+    monkeypatch.setattr(db, "ensure_schema", lambda: None)
+    coordinated_lock = _PauseAfterFirstUnlock()
+    db._write_lock = coordinated_lock
+
+    def first_update():
+        if first_operation == "initialize":
+            return db.initialize(MODEL, DIM, PIPELINE)
+        return db.rebind_model(MODEL, DIM, PIPELINE)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_update)
+        assert coordinated_lock.first_unlocked.wait(timeout=5)
+        second_future = pool.submit(db.rebind_model, MODEL, DIM, PIPELINE)
+        try:
+            second = second_future.result(timeout=5)
+        finally:
+            coordinated_lock.resume_first.set()
+        first_future.result(timeout=5)
+
+    assert db.expected_embedding_binding() == second
+    with db.reader() as conn:
+        assert get_meta(conn, "embedding_epoch") == str(second.epoch)
 
 
 def test_rebind_empties_vectors_and_resets_live_and_deleted_dirty_states(tmp_path):
