@@ -32,3 +32,6 @@ __pycache__/
 .coverage.*
 htmlcov/
 coverage.xml
+
+# Isolated Codex/Superpowers worktrees
+/.worktrees/
