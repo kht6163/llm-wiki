@@ -21,9 +21,11 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from itertools import groupby
+from itertools import groupby, islice
 from pathlib import Path
 from urllib.parse import quote
+
+import regex as regex_lib
 
 from .. import file_projection as fp
 from .. import graph, indexing, search
@@ -68,6 +70,9 @@ from .errors import (
     ValidationError,
     WikiError,
 )
+
+REGEX_TIMEOUT_S = 0.25
+MAX_PATCH_MATCHES = 10_000
 
 log = logging.getLogger("llm_wiki.documents")
 
@@ -2510,24 +2515,36 @@ class DocumentService:
             if len(find) > 1000:
                 raise ValidationError("regex pattern too long (max 1000 chars).")
             try:
-                pat = re.compile(find, re.MULTILINE)
-            except re.error as e:
+                pat = regex_lib.compile(find, regex_lib.MULTILINE)
+            except regex_lib.error as e:
                 raise ValidationError(f"invalid regex: {e}") from None
-            matches = list(pat.finditer(content))
-            n = len(matches)
-            if n == 0:
-                raise NotFoundError("Pattern not found; nothing patched.", path=rel)
-            if occurrence is not None:
-                if occurrence > n:
-                    raise ValidationError(f"occurrence {occurrence} out of range (1..{n}).")
-                m = matches[occurrence - 1]
-                new_body = content[:m.start()] + m.expand(replace) + content[m.end():]
-            else:
-                if count and n > count:
+            try:
+                matches = list(islice(
+                    pat.finditer(content, timeout=REGEX_TIMEOUT_S), MAX_PATCH_MATCHES + 1,
+                ))
+                if len(matches) > MAX_PATCH_MATCHES:
                     raise ValidationError(
-                        f"Pattern matches {n} times (limit {count}); narrow it, pass "
-                        f"'occurrence', or raise 'count'.")
-                new_body = pat.sub(replace, content, count=count or 0)
+                        f"Pattern matches more than {MAX_PATCH_MATCHES} times; narrow the pattern."
+                    )
+                n = len(matches)
+                if n == 0:
+                    raise NotFoundError("Pattern not found; nothing patched.", path=rel)
+                if occurrence is not None:
+                    if occurrence > n:
+                        raise ValidationError(f"occurrence {occurrence} out of range (1..{n}).")
+                    m = matches[occurrence - 1]
+                    new_body = content[:m.start()] + m.expand(replace) + content[m.end():]
+                else:
+                    if count and n > count:
+                        raise ValidationError(
+                            f"Pattern matches {n} times (limit {count}); narrow it, pass "
+                            f"'occurrence', or raise 'count'.")
+                    new_body = pat.sub(replace, content, count=count or 0,
+                                       timeout=REGEX_TIMEOUT_S)
+            except TimeoutError:
+                raise ValidationError(
+                    "regex evaluation timed out; narrow the pattern."
+                ) from None
         else:
             occurrences = content.count(find)
             if occurrences == 0:

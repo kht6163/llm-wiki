@@ -155,6 +155,38 @@ async def test_search_rejects_empty_query(editor_mcp):
     assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
+async def test_search_rejects_oversized_query_before_search(editor_mcp, ctx, monkeypatch, caplog):
+    secret_query = "private-query-" + "q" * 4097
+    monkeypatch.setattr(ctx.docs, "search_page", lambda *args, **kwargs: pytest.fail(
+        "oversized query reached search"))
+
+    d = _payload(await editor_mcp.call_tool("search_documents", {"query": secret_query}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+    assert secret_query not in caplog.text
+
+
+async def test_search_rejects_too_many_tags_before_search(editor_mcp, ctx, monkeypatch, caplog):
+    secret_tag = "private-tag-value"
+    tags = [f"tag-{index}" for index in range(100)] + [secret_tag]
+    monkeypatch.setattr(ctx.docs, "search_page", lambda *args, **kwargs: pytest.fail(
+        "oversized tag list reached search"))
+
+    d = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "bounded", "tags": tags}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+    assert secret_tag not in caplog.text
+
+
+@pytest.mark.parametrize("top_k", [0, 51])
+async def test_search_rejects_out_of_range_top_k_with_structured_error(editor_mcp, top_k):
+    d = _payload(await editor_mcp.call_tool(
+        "search_documents", {"query": "bounded", "top_k": top_k}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
 async def test_search_path_operator_and_triage_metadata(editor_mcp):
     # An agent narrows by path in ONE call (no post-filtering) and reads content_length/
     # section_depth off each hit to triage which to open without a follow-up read.
@@ -343,6 +375,20 @@ async def test_resolve_links_tool(editor_mcp):
     assert d["unresolved"] == ["ghosttarget"]
 
 
+async def test_resolve_links_rejects_too_many_targets_before_db(
+    editor_mcp, ctx, monkeypatch, caplog,
+):
+    secret_target = "private-resolve-target"
+    targets = [f"target-{index}" for index in range(500)] + [secret_target]
+    monkeypatch.setattr(ctx.docs, "resolve_link", lambda *args, **kwargs: pytest.fail(
+        "oversized target list reached resolver"))
+
+    d = _payload(await editor_mcp.call_tool("resolve_links", {"targets": targets}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+    assert secret_target not in caplog.text
+
+
 async def test_edit_documents_batch_applies_all(editor_mcp):
     ops = [
         {"op": "create", "path": "m1.md", "content": "# M1\n\na"},
@@ -352,6 +398,19 @@ async def test_edit_documents_batch_applies_all(editor_mcp):
     d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": ops}))
     assert d["ok"] and d["applied"] == 3 and d["failed"] == 0
     assert all(r["ok"] for r in d["results"])
+
+
+async def test_edit_documents_rejects_nested_oversized_tag_list_before_write(editor_mcp, ctx):
+    tags = [f"tag-{index}" for index in range(101)]
+
+    d = _payload(await editor_mcp.call_tool("edit_documents", {"operations": [{
+        "op": "create", "path": "oversized-batch-tags.md", "content": "unchanged",
+        "tags": tags,
+    }]}))
+
+    assert d["ok"] is True and d["failed"] == 1
+    assert d["results"][0]["error"]["code"] == "validation"
+    assert ctx.docs.exists("oversized-batch-tags.md") is False
 
 
 async def test_edit_documents_stop_on_error(editor_mcp):
@@ -900,6 +959,32 @@ async def test_assemble_context_rejects_empty_question(editor_mcp):
     assert d["ok"] is False and d["error"]["code"] == "validation"
 
 
+async def test_assemble_context_rejects_oversized_question_before_embedding(
+    editor_mcp, ctx, monkeypatch, caplog,
+):
+    secret_question = "private-question-" + "q" * 4097
+    monkeypatch.setattr(ctx.docs, "assemble_context", lambda *args, **kwargs: pytest.fail(
+        "oversized question reached embedding"))
+
+    d = _payload(await editor_mcp.call_tool(
+        "assemble_context", {"question": secret_question}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+    assert secret_question not in caplog.text
+
+
+@pytest.mark.parametrize("arguments", [
+    {"depth": 0},
+    {"depth": 4},
+    {"limit": 0},
+    {"limit": 2001},
+])
+async def test_graph_rejects_out_of_range_limits_with_structured_error(editor_mcp, arguments):
+    d = _payload(await editor_mcp.call_tool("get_graph", arguments))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+
+
 async def test_internal_error_returns_structured_envelope(ctx, principals, monkeypatch):
     # A non-WikiError raised inside a tool body must still reach the agent as the
     # structured {ok:false, error:{code:"internal"}} envelope, not a raw protocol
@@ -1205,6 +1290,22 @@ async def test_merge_tags_folds_sources(editor_mcp):
     for path in ("m1.md", "m2.md"):
         tags = _payload(await editor_mcp.call_tool("read_document", {"path": path}))["tags"]
         assert "in-progress" in tags and "draft" not in tags and "wip" not in tags
+
+
+async def test_merge_tags_limit_does_not_audit_raw_tags(editor_mcp, ctx, caplog):
+    secret_tag = "private-merge-tag"
+    sources = [f"source-{index}" for index in range(100)] + [secret_tag]
+
+    d = _payload(await editor_mcp.call_tool(
+        "merge_tags", {"sources": sources, "dest": "merged"}))
+
+    assert d["ok"] is False and d["error"]["code"] == "validation"
+    with ctx.db.reader() as conn:
+        rows = conn.execute(
+            "SELECT target, detail FROM audit_log WHERE action='doc_update' AND outcome='validation'"
+        ).fetchall()
+    assert secret_tag not in json.dumps([dict(row) for row in rows])
+    assert secret_tag not in caplog.text
 
 
 async def test_rename_tag_forbidden_for_viewer(ctx, principals, monkeypatch):

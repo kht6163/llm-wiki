@@ -137,6 +137,28 @@ def test_patch_regex_no_match_and_bad_pattern(docs, principals):
         docs.patch(p, "g.md", r"(unclosed", "X", mode="regex")
 
 
+def test_patch_regex_timeout_preserves_document(docs, principals):
+    p = principals["editor"]
+    original = "a" * 10_000 + "!"
+    docs.create(p, "slow-regex.md", original)
+
+    with pytest.raises(ValidationError, match="regex evaluation timed out; narrow the pattern"):
+        docs.patch(p, "slow-regex.md", r"(a+)+$", "X", mode="regex")
+
+    assert docs.get("slow-regex.md")["content"] == original
+
+
+def test_patch_regex_rejects_more_than_max_matches_without_editing(docs, principals):
+    p = principals["editor"]
+    original = "x" * 10_001
+    docs.create(p, "many-regex-matches.md", original)
+
+    with pytest.raises(ValidationError, match="more than 10000 times; narrow the pattern"):
+        docs.patch(p, "many-regex-matches.md", "x", "y", mode="regex", count=0)
+
+    assert docs.get("many-regex-matches.md")["content"] == original
+
+
 def test_patch_occurrence_out_of_range(docs, principals):
     p = principals["editor"]
     docs.create(p, "o.md", "k k")

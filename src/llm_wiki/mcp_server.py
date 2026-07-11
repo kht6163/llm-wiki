@@ -35,6 +35,27 @@ from .util import clamp_int, normalize_client_ip
 
 log = logging.getLogger("llm_wiki.mcp")
 
+MAX_QUERY_CHARS = 4096
+MAX_TAGS = 100
+MAX_RESOLVE_TARGETS = 500
+
+
+def _validate_text(value: str, name: str) -> None:
+    if not value or not value.strip():
+        raise ValidationError(f"{name} must not be empty.")
+    if len(value) > MAX_QUERY_CHARS:
+        raise ValidationError(f"{name} is too long (max {MAX_QUERY_CHARS} chars).")
+
+
+def _validate_items(values: list[str] | None, name: str, maximum: int) -> None:
+    if values is not None and len(values) > maximum:
+        raise ValidationError(f"too many {name} (max {maximum} per call).")
+
+
+def _validate_range(value: int, name: str, minimum: int, maximum: int) -> None:
+    if value < minimum or value > maximum:
+        raise ValidationError(f"{name} must be between {minimum} and {maximum}.")
+
 
 def _request(ctx: Context):
     # ctx.request_context raises if accessed outside an active request (e.g. a
@@ -309,7 +330,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         query: str,
         mode: Annotated[Literal["hybrid", "bm25", "vector"],
                         Field(description="Ranking mode.")] = "hybrid",
-        top_k: Annotated[int, Field(ge=1, le=50, description="Max hits (1..50).")] = 10,
+        top_k: Annotated[int, Field(description="Max hits (1..50).")] = 10,
         folder: Annotated[str | None, Field(description="Restrict to this folder subtree.")] = None,
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
         since: Annotated[str | None,
@@ -318,8 +339,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                          Field(description="ISO-8601 upper bound on updated_at.")] = None,
     ) -> dict:
         def fn(p: Principal) -> dict:
-            if not query or not query.strip():
-                raise ValidationError("query must not be empty.")
+            _validate_text(query, "query")
+            _validate_items(tags, "tags", MAX_TAGS)
+            _validate_range(top_k, "top_k", 1, 50)
             _throttle_read(p, "search_documents")
             results, truncated = docs.search_page(query, mode=mode, top_k=top_k,
                                                   folder=folder, tags=tags, since=since, until=until)
@@ -352,6 +374,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         tags: Annotated[list[str] | None, Field(description="Require ALL of these tags.")] = None,
     ) -> dict:
         def fn(p: Principal) -> dict:
+            _validate_text(question, "question")
+            _validate_items(tags, "tags", MAX_TAGS)
             _throttle_read(p, "assemble_context")
             return {"ok": True, **docs.assemble_context(
                 question, max_chars=max_chars, max_sources=max_sources,
@@ -427,6 +451,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                         Field(description="Sort order.")] = "updated_at",
     ) -> dict:
         def fn(_p: Principal) -> dict:
+            _validate_items(tags, "tags", MAX_TAGS)
             items = docs.list_docs(folder=folder, tag=tag, tags=tags, limit=limit,
                                    offset=offset, sort=sort)
             total = docs.count(folder=folder, tag=tag, tags=tags)
@@ -568,6 +593,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                              Field(description="Source document (for same-folder preference).")] = None,
     ) -> dict:
         def fn(_p: Principal) -> dict:
+            _validate_items(targets, "targets", MAX_RESOLVE_TARGETS)
             resolved = {t: docs.resolve_link(t, from_path) for t in (targets or [])}
             return {"ok": True, "resolved": resolved,
                     "unresolved": [t for t, v in resolved.items() if v is None]}
@@ -611,12 +637,16 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "whole vault; otherwise BFS to 'depth' around the root document.")
     async def get_graph(
         ctx: Context, root: str | None = None,
-        depth: Annotated[int, Field(ge=1, le=3, description="BFS depth around root (1..3).")] = 1,
-        limit: Annotated[int, Field(ge=1, le=2000, description="Max nodes (1..2000).")] = 500,
+        depth: Annotated[int, Field(description="BFS depth around root (1..3).")] = 1,
+        limit: Annotated[int, Field(description="Max nodes (1..2000).")] = 500,
         include_unresolved: bool = True,
     ) -> dict:
-        return await _call(ctx, lambda _p: docs.graph(
-            root=root, depth=depth, limit=limit, include_unresolved=include_unresolved), "get_graph")
+        def fn(_p: Principal) -> dict:
+            _validate_range(depth, "depth", 1, 3)
+            _validate_range(limit, "limit", 1, 2000)
+            return docs.graph(root=root, depth=depth, limit=limit,
+                              include_unresolved=include_unresolved)
+        return await _call(ctx, fn, "get_graph")
 
     # ---- write tools (editor/admin) -------------------------------------
     @mcp.tool(description="Create a new document. Fails with code 'conflict' if the path "
@@ -630,8 +660,11 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                   Field(description="'full' echoes the body (and current_content on a "
                                         "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **_shape_write(
-            docs.create(p, path, content, title, tags), return_content)}, "create_document",
+        def fn(p: Principal) -> dict:
+            _validate_items(tags, "tags", MAX_TAGS)
+            return {"ok": True, **_shape_write(
+                docs.create(p, path, content, title, tags), return_content)}
+        return await _call(ctx, fn, "create_document",
             shape=lambda d: _shape_conflict(d, return_content),
             audit_action="doc_create", audit_target=path)
 
@@ -648,8 +681,11 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                                   Field(description="'full' echoes the body (and current_content on a "
                                         "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **_shape_write(docs.update(
-            p, path, base_version, content, title, tags), return_content)}, "update_document",
+        def fn(p: Principal) -> dict:
+            _validate_items(tags, "tags", MAX_TAGS)
+            return {"ok": True, **_shape_write(docs.update(
+                p, path, base_version, content, title, tags), return_content)}
+        return await _call(ctx, fn, "update_document",
             shape=lambda d: _shape_conflict(d, return_content),
             audit_action="doc_update", audit_target=path)
 
@@ -771,8 +807,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         add: Annotated[list[str] | None, Field(description="Tags to add.")] = None,
         remove: Annotated[list[str] | None, Field(description="Tags to remove.")] = None,
     ) -> dict:
-        return await _call(ctx, lambda p: {"ok": True, **docs.patch_tags(p, path, add=add, remove=remove)},
-                           "patch_tags", audit_action="doc_update", audit_target=path)
+        def fn(p: Principal) -> dict:
+            _validate_items(add, "tags to add", MAX_TAGS)
+            _validate_items(remove, "tags to remove", MAX_TAGS)
+            return {"ok": True, **docs.patch_tags(p, path, add=add, remove=remove)}
+        return await _call(ctx, fn, "patch_tags",
+                           audit_action="doc_update", audit_target=path)
 
     @mcp.tool(description="Set or replace a single frontmatter property without rewriting the body "
                           "(editor/admin only) — e.g. status, aliases, due, author. 'value' is a "
@@ -955,12 +995,16 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         sources: Annotated[list[str], Field(description="Tags to fold into 'dest'.")],
         dest: Annotated[str, Field(description="The surviving tag.")],
     ) -> dict:
+        def fn(p: Principal) -> dict:
+            _validate_items(sources, "source tags", MAX_TAGS)
+            return docs.merge_tags(p, sources, dest)
         return await _call(
             ctx,
-            lambda p: docs.merge_tags(p, sources, dest),
+            fn,
             "merge_tags",
             audit_action="doc_update",
-            audit_target=f"tags:{','.join(sources)} -> {dest}",
+            audit_target=(f"tags:{','.join(sources)} -> {dest}"
+                          if len(sources) <= MAX_TAGS else f"tags:count={len(sources)}"),
         )
 
     @mcp.tool(description="Rename/move a document to a new path, preserving history and "
@@ -1034,9 +1078,18 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda p: docs.purge(p, path), "purge_document",
                            audit_action="doc_purge", audit_target=path)
 
+    def _validate_op_collections(raw: dict) -> None:
+        op = raw.get("op")
+        if op in {"create", "update"}:
+            _validate_items(raw.get("tags"), "tags", MAX_TAGS)
+        elif op == "patch_tags":
+            _validate_items(raw.get("add"), "tags to add", MAX_TAGS)
+            _validate_items(raw.get("remove"), "tags to remove", MAX_TAGS)
+
     def _apply_op(principal: Principal, raw: dict) -> dict:
         """Dispatch one batch operation to the matching single-document service call
         (each keeps its own CAS guard, audit entry, and live-change event)."""
+        _validate_op_collections(raw)
         op = raw.get("op")
         if op == "rename_references":
             old, new = raw.get("old_path") or raw.get("path"), raw.get("new_path")
@@ -1159,6 +1212,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         try:
             if not principal.can_write:
                 raise ForbiddenError(f"Role '{principal.role}' cannot modify documents.")
+            _validate_op_collections(raw)
             if op == "rename_references":
                 old, new = raw.get("old_path") or raw.get("path"), raw.get("new_path")
                 if not isinstance(old, str) or not isinstance(new, str):
