@@ -45,6 +45,57 @@ def test_real_worker_sweeps_dirty(ctx, principals):
         worker.stop()
 
 
+def test_worker_sweeps_backlog_across_multiple_document_pages(
+    ctx, principals, monkeypatch
+):
+    doc_ids = []
+    for index in range(5):
+        path = f"worker-page-{index}.md"
+        ctx.docs.create(
+            principals["editor"], path, f"# P{index}\n\nworker backlog {index}"
+        )
+        with ctx.db.reader() as conn:
+            doc_ids.append(
+                conn.execute(
+                    "SELECT id FROM documents WHERE path=?", (path,)
+                ).fetchone()[0]
+            )
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "DELETE FROM chunk_vectors WHERE chunk_id IN "
+            "(SELECT id FROM chunks WHERE doc_id IN (?,?,?,?,?))",
+            doc_ids,
+        )
+        conn.execute(
+            "UPDATE documents SET vector_dirty=1 WHERE id IN (?,?,?,?,?)", doc_ids
+        )
+
+    real_embed_pending = indexing.embed_pending
+
+    def sweep_with_small_pages(db, embedder):
+        return real_embed_pending(db, embedder, doc_batch_size=2)
+
+    monkeypatch.setattr(indexing, "embed_pending", sweep_with_small_pages)
+    worker = indexing.EmbeddingWorker(ctx.db, ctx.embedder, idle_interval=0.05)
+    worker.start()
+    try:
+        worker.notify()
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            with ctx.db.reader() as conn:
+                dirty = conn.execute(
+                    "SELECT COUNT(*) FROM documents "
+                    "WHERE id IN (?,?,?,?,?) AND vector_dirty=1",
+                    doc_ids,
+                ).fetchone()[0]
+            if dirty == 0:
+                break
+            time.sleep(0.1)
+        assert dirty == 0
+    finally:
+        worker.stop()
+
+
 def test_default_context_embeds_inline(ctx, principals):
     # The default build_context has no worker -> inline embedding -> not dirty after write.
     ctx.docs.create(principals["editor"], "inline.md", "# I\n\n" + "gamma " * 40)

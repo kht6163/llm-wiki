@@ -219,69 +219,127 @@ def embed_doc(
     return True
 
 
-def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64,
-                  progress: Callable[[int, int], None] | None = None) -> int:
+def embed_pending(
+    db,
+    embedder: Embedder,
+    doc_id: int | None = None,
+    batch_size: int = 64,
+    progress: Callable[[int, int], None] | None = None,
+    doc_batch_size: int = 64,
+) -> int:
     """Embed a single doc, or sweep all docs with vector_dirty=1. Returns the number
     of documents whose vectors were brought up to date. ``progress``, if given, is
-    called ``progress(done_chunks, total_chunks)`` after each batch — used by the
-    reindex CLI to show a progress line on a long re-embed.
+    called ``progress(done_chunks, total_chunks)`` when snapshot progress advances
+    after a batch and once at completion — used by the reindex CLI to show a progress
+    line on a long re-embed.
 
-    The sweep path (doc_id is None, used by reindex) batches the expensive encode
-    across *all* dirty chunks, then writes in one transaction. The write is verified
-    per document — exactly like embed_doc — so vector_dirty is cleared ONLY for docs
-    whose current chunk set was fully embedded with matching (chunk_id, text). This
-    prevents a doc created or rechunked mid-sweep (possibly from another process) from
-    being marked clean without its vectors and then never retried."""
-    if doc_id is not None:
-        embed_doc(db, embedder, doc_id)
-        return 1
+    A full sweep snapshots only scalar progress bounds, then keyset-pages document IDs.
+    Each document is encoded and atomically published independently through
+    :func:`embed_doc`; a document race therefore stays dirty without starving later
+    IDs, while an encoder or binding error stops the sweep without rolling back prior
+    document commits."""
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if doc_batch_size <= 0:
+        raise ValueError("doc_batch_size must be positive")
+
+    if doc_id is not None and progress is None:
+        return int(embed_doc(db, embedder, doc_id, batch_size=batch_size))
 
     with db.reader() as conn:
-        dirty = [r[0] for r in conn.execute(
-            "SELECT id FROM documents WHERE vector_dirty=1 AND is_deleted=0")]
-        rows = conn.execute(
-            "SELECT c.id AS chunk_id, c.text AS text, c.heading_path AS heading_path "
-            "FROM chunks c JOIN documents d ON d.id=c.doc_id "
-            "WHERE d.vector_dirty=1 AND d.is_deleted=0 ORDER BY c.doc_id, c.ordinal"
-        ).fetchall()
-    if not dirty:
-        return 0
-    texts = [_embed_text(r) for r in rows]
-    log.info("embed_pending: embedding %d chunk(s) across %d document(s)", len(texts), len(dirty))
-    vectors: list = []
-    t0 = time.perf_counter()
-    total = len(texts)
-    for i in range(0, total, batch_size):
-        vectors.extend(embedder.embed_passages(texts[i:i + batch_size]))
-        if progress is not None:
-            progress(min(i + batch_size, total), total)
-    EMBED_DURATION.observe(time.perf_counter() - t0)
-    EMBED_CHUNKS.inc(len(texts))
-    embedded = {r["chunk_id"]: (r["text"], emb) for r, emb in zip(rows, vectors, strict=False)}
+        params: tuple[int, ...] = () if doc_id is None else (doc_id,)
+        doc_filter = "" if doc_id is None else " AND d.id=?"
+        if progress is None:
+            stats = conn.execute(
+                "SELECT COALESCE(MAX(d.id), 0) AS max_id, "
+                "COUNT(*) AS doc_count FROM documents d "
+                f"WHERE d.vector_dirty=1 AND d.is_deleted=0{doc_filter}",
+                params,
+            ).fetchone()
+        else:
+            stats = conn.execute(
+                "SELECT COALESCE(MAX(d.id), 0) AS max_id, COUNT(*) AS doc_count, "
+                "COALESCE(SUM((SELECT COUNT(*) FROM chunks c "
+                "WHERE c.doc_id=d.id)), 0) AS chunk_count "
+                "FROM documents d "
+                f"WHERE d.vector_dirty=1 AND d.is_deleted=0{doc_filter}",
+                params,
+            ).fetchone()
 
+    max_id = int(stats["max_id"] or 0)
+    target_docs = int(stats["doc_count"])
+    total_chunks = int(stats["chunk_count"]) if progress is not None else 0
+    done_chunks = 0
+    last_progress: tuple[int, int] | None = None
+
+    def on_batch(count: int) -> None:
+        nonlocal done_chunks, last_progress
+        done_chunks = min(done_chunks + count, total_chunks)
+        next_progress = (done_chunks, total_chunks)
+        if progress is not None and next_progress != last_progress:
+            last_progress = next_progress
+            progress(*next_progress)
+
+    def finish_progress() -> None:
+        complete = (total_chunks, total_chunks)
+        if progress is not None and last_progress != complete:
+            progress(*complete)
+
+    if doc_id is not None:
+        published = embed_doc(
+            db,
+            embedder,
+            doc_id,
+            batch_size=batch_size,
+            on_batch=on_batch if progress is not None else None,
+        )
+        finish_progress()
+        return int(published)
+
+    if not target_docs:
+        finish_progress()
+        return 0
+
+    if progress is None:
+        log.info("embed_pending: embedding %d document(s)", target_docs)
+    else:
+        log.info(
+            "embed_pending: embedding %d chunk(s) across %d document(s)",
+            total_chunks,
+            target_docs,
+        )
     cleared = 0
-    with db.writer() as conn:
-        for did in dirty:
-            current = {
-                r["id"]: r["text"]
-                for r in conn.execute("SELECT id, text FROM chunks WHERE doc_id=?", (did,))
-            }
-            all_matched = True
-            for cid, ctext in current.items():
-                hit = embedded.get(cid)
-                if hit is not None and hit[0] == ctext:
-                    # vec0 doesn't honor INSERT OR REPLACE; delete any prior vector first.
-                    conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (cid,))
-                    conn.execute(
-                        "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
-                        (cid, Embedder.serialize(hit[1])),
-                    )
-                else:
-                    all_matched = False
-            if all_matched:  # fully (re)embedded — also true for a chunk-less doc
-                conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (did,))
+    last_id = 0
+    while last_id < max_id:
+        with db.reader() as conn:
+            page = tuple(
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM documents "
+                    "WHERE vector_dirty=1 AND is_deleted=0 AND id>? AND id<=? "
+                    "ORDER BY id LIMIT ?",
+                    (last_id, max_id, doc_batch_size),
+                ).fetchall()
+            )
+        if not page:
+            break
+        for pending_id in page:
+            last_id = pending_id
+            if embed_doc(
+                db,
+                embedder,
+                pending_id,
+                batch_size=batch_size,
+                on_batch=on_batch if progress is not None else None,
+            ):
                 cleared += 1
-    log.info("embed_pending: cleared vector_dirty on %d/%d document(s)", cleared, len(dirty))
+
+    finish_progress()
+    log.info(
+        "embed_pending: cleared vector_dirty on %d/%d document(s)",
+        cleared,
+        target_docs,
+    )
     return cleared
 
 

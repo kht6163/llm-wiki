@@ -1,11 +1,15 @@
 """Embedding maintenance (batch B): vectors land for the current chunk set, and the
 dirty flag survives a concurrent rechunk so the new chunks are not orphaned."""
+import logging
+import sqlite3
+
 import pytest
 from prometheus_client import REGISTRY
 
 from llm_wiki import indexing
 from llm_wiki.db import Database
 from llm_wiki.embedding_contract import EmbeddingBindingChanged
+from llm_wiki.services.documents import DocumentService
 
 
 def _doc_id(ctx, norm):
@@ -46,6 +50,18 @@ def _mark_dirty_without_vectors(ctx, doc_id):
             (doc_id,),
         )
         conn.execute("UPDATE documents SET vector_dirty=1 WHERE id=?", (doc_id,))
+
+
+def _create_dirty_docs(ctx, principals, prefix, count):
+    docs, principal = ctx.docs, principals["editor"]
+    doc_ids = []
+    for index in range(count):
+        path = f"{prefix}-{index}.md"
+        docs.create(principal, path, f"# T{index}\n\nbody passage {index}")
+        doc_id = _doc_id(ctx, path)
+        _mark_dirty_without_vectors(ctx, doc_id)
+        doc_ids.append(doc_id)
+    return doc_ids
 
 
 def _replace_with_chunks(ctx, doc_id, count):
@@ -361,6 +377,321 @@ def test_embed_pending_sweep_clears_dirty(ctx, principals):
     assert _dirty(ctx, doc_id) == 0
 
 
+def test_embed_pending_drains_multiple_keyset_pages(ctx, principals):
+    doc_ids = _create_dirty_docs(ctx, principals, "paged", 5)
+
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_batch_size=2
+    ) == len(doc_ids)
+    assert [_dirty(ctx, doc_id) for doc_id in doc_ids] == [0] * len(doc_ids)
+    assert all(_vector_count(ctx, doc_id) > 0 for doc_id in doc_ids)
+
+
+def test_embed_pending_without_progress_does_not_read_chunks_for_empty_backlog(ctx):
+    with ctx.db.reader() as conn:
+        def deny_chunk_reads(action, table, _column, _database, _trigger):
+            if action == sqlite3.SQLITE_READ and table == "chunks":
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(deny_chunk_reads)
+        try:
+            assert indexing.embed_pending(ctx.db, ctx.embedder) == 0
+        finally:
+            conn.set_authorizer(None)
+
+
+def test_embed_pending_without_progress_logs_only_document_count(
+    ctx, principals, caplog
+):
+    doc_ids = _create_dirty_docs(ctx, principals, "log-backlog", 2)
+    caplog.set_level(logging.INFO, logger="llm_wiki.indexing")
+
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_batch_size=1
+    ) == len(doc_ids)
+
+    start_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "llm_wiki.indexing"
+        and record.getMessage().startswith("embed_pending: embedding")
+    ]
+    assert start_messages == ["embed_pending: embedding 2 document(s)"]
+
+
+def test_embed_pending_progress_stats_plan_avoids_temp_btree(ctx):
+    statements = []
+    events = []
+    with ctx.db.reader() as conn:
+        conn.set_trace_callback(statements.append)
+        try:
+            assert indexing.embed_pending(
+                ctx.db,
+                ctx.embedder,
+                progress=lambda done, total: events.append((done, total)),
+            ) == 0
+        finally:
+            conn.set_trace_callback(None)
+
+        stats_sql = next(
+            statement for statement in statements if "AS chunk_count" in statement
+        )
+        plan = [
+            row["detail"]
+            for row in conn.execute(f"EXPLAIN QUERY PLAN {stats_sql}").fetchall()
+        ]
+
+    assert events == [(0, 0)]
+    assert not any("USE TEMP B-TREE" in detail for detail in plan)
+    assert any("idx_chunks_doc_ord" in detail for detail in plan)
+
+
+def test_embed_pending_keeps_prior_commit_when_later_encoder_fails(
+    ctx, principals, monkeypatch
+):
+    doc_ids = _create_dirty_docs(ctx, principals, "partial", 3)
+    real = ctx.embedder.embed_passages
+    calls = 0
+
+    def fail_second_document(texts):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second document failed")
+        return real(texts)
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", fail_second_document)
+
+    with pytest.raises(RuntimeError, match="second document failed"):
+        indexing.embed_pending(
+            ctx.db, ctx.embedder, batch_size=1, doc_batch_size=2
+        )
+
+    assert [_dirty(ctx, doc_id) for doc_id in doc_ids] == [0, 1, 1]
+    assert _vector_count(ctx, doc_ids[0]) > 0
+    assert _vector_count(ctx, doc_ids[1]) == 0
+    assert _vector_count(ctx, doc_ids[2]) == 0
+
+
+def test_embed_pending_keeps_prior_commit_when_later_progress_callback_fails(
+    ctx, principals
+):
+    doc_ids = _create_dirty_docs(ctx, principals, "progress-failure", 3)
+    events = []
+
+    def fail_on_second_document(done, total):
+        events.append((done, total))
+        if done == 2:
+            raise RuntimeError("progress callback failed")
+
+    with pytest.raises(RuntimeError, match="progress callback failed"):
+        indexing.embed_pending(
+            ctx.db,
+            ctx.embedder,
+            batch_size=1,
+            doc_batch_size=1,
+            progress=fail_on_second_document,
+        )
+
+    assert events == [(1, 3), (2, 3)]
+    assert [_dirty(ctx, doc_id) for doc_id in doc_ids] == [0, 1, 1]
+    assert _vector_count(ctx, doc_ids[0]) > 0
+    assert _vector_count(ctx, doc_ids[1]) == 0
+    assert _vector_count(ctx, doc_ids[2]) == 0
+
+
+def test_embed_pending_single_doc_returns_cas_result_and_forwards_batch_size(
+    ctx, principals, monkeypatch
+):
+    docs, principal = ctx.docs, principals["editor"]
+    docs.create(principal, "single.md", "placeholder")
+    doc_id = _doc_id(ctx, "single.md")
+    _replace_with_chunks(ctx, doc_id, 3)
+    real = ctx.embedder.embed_passages
+    call_sizes = []
+    raced = False
+
+    def race_once(texts):
+        nonlocal raced
+        call_sizes.append(len(texts))
+        outputs = real(texts)
+        if not raced:
+            raced = True
+            with ctx.db.writer() as conn:
+                conn.execute(
+                    "UPDATE documents SET version=version+1 WHERE id=?", (doc_id,)
+                )
+        return outputs
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", race_once)
+
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_id=doc_id, batch_size=2
+    ) == 0
+    assert _dirty(ctx, doc_id) == 1
+    assert call_sizes == [2, 1]
+
+    call_sizes.clear()
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_id=doc_id, batch_size=2
+    ) == 1
+    assert _dirty(ctx, doc_id) == 0
+    assert call_sizes == [2, 1]
+
+
+def test_embed_pending_reports_monotonic_progress_per_model_batch(
+    ctx, principals, monkeypatch
+):
+    doc_ids = _create_dirty_docs(ctx, principals, "progress", 2)
+    _replace_with_chunks(ctx, doc_ids[0], 3)
+    _replace_with_chunks(ctx, doc_ids[1], 2)
+    events = []
+    call_sizes = []
+
+    def fake_embed(texts):
+        call_sizes.append(len(texts))
+        return [[0.1] * ctx.embedder.dim for _text in texts]
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", fake_embed)
+
+    assert indexing.embed_pending(
+        ctx.db,
+        ctx.embedder,
+        batch_size=2,
+        doc_batch_size=1,
+        progress=lambda done, total: events.append((done, total)),
+    ) == 2
+
+    assert call_sizes == [2, 1, 2]
+    assert events == [(2, 5), (3, 5), (5, 5)]
+    assert events == sorted(events)
+
+
+def test_embed_pending_reports_completion_once_when_chunk_total_grows(
+    ctx, principals, monkeypatch
+):
+    docs, principal = ctx.docs, principals["editor"]
+    docs.create(principal, "growth-a.md", "# A\n\ninitial passage")
+    docs.create(principal, "growth-b.md", "placeholder")
+    docs.create(principal, "growth-c.md", "placeholder")
+    a_id = _doc_id(ctx, "growth-a.md")
+    b_id = _doc_id(ctx, "growth-b.md")
+    c_id = _doc_id(ctx, "growth-c.md")
+    _mark_dirty_without_vectors(ctx, a_id)
+    _replace_with_chunks(ctx, b_id, 3)
+    assert indexing.embed_doc(ctx.db, ctx.embedder, b_id) is True
+    with ctx.db.writer() as conn:
+        indexing.clear_chunks(conn, c_id)
+        conn.execute("UPDATE documents SET vector_dirty=1 WHERE id=?", (c_id,))
+
+    real = ctx.embedder.embed_passages
+    queued_b = False
+
+    def queue_larger_document(texts):
+        nonlocal queued_b
+        outputs = real(texts)
+        if not queued_b:
+            queued_b = True
+            _mark_dirty_without_vectors(ctx, b_id)
+        return outputs
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", queue_larger_document)
+    events = []
+
+    assert indexing.embed_pending(
+        ctx.db,
+        ctx.embedder,
+        batch_size=1,
+        doc_batch_size=1,
+        progress=lambda done, total: events.append((done, total)),
+    ) == 3
+
+    assert events == [(1, 1)]
+    assert [_dirty(ctx, doc_id) for doc_id in (a_id, b_id, c_id)] == [0, 0, 0]
+
+
+def test_embed_pending_defers_document_created_above_snapshot_max_id(
+    ctx, principals, monkeypatch
+):
+    docs, principal = ctx.docs, principals["editor"]
+    docs.create(principal, "snapshot-existing.md", "# Existing\n\nfirst passage")
+    existing_id = _doc_id(ctx, "snapshot-existing.md")
+    _mark_dirty_without_vectors(ctx, existing_id)
+
+    class DeferredWorker:
+        def notify(self):
+            pass
+
+    deferred_docs = DocumentService(
+        ctx.db,
+        ctx.embedder,
+        ctx.settings.vault_path,
+        embed_worker=DeferredWorker(),
+    )
+    real = ctx.embedder.embed_passages
+    created = False
+
+    def create_newer_document(texts):
+        nonlocal created
+        outputs = real(texts)
+        if not created:
+            created = True
+            deferred_docs.create(
+                principal, "snapshot-new.md", "# New\n\ncreated during sweep"
+            )
+        return outputs
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", create_newer_document)
+
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_batch_size=1
+    ) == 1
+    new_id = _doc_id(ctx, "snapshot-new.md")
+    assert new_id > existing_id
+    assert _dirty(ctx, existing_id) == 0
+    assert _dirty(ctx, new_id) == 1
+
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_batch_size=1
+    ) == 1
+    assert _dirty(ctx, new_id) == 0
+
+
+def test_embed_pending_stops_immediately_when_binding_changes(
+    ctx, principals, monkeypatch
+):
+    doc_ids = _create_dirty_docs(ctx, principals, "binding", 2)
+    other = Database(ctx.db.path)
+    other.initialize(
+        ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+    )
+    real = ctx.embedder.embed_passages
+    calls = 0
+
+    def rebind_after_first_encode(texts):
+        nonlocal calls
+        calls += 1
+        outputs = real(texts)
+        other.rebind_model(
+            ctx.embedder.model_name, ctx.embedder.dim, ctx.embedder.pipeline
+        )
+        return outputs
+
+    monkeypatch.setattr(ctx.embedder, "embed_passages", rebind_after_first_encode)
+    try:
+        with pytest.raises(EmbeddingBindingChanged):
+            indexing.embed_pending(
+                ctx.db, ctx.embedder, batch_size=1, doc_batch_size=1
+            )
+    finally:
+        other.close()
+
+    assert calls == 1
+    assert [_dirty(ctx, doc_id) for doc_id in doc_ids] == [1, 1]
+    assert [_vector_count(ctx, doc_id) for doc_id in doc_ids] == [0, 0]
+
+
 def test_metadata_only_update_preserves_pending_dirty(ctx, principals):
     # A doc with a queued-but-unembedded vector (vector_dirty=1, no vectors yet — the
     # state reindex leaves) must NOT have that flag cleared by a metadata-only edit.
@@ -387,9 +718,17 @@ def test_embed_pending_skips_doc_rechunked_mid_sweep(ctx, principals, monkeypatc
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "A.md", "# A\n\nalpha alpha alpha")
     docs.create(p, "B.md", "# B\n\nbeta beta beta")
-    a_id, b_id = _doc_id(ctx, "a.md"), _doc_id(ctx, "b.md")
+    docs.create(p, "C.md", "# C\n\ncharlie charlie charlie")
+    a_id, b_id, c_id = (
+        _doc_id(ctx, "a.md"),
+        _doc_id(ctx, "b.md"),
+        _doc_id(ctx, "c.md"),
+    )
     with ctx.db.writer() as conn:
-        conn.execute("UPDATE documents SET vector_dirty=1 WHERE id IN (?,?)", (a_id, b_id))
+        conn.execute(
+            "UPDATE documents SET vector_dirty=1 WHERE id IN (?,?,?)",
+            (a_id, b_id, c_id),
+        )
 
     real = ctx.embedder.embed_passages
     fired = {"once": False}
@@ -403,6 +742,9 @@ def test_embed_pending_skips_doc_rechunked_mid_sweep(ctx, principals, monkeypatc
         return out
 
     monkeypatch.setattr(ctx.embedder, "embed_passages", racing_embed)
-    indexing.embed_pending(ctx.db, ctx.embedder)
+    assert indexing.embed_pending(
+        ctx.db, ctx.embedder, doc_batch_size=1
+    ) == 2
     assert _dirty(ctx, a_id) == 1  # rechunked mid-sweep -> left dirty for a later sweep
     assert _dirty(ctx, b_id) == 0  # cleanly embedded -> cleared
+    assert _dirty(ctx, c_id) == 0  # later pages are not starved by the failed CAS
