@@ -113,16 +113,17 @@ def test_llms_index_escapes_markdown_label(ctx, principals):
     assert r"[A \[B\] \\](/doc/odd.md/raw)" in text
 
 
-def test_llms_index_batches_129_rows_and_loads_current_bodies_with_one_join(
+def test_corpus_iterator_batches_metadata_but_materializes_one_current_body_at_a_time(
     ctx, monkeypatch
 ):
+    large_suffix = "x" * 65_536
     with ctx.db.writer() as conn:
         ids = [
             _insert_doc(
                 conn,
                 f"batch/{i:03}.md",
                 title=f"Doc {i:03}",
-                body=f"body {i:03}",
+                body=f"body {i:03}\n{large_suffix}",
                 tags=(f"tag-{i:03}",),
             )
             for i in range(129)
@@ -134,7 +135,13 @@ def test_llms_index_batches_129_rows_and_loads_current_bodies_with_one_join(
         conn.execute(
             "INSERT INTO revisions(doc_id, version, body, title, content_hash, created_at) "
             "VALUES(?,2,?,?,?,?)",
-            (ids[-1], "latest body 128", "Doc 128", "hash:latest", _FIXED_NOW),
+            (
+                ids[-1],
+                f"latest body 128\n{large_suffix}",
+                "Doc 128",
+                "hash:latest",
+                _FIXED_NOW,
+            ),
         )
 
     tag_batch_sizes = []
@@ -146,19 +153,35 @@ def test_llms_index_batches_129_rows_and_loads_current_bodies_with_one_join(
 
     monkeypatch.setattr(ctx.docs, "_tags_for_ids", record_tag_batch)
     statements = []
+    materialized_bodies = 0
     with ctx.db.reader() as conn:
+        original_row_factory = conn.row_factory
+
+        def record_body_materialization(cursor, row):
+            nonlocal materialized_bodies
+            if any(column[0] == "body" for column in cursor.description):
+                materialized_bodies += 1
+            return original_row_factory(cursor, row)
+
+        conn.row_factory = record_body_materialization
         conn.set_trace_callback(statements.append)
         try:
-            text = ctx.docs.llms_index(site_title="W")
+            docs = ctx.docs._iter_corpus_docs(conn=conn)
+            for expected_count in range(1, 130):
+                doc = next(docs)
+                assert materialized_bodies == expected_count
+                if expected_count == 129:
+                    assert doc["body"].startswith("latest body 128\n")
+            with pytest.raises(StopIteration):
+                next(docs)
         finally:
             conn.set_trace_callback(None)
+            conn.row_factory = original_row_factory
 
     body_queries = [
         sql for sql in statements
         if "revisions" in sql.lower() and "body" in sql.lower()
     ]
-    assert "latest body 128" in text
-    assert "): body 128\n" not in text
     assert tag_batch_sizes == [128, 1]
     assert len(body_queries) == 1
     assert "join revisions" in " ".join(body_queries[0].lower().split())
@@ -166,6 +189,52 @@ def test_llms_index_batches_129_rows_and_loads_current_bodies_with_one_join(
         "select body from revisions where doc_id=" in " ".join(sql.lower().split())
         for sql in statements
     )
+
+
+def test_llms_index_fetches_a_bounded_prefix_for_the_description(ctx):
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "big.md", title="Big", body="first prose\n" + ("x" * 1_000_000))
+
+    statements = []
+    returned_body_lengths = []
+    with ctx.db.reader() as conn:
+        original_row_factory = conn.row_factory
+
+        def record_body_prefix(cursor, row):
+            columns = [column[0] for column in cursor.description]
+            if "body" in columns:
+                returned_body_lengths.append(len(row[columns.index("body")]))
+            return original_row_factory(cursor, row)
+
+        conn.row_factory = record_body_prefix
+        conn.set_trace_callback(statements.append)
+        try:
+            text = ctx.docs.llms_index(site_title="W")
+        finally:
+            conn.set_trace_callback(None)
+            conn.row_factory = original_row_factory
+
+    assert "- [Big](/doc/big.md/raw): first prose" in text
+    assert returned_body_lengths == [16_384]
+    body_queries = [
+        " ".join(sql.lower().split())
+        for sql in statements
+        if "revisions" in sql.lower() and "body" in sql.lower()
+    ]
+    assert len(body_queries) == 1
+    assert "substr(r.body, 1, 16384)" in body_queries[0]
+
+
+def test_llms_index_does_not_expose_incomplete_frontmatter_as_a_description(ctx):
+    body = "---\nsecret: " + ("not-public-" * 100_000) + "\n---\nvisible body\n"
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "private.md", title="Private", body=body)
+
+    text = ctx.docs.llms_index(site_title="W")
+
+    assert "- [Private](/doc/private.md/raw)\n" in text
+    assert "secret:" not in text
+    assert "not-public" not in text
 
 
 def test_corpus_helpers_filter_folder_subtree_deleted_rows_and_sort(ctx):
@@ -229,7 +298,7 @@ def test_corpus_export_keeps_count_and_rows_in_one_snapshot(
 
     original = ctx.docs._iter_corpus_docs
 
-    def interleaved(folder=None, batch_size=128, conn=None):
+    def interleaved(folder=None, batch_size=128, conn=None, body_max_chars=None):
         writer = ctx.db.connect()
         try:
             writer.execute("BEGIN IMMEDIATE")
@@ -238,9 +307,11 @@ def test_corpus_export_keeps_count_and_rows_in_one_snapshot(
         finally:
             writer.close()
         if conn is None:
-            yield from original(folder, batch_size)
+            yield from original(folder, batch_size, body_max_chars=body_max_chars)
         else:
-            yield from original(folder, batch_size, conn=conn)
+            yield from original(
+                folder, batch_size, conn=conn, body_max_chars=body_max_chars
+            )
 
     monkeypatch.setattr(ctx.docs, "_iter_corpus_docs", interleaved)
     result = getattr(ctx.docs, export_name)(site_title="W")
@@ -336,14 +407,59 @@ def test_llms_full_truncates_on_budget(ctx, principals):
     assert len(res["text"]) <= 10
 
 
-def test_llms_full_hard_caps_single_large_document(ctx, principals):
+def test_llms_full_fetches_only_a_budget_sized_prefix_of_a_large_document(ctx):
+    max_chars = 1000
+    expected_prefix_chars = max_chars - len(_full_header(1))
     with ctx.db.writer() as conn:
-        _insert_doc(conn, "big.md", title="Big", body="가" * 5000)
-    res = ctx.docs.llms_full(site_title="W", max_chars=1000)
-    assert len(res["text"]) == 1000
+        _insert_doc(conn, "big.md", title="Big", body="가" * 1_000_000)
+
+    statements = []
+    returned_body_lengths = []
+    with ctx.db.reader() as conn:
+        original_row_factory = conn.row_factory
+
+        def record_body_prefix(cursor, row):
+            columns = [column[0] for column in cursor.description]
+            if "body" in columns:
+                returned_body_lengths.append(len(row[columns.index("body")]))
+            return original_row_factory(cursor, row)
+
+        conn.row_factory = record_body_prefix
+        conn.set_trace_callback(statements.append)
+        try:
+            res = ctx.docs.llms_full(site_title="W", max_chars=max_chars)
+        finally:
+            conn.set_trace_callback(None)
+            conn.row_factory = original_row_factory
+
+    assert len(res["text"]) == max_chars
     assert res["included"] == res["total"] == 1
     assert res["truncated"] is True
     assert res["text"].endswith(_full_marker(1, 1))
+    assert returned_body_lengths == [expected_prefix_chars]
+    body_queries = [
+        " ".join(sql.lower().split())
+        for sql in statements
+        if "revisions" in sql.lower() and "body" in sql.lower()
+    ]
+    assert len(body_queries) == 1
+    assert f"substr(r.body, 1, {expected_prefix_chars})" in body_queries[0]
+    assert "length(r.body)" in body_queries[0]
+
+
+def test_llms_full_does_not_expose_frontmatter_when_its_prefix_is_incomplete(ctx):
+    body = "---\nsecret: " + ("not-public-" * 100_000) + "\n---\nvisible body\n"
+    with ctx.db.writer() as conn:
+        _insert_doc(conn, "private.md", title="Private", body=body)
+
+    result = ctx.docs.llms_full(site_title="W", max_chars=1000)
+
+    assert len(result["text"]) <= 1000
+    assert result["included"] == result["total"] == 1
+    assert result["truncated"] is True
+    assert result["text"].endswith(_full_marker(1, 1))
+    assert "secret:" not in result["text"]
+    assert "not-public" not in result["text"]
 
 
 def test_llms_full_budget_boundaries(ctx):

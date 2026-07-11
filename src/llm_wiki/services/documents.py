@@ -72,6 +72,7 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 # checkbox state for click-to-toggle). Groups: (prefix, state-char, rest).
 _TASK_LINE_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\].*)$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CORPUS_DESCRIPTION_PREFIX_CHARS = 16 * 1024
 
 # Uploaded images/files live under this vault subdir (excluded from the .md scan).
 ATTACH_DIR = "_attachments"
@@ -877,33 +878,52 @@ class DocumentService:
         folder: str | None = None,
         batch_size: int = 128,
         conn: sqlite3.Connection | None = None,
+        body_max_chars: int | None = None,
     ) -> Iterator[dict]:
-        """Yield non-deleted documents in bounded batches, ordered folder→path."""
+        """Yield ordered corpus metadata in batches, materializing one body at a time."""
         if conn is None:
             with self.db.reader() as read_conn:
-                yield from self._iter_corpus_docs(folder, batch_size, conn=read_conn)
+                yield from self._iter_corpus_docs(
+                    folder, batch_size, conn=read_conn, body_max_chars=body_max_chars
+                )
             return
-        q = (
-            "SELECT d.id, d.path, d.title, d.folder, d.updated_at, r.body "
-            "FROM documents d "
-            "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version "
-            "WHERE d.is_deleted=0"
-        )
+        where = " WHERE d.is_deleted=0"
         params: list = []
         if folder:
             f = folder.strip("/")
-            q += " AND (d.folder=? OR d.folder LIKE ?)"
+            where += " AND (d.folder=? OR d.folder LIKE ?)"
             params += [f, f + "/%"]
-        q += " ORDER BY d.folder, d.path"
+        order = " ORDER BY d.folder, d.path"
+        metadata_q = (
+            "SELECT d.id, d.path, d.title, d.folder, d.updated_at "
+            "FROM documents d" + where + order
+        )
+        body_params = list(params)
+        if body_max_chars is None:
+            body_column = "r.body"
+        else:
+            body_column = "substr(r.body, 1, ?) AS body"
+            body_params.insert(0, max(0, int(body_max_chars)))
+        body_q = (
+            f"SELECT d.id, {body_column}, length(r.body) AS body_chars "
+            "FROM documents d "
+            "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version"
+            + where + order
+        )
         batch_size = max(1, int(batch_size))
-        cursor = conn.execute(q, params)
-        while rows := cursor.fetchmany(batch_size):
+        metadata_cursor = conn.execute(metadata_q, params)
+        body_cursor = conn.execute(body_q, body_params)
+        while rows := metadata_cursor.fetchmany(batch_size):
             tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
             for r in rows:
+                body_row = body_cursor.fetchone()
+                if body_row is None or body_row["id"] != r["id"]:
+                    raise RuntimeError("Corpus metadata and body cursors lost alignment.")
                 yield {
                     "path": r["path"], "title": r["title"] or r["path"],
                     "folder": r["folder"] or "", "updated_at": r["updated_at"],
-                    "tags": tags_by.get(r["id"], []), "body": r["body"],
+                    "tags": tags_by.get(r["id"], []), "body": body_row["body"],
+                    "body_chars": body_row["body_chars"],
                 }
 
     def _corpus_count(
@@ -929,11 +949,20 @@ class DocumentService:
         return cls._one_line(value).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
     @staticmethod
-    def _doc_description(body: str, max_chars: int = 120) -> str:
+    def _doc_description(
+        body: str, max_chars: int = 120, body_chars: int | None = None
+    ) -> str:
         """A one-line description for the llms.txt index: a frontmatter
         ``description``/``summary`` if present, else the first non-empty body line
         with markdown markers stripped (single line, never HTML)."""
         meta, off = parse_frontmatter(body)
+        if (
+            body_chars is not None
+            and len(body) < body_chars
+            and not off
+            and re.match(r"^---[ \t]*\n", body)
+        ):
+            return ""
         for key in ("description", "summary"):
             v = meta.get(key)
             if isinstance(v, str) and v.strip():
@@ -949,6 +978,17 @@ class DocumentService:
                 return " ".join(s.split())[:max_chars]
         return ""
 
+    @staticmethod
+    def _corpus_body_prefix(body: str, body_chars: int) -> tuple[str, bool]:
+        """Strip complete frontmatter without exposing a prefix cut inside YAML."""
+        prefix_truncated = len(body) < body_chars
+        _meta, offset = parse_frontmatter(body)
+        if offset:
+            return body[offset:], prefix_truncated
+        if prefix_truncated and re.match(r"^---[ \t]*\n", body):
+            return "", True
+        return body, prefix_truncated
+
     def _doc_raw_url(self, path: str, base_url: str = "") -> str:
         enc = quote(path)
         return f"{base_url.rstrip('/')}/doc/{enc}/raw" if base_url else f"/doc/{enc}/raw"
@@ -961,7 +1001,9 @@ class DocumentService:
         can discover what the knowledge base holds."""
         with self._corpus_read_snapshot() as conn:
             total = self._corpus_count(conn=conn)
-            docs = self._iter_corpus_docs(conn=conn)
+            docs = self._iter_corpus_docs(
+                conn=conn, body_max_chars=_CORPUS_DESCRIPTION_PREFIX_CHARS
+            )
             lines = [
                 f"# {self._md_label(site_title)}", "",
                 f"> 마크다운 지식베이스 — 문서 {total}개. "
@@ -971,7 +1013,9 @@ class DocumentService:
             for folder, group in groupby(docs, key=lambda d: d["folder"]):
                 lines.append(f"## {self._md_label(folder or '루트')}")
                 for d in group:
-                    desc = self._one_line(self._doc_description(d["body"]))
+                    desc = self._one_line(
+                        self._doc_description(d["body"], body_chars=d["body_chars"])
+                    )
                     url = self._doc_raw_url(d["path"], base_url)
                     title = self._md_label(d["title"])
                     lines.append(f"- [{title}]({url})" + (f": {desc}" if desc else ""))
@@ -1002,8 +1046,13 @@ class DocumentService:
 
             size = len(parts[0])
             if size <= limit:
-                for d in self._iter_corpus_docs(conn=conn):
-                    body = d["body"][parse_frontmatter(d["body"])[1]:].strip()
+                for d in self._iter_corpus_docs(
+                    conn=conn, body_max_chars=limit - size
+                ):
+                    body, body_prefix_truncated = self._corpus_body_prefix(
+                        d["body"], d["body_chars"]
+                    )
+                    body = body.strip()
                     header = (f"---\n\n# {self._md_label(d['title'])}\n\n"
                               f"- 경로: `{d['path']}`\n"
                               + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
@@ -1011,7 +1060,7 @@ class DocumentService:
                     block = header + "\n" + body + "\n"
                     separator = "\n"
                     candidate = separator + block
-                    if size + len(candidate) <= limit:
+                    if not body_prefix_truncated and size + len(candidate) <= limit:
                         parts.append(candidate)
                         size += len(candidate)
                         included += 1
