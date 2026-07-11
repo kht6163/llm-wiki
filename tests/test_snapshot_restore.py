@@ -388,3 +388,205 @@ def test_restore_rejects_future_schema(tmp_path, monkeypatch):
         tar.addfile(info, io.BytesIO(data))
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: _settings(tmp_path, "fut"))
     assert _cli_impl._restore(SimpleNamespace(in_=str(bad), force=True)) == 1
+
+
+def _rewrite_snapshot(src: Path, dst: Path, transform) -> None:
+    with tarfile.open(src, "r") as archive:
+        members = []
+        for member in archive.getmembers():
+            extracted = archive.extractfile(member) if member.isfile() else None
+            members.append((member, extracted.read() if extracted else None))
+    members = transform(members)
+    with tarfile.open(dst, "w") as archive:
+        for member, data in members:
+            copied = tarfile.TarInfo(member.name)
+            copied.type = member.type
+            copied.linkname = member.linkname
+            copied.size = len(data) if data is not None else 0
+            archive.addfile(copied, io.BytesIO(data) if data is not None else None)
+
+
+def _snapshot_for_restore(tmp_path: Path, name: str = "restore-source") -> Path:
+    src = _seed(_settings(tmp_path, name))
+    (src.settings.vault_path / "asset.bin").write_bytes(b"asset")
+    out = tmp_path / f"{name}.tar"
+    snapshot_writer.write_snapshot(src.db, src.settings.vault_path, out, force=False)
+    return out
+
+
+def test_restore_force_fully_replaces_targets_and_removes_sidecars(tmp_path):
+    archive = _snapshot_for_restore(tmp_path)
+    db_path = tmp_path / "target" / "wiki.db"
+    vault = tmp_path / "target-vault"
+    db_path.parent.mkdir()
+    db_path.write_bytes(b"old database")
+    vault.mkdir()
+    (vault / "stale.md").write_text("stale")
+    Path(f"{db_path}-wal").write_bytes(b"old wal")
+    Path(f"{db_path}-shm").write_bytes(b"old shm")
+
+    report = snapshot_writer.restore_snapshot(
+        archive, db_path, vault, force=True
+    )
+
+    assert report.doc_count == 1
+    assert (vault / "note.md").read_text() == "# Note\n\nhello world"
+    assert (vault / "asset.bin").read_bytes() == b"asset"
+    assert not (vault / "stale.md").exists()
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+
+
+@pytest.mark.parametrize("field,value", [("size", 999), ("sha256", "0" * 64)])
+def test_restore_rejects_manifest_content_mismatch_without_touching_targets(
+    tmp_path, field, value
+):
+    original = _snapshot_for_restore(tmp_path, f"bad-{field}-source")
+    damaged = tmp_path / f"bad-{field}.tar"
+
+    def corrupt(members):
+        result = []
+        for member, data in members:
+            if member.name == "manifest.json":
+                manifest = json.loads(data)
+                manifest["files"][0][field] = value
+                data = json.dumps(manifest).encode()
+            result.append((member, data))
+        return result
+
+    _rewrite_snapshot(original, damaged, corrupt)
+    db_path = tmp_path / f"target-{field}.db"
+    vault = tmp_path / f"vault-{field}"
+    db_path.write_bytes(b"original db")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+
+    with pytest.raises(ValueError, match="manifest|verification"):
+        snapshot_writer.restore_snapshot(damaged, db_path, vault, force=True)
+
+    assert db_path.read_bytes() == b"original db"
+    assert (vault / "original.txt").read_text() == "original"
+
+
+@pytest.mark.parametrize("bad_kind", ["duplicate", "traversal", "symlink"])
+def test_restore_rejects_unsafe_archive_members_without_touching_targets(
+    tmp_path, bad_kind
+):
+    original = _snapshot_for_restore(tmp_path, f"unsafe-{bad_kind}-source")
+    damaged = tmp_path / f"unsafe-{bad_kind}.tar"
+
+    def add_bad_member(members):
+        if bad_kind == "duplicate":
+            member, data = next(item for item in members if item[0].name == "vault/note.md")
+            members.append((member, data))
+        elif bad_kind == "traversal":
+            members.append((tarfile.TarInfo("vault/../escaped"), b"bad"))
+        else:
+            link = tarfile.TarInfo("vault/link")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "../outside"
+            members.append((link, None))
+        return members
+
+    _rewrite_snapshot(original, damaged, add_bad_member)
+    db_path = tmp_path / f"unsafe-{bad_kind}.db"
+    vault = tmp_path / f"unsafe-{bad_kind}-vault"
+    db_path.write_bytes(b"original db")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+
+    with pytest.raises(ValueError, match="archive|member|duplicate|unsafe"):
+        snapshot_writer.restore_snapshot(damaged, db_path, vault, force=True)
+
+    assert db_path.read_bytes() == b"original db"
+    assert (vault / "original.txt").read_text() == "original"
+
+
+def test_restore_rejects_a_missing_manifest_payload(tmp_path):
+    original = _snapshot_for_restore(tmp_path, "missing-source")
+    damaged = tmp_path / "missing.tar"
+    _rewrite_snapshot(
+        original,
+        damaged,
+        lambda members: [item for item in members if item[0].name != "vault/note.md"],
+    )
+    db_path = tmp_path / "missing.db"
+    vault = tmp_path / "missing-vault"
+
+    with pytest.raises(ValueError, match="missing|manifest"):
+        snapshot_writer.restore_snapshot(damaged, db_path, vault, force=True)
+    assert not db_path.exists()
+    assert not vault.exists()
+
+
+def test_restore_rejects_an_archive_payload_missing_from_the_manifest(tmp_path):
+    original = _snapshot_for_restore(tmp_path, "undeclared-source")
+    damaged = tmp_path / "undeclared.tar"
+
+    def add_undeclared(members):
+        members.append((tarfile.TarInfo("vault/undeclared.bin"), b"undeclared"))
+        return members
+
+    _rewrite_snapshot(original, damaged, add_undeclared)
+
+    with pytest.raises(ValueError, match="undeclared"):
+        snapshot_writer.restore_snapshot(
+            damaged, tmp_path / "undeclared.db", tmp_path / "undeclared-vault", force=True
+        )
+
+
+def test_restore_extraction_failure_leaves_live_targets_unchanged(tmp_path, monkeypatch):
+    archive = _snapshot_for_restore(tmp_path, "extract-source")
+    db_path = tmp_path / "extract.db"
+    vault = tmp_path / "extract-vault"
+    db_path.write_bytes(b"original db")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+    real_copy = snapshot_writer._copy_archive_file
+    calls = 0
+
+    def fail_during_extract(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("simulated extraction failure")
+        return real_copy(source, target)
+
+    monkeypatch.setattr(snapshot_writer, "_copy_archive_file", fail_during_extract)
+    with pytest.raises(OSError, match="simulated extraction failure"):
+        snapshot_writer.restore_snapshot(archive, db_path, vault, force=True)
+
+    assert db_path.read_bytes() == b"original db"
+    assert (vault / "original.txt").read_text() == "original"
+
+
+def test_restore_second_publish_failure_rolls_back_every_live_target(
+    tmp_path, monkeypatch
+):
+    archive = _snapshot_for_restore(tmp_path, "publish-source")
+    db_path = tmp_path / "publish" / "wiki.db"
+    vault = tmp_path / "publish-vault"
+    db_path.parent.mkdir()
+    db_path.write_bytes(b"original db")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+    wal = Path(f"{db_path}-wal")
+    shm = Path(f"{db_path}-shm")
+    wal.write_bytes(b"original wal")
+    shm.write_bytes(b"original shm")
+    real_replace = snapshot_writer.os.replace
+
+    def fail_vault_publish(source, destination):
+        source_path = Path(source)
+        if Path(destination) == vault and ".restore-stage-" in source_path.name:
+            raise OSError("simulated vault publish failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(snapshot_writer.os, "replace", fail_vault_publish)
+    with pytest.raises(OSError, match="simulated vault publish failure"):
+        snapshot_writer.restore_snapshot(archive, db_path, vault, force=True)
+
+    assert db_path.read_bytes() == b"original db"
+    assert (vault / "original.txt").read_text() == "original"
+    assert wal.read_bytes() == b"original wal"
+    assert shm.read_bytes() == b"original shm"

@@ -5,10 +5,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
-import json
 import signal
 import sqlite3
-import tarfile
 from pathlib import Path
 from typing import cast
 
@@ -16,18 +14,19 @@ import uvicorn
 from pydantic import ValidationError
 
 from .config import ConfigError, get_settings
-from .db import SCHEMA_VERSION, get_meta
+from .db import SCHEMA_VERSION as DB_SCHEMA_VERSION
+from .db import get_meta
 from .mcp_server import create_mcp_server
 from .runtime import build_context
 from .services import audit
 from .services import users as users_svc
 from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
-from .snapshot import write_snapshot
+from .snapshot import restore_snapshot, write_snapshot
 from .web import create_web_app
 from .web.security import RequestBodyLimitMiddleware
 
-SNAPSHOT_FORMAT = "llm-wiki-snapshot"
+SCHEMA_VERSION = DB_SCHEMA_VERSION
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -473,86 +472,31 @@ def _snapshot(args) -> int:
 
 
 def _restore(args) -> int:
-    """Restore a snapshot .tar over the configured DB + vault. Validates the manifest
-    before touching anything, refuses a non-empty target without --force, then
-    re-projects any pending docs so DB and vault converge."""
+    """Restore a validated snapshot as a full DB + vault replacement."""
     settings = get_settings()
     src = Path(args.in_)
     if not src.exists():
         print(f"no such snapshot: {src}")
         return 1
     db_path, vault = Path(settings.db_path), Path(settings.vault_path)
-
-    # 1) Read + validate the manifest BEFORE clobbering anything.
     try:
-        with tarfile.open(src, "r") as tar:
-            mf = tar.extractfile("manifest.json")
-            manifest = json.load(mf) if mf else None
-    except (tarfile.TarError, KeyError, json.JSONDecodeError):
-        manifest = None
-    if not manifest or manifest.get("format") != SNAPSHOT_FORMAT:
-        print("not a recognizable llm-wiki snapshot (missing/invalid manifest.json).")
-        return 1
-    snap_sv = manifest.get("schema_version")
-    if snap_sv is not None and int(snap_sv) > SCHEMA_VERSION:
-        print(f"snapshot schema_version {snap_sv} is newer than this build supports "
-              f"({SCHEMA_VERSION}); upgrade llm-wiki before restoring.")
-        return 1
-
-    # 2) Refuse to overwrite a populated target unless forced.
-    db_nonempty = db_path.exists() and db_path.stat().st_size > 0
-    vault_nonempty = vault.exists() and any(vault.iterdir())
-    if (db_nonempty or vault_nonempty) and not args.force:
+        report = restore_snapshot(src, db_path, vault, force=args.force)
+    except FileExistsError:
         print("target database or vault is not empty; pass --force to overwrite.")
         return 1
+    except (OSError, ValueError) as exc:
+        print(f"restore failed: {exc}")
+        return 1
 
-    # 3) Extract (path-traversal-safe), clearing stale WAL sidecars first.
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    vault.mkdir(parents=True, exist_ok=True)
-    for sfx in ("-wal", "-shm"):
-        sidecar = Path(str(db_path) + sfx)
-        if sidecar.exists():
-            sidecar.unlink()
-    with tarfile.open(src, "r") as tar:
-        for member in tar.getmembers():
-            if member.name == "manifest.json" or not member.isfile():
-                continue
-            if member.name == "wiki.db":
-                dest = db_path
-            elif member.name.startswith("vault/"):
-                safe = _safe_join(vault, member.name[len("vault/"):])
-                if safe is None:
-                    print(f"  skipped unsafe path in snapshot: {member.name}")
-                    continue
-                dest = safe
-            else:
-                continue
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            extracted = tar.extractfile(member)
-            if extracted is None:
-                continue
-            with open(dest, "wb") as out_f:
-                out_f.write(extracted.read())
-
-    # 4) Warn on a model mismatch and re-project pending docs.
-    if manifest.get("embedding_model") and manifest["embedding_model"] != settings.embedding_model:
-        print(f"WARNING: snapshot embedding_model '{manifest['embedding_model']}' differs from "
+    if report.embedding_model and report.embedding_model != settings.embedding_model:
+        print(f"WARNING: snapshot embedding_model '{report.embedding_model}' differs from "
               f"configured '{settings.embedding_model}'. Run 'llm-wiki reindex --reembed'.")
     ctx = build_context(full=False)  # opens the restored DB and applies any migrations
     recovered = ctx.docs.recover_pending()
-    print(f"Restored from {src}: schema v{snap_sv} · {manifest.get('doc_count')} docs.")
+    print(f"Restored from {src}: schema v{report.schema_version} · {report.doc_count} docs.")
     if recovered:
         print(f"  re-projected {recovered} pending document(s).")
     return 0
-
-
-def _safe_join(base: Path, rel: str) -> Path | None:
-    """Resolve ``rel`` under ``base``, or None if it escapes (tar path traversal)."""
-    base = base.resolve()
-    target = (base / rel).resolve()
-    if target == base or base in target.parents:
-        return target
-    return None
 
 
 def _apply_serve_overrides(settings, args):
