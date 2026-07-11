@@ -254,12 +254,25 @@ def _reindex(args) -> int:
     res = ctx.docs.reindex_all(reembed=args.reembed, progress=_progress)
     print(f"created={res['created']} updated={res['updated']} renamed={res['renamed']} "
           f"unchanged={res['unchanged']} embedded={res['embedded']}")
+    conflicts = res.get("skipped_conflicts", [])
+    print(f"recovered_pending={res.get('recovered_pending', 0)} "
+          f"retried={res.get('retried', 0)} conflicts={len(conflicts)}")
     for mv in res.get("renames", []):
         print(f"  renamed: {mv}")
+    if res.get("skipped_deleted"):
+        print(f"WARNING: {len(res['skipped_deleted'])} tombstoned document(s) were skipped:")
+        for path in res["skipped_deleted"]:
+            print(f"  - {path}")
     if res["missing_files"]:
         print(f"WARNING: {len(res['missing_files'])} document(s) have no file on disk:")
         for m in res["missing_files"]:
             print(f"  - {m}")
+    if conflicts:
+        print(f"ERROR: {len(conflicts)} path(s) did not converge:")
+        for conflict in conflicts:
+            print(f"  - {conflict['path']}: {conflict['reason']} "
+                  f"(attempts={conflict['attempts']})")
+        return 1
     return 0
 
 

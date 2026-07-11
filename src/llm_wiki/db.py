@@ -24,7 +24,7 @@ from .embedding_contract import (
     EmbeddingBindingChanged,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -85,6 +85,9 @@ CREATE INDEX IF NOT EXISTS idx_documents_dirty ON documents(vector_dirty);
 -- Covers the default listing/autocomplete sort (WHERE is_deleted=0 ORDER BY
 -- updated_at DESC) so it seeks instead of full-scanning + sorting the table.
 CREATE INDEX IF NOT EXISTS idx_documents_updated ON documents(is_deleted, updated_at DESC);
+-- External rename reconciliation looks up live documents by exact content hash.
+CREATE INDEX IF NOT EXISTS idx_documents_live_content_hash
+  ON documents(content_hash) WHERE is_deleted=0;
 
 -- A move can leave more than one historical path to remove.  Each intent carries the
 -- exact filesystem generation that may be unlinked; a changed or newly-owned path is
@@ -288,6 +291,7 @@ MIGRATIONS: list[tuple[int, str]] = [
     (9, "CREATE INDEX IF NOT EXISTS idx_tags_tag_doc ON tags(tag, doc_id)"),
     (10, "DROP INDEX IF EXISTS idx_tags_tag"),
     (11, "CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor, id DESC)"),
+    (12, "CREATE INDEX IF NOT EXISTS idx_documents_live_content_hash ON documents(content_hash) WHERE is_deleted=0"),
 ]
 
 

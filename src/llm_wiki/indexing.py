@@ -13,6 +13,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from . import graph
 from .embedding import Embedder
@@ -21,7 +22,7 @@ from .embedding_contract import (
     EmbeddingBinding,
     EmbeddingBindingChanged,
 )
-from .markdown_utils import chunk_markdown, extract_links, parse_frontmatter
+from .markdown_utils import Chunk, Link, chunk_markdown, extract_links, parse_frontmatter
 from .metrics import (
     EMBED_CHUNKS,
     EMBED_DURATION,
@@ -32,6 +33,57 @@ from .metrics import (
 )
 
 log = logging.getLogger("llm_wiki.indexing")
+
+
+@dataclass(frozen=True)
+class PreparedMarkdown:
+    fts_body: str
+    chunks: tuple[Chunk, ...]
+    links: tuple[Link, ...]
+
+
+def prepare_markdown(body: str) -> PreparedMarkdown:
+    """Parse all index inputs outside the SQLite writer lock."""
+    text = body or ""
+    return PreparedMarkdown(
+        text[parse_frontmatter(text)[1]:],
+        tuple(chunk_markdown(text)),
+        tuple(extract_links(text)),
+    )
+
+
+def publish_prepared(
+    conn: sqlite3.Connection,
+    doc_id: int,
+    title: str,
+    folder: str,
+    prepared: PreparedMarkdown,
+) -> None:
+    """Publish already-parsed FTS/chunk/link rows in the caller's transaction."""
+    conn.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
+    conn.execute(
+        "INSERT INTO documents_fts(rowid, title, body) VALUES(?,?,?)",
+        (doc_id, title or "", prepared.fts_body),
+    )
+    old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    if old:
+        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    for chunk in prepared.chunks:
+        conn.execute(
+            "INSERT INTO chunks(doc_id,ordinal,heading,text,char_start,char_end,heading_path) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                doc_id,
+                chunk.ordinal,
+                chunk.heading,
+                chunk.text,
+                chunk.char_start,
+                chunk.char_end,
+                chunk.heading_path,
+            ),
+        )
+    graph.store_links(conn, doc_id, list(prepared.links), folder)
 
 
 def reindex_fts(conn: sqlite3.Connection, doc_id: int, title: str, body: str) -> None:

@@ -78,14 +78,19 @@ def _indexes(conn) -> set[str]:
 
 
 def test_query_shape_indexes_replace_single_column_ones(tmp_path):
-    # A pre-v7 DB carried the single-column idx_chunks_doc / idx_tags_tag; the v7-v11
+    # A pre-v7 DB carried the single-column idx_chunks_doc / idx_tags_tag; the v7-v12
     # migrations replace them with composite (doc_id,ordinal)/(tag,doc_id) indexes and
     # add idx_audit_actor — creating each replacement before dropping the old one.
     db = Database(tmp_path / "idx.db")
     db.ensure_schema()
     with db.writer() as conn:
         # Rewind to the v6 index layout: drop the new composites, restore the old ones.
-        for name in ("idx_chunks_doc_ord", "idx_tags_tag_doc", "idx_audit_actor"):
+        for name in (
+            "idx_chunks_doc_ord",
+            "idx_tags_tag_doc",
+            "idx_audit_actor",
+            "idx_documents_live_content_hash",
+        ):
             conn.execute(f"DROP INDEX IF EXISTS {name}")
         conn.execute("CREATE INDEX idx_chunks_doc ON chunks(doc_id)")
         conn.execute("CREATE INDEX idx_tags_tag ON tags(tag)")
@@ -96,7 +101,12 @@ def test_query_shape_indexes_replace_single_column_ones(tmp_path):
     with db.reader() as conn:
         assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
         idx = _indexes(conn)
-        assert {"idx_chunks_doc_ord", "idx_tags_tag_doc", "idx_audit_actor"} <= idx
+        assert {
+            "idx_chunks_doc_ord",
+            "idx_tags_tag_doc",
+            "idx_audit_actor",
+            "idx_documents_live_content_hash",
+        } <= idx
         assert "idx_chunks_doc" not in idx and "idx_tags_tag" not in idx
 
 

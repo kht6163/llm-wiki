@@ -394,8 +394,8 @@ git commit -m "외부 파일 반영에 안정 스냅샷 적용"
 - target이 동시에 생성되면 rename이 덮어쓰지 않는다.
 - source old path가 writer 검증 전에 다시 나타나면 `rename_source_reappeared`로 retry/skip한다.
 - 같은 hash의 pending source는 rename/new create를 막고 `pending_projection`으로 보고한다.
-- 초기 map 뒤 다른 connection이 새 missing same-hash source를 만들면 `data_version` global
-  rebuild가 이를 발견하며, 세 번 계속 바뀌면 duplicate INSERT 없이 `rename_source_changed`다.
+- 첫 presence pass 뒤 다른 source가 missing으로 바뀌면 writer의 두 번째 same-hash bucket
+  검증이 이를 발견하며, commit 뒤 peer 변화도 duplicate INSERT 없이 `rename_source_changed`다.
 - DB commit 없이 외부에서 같은-hash source 파일 하나를 추가로 제거해도 target-absent writer가
   모든 same-hash live row의 lexical 존재를 재검사해 unique/ambiguous를 다시 판정한다.
 - ambiguous clean missing source는 기존처럼 new create로 fallback한다.
@@ -416,15 +416,13 @@ uv run pytest tests/test_reindex_concurrency.py tests/test_reindex.py -q
 
 ### 2. 최소 구현
 
-- global round 시작 시 O(D) 한 번으로 clean/pending missing-by-hash map과 같은 reader
-  connection의 `PRAGMA data_version`을 캡처한다. target-absent writer 안에서 generation이
-  같을 때만 rename/INSERT하고, 다른 connection commit을 감지하면 전체 map/disk round를 다시
-  만든다. 최대 3 round 뒤에도 변하면 `rename_source_changed`이며 INSERT하지 않는다. 자체
-  commit은 in-memory map에 반영해 전체 복잡도를 `O(3(F+D))`로 제한한다.
+- live `content_hash` 부분 인덱스로 target별 동일-hash bucket만 조회한다. 일반 복잡도는
+  `O(F log D + ΣB)`이며, 동일 hash가 대량 반복되는 병적 vault의 최악 `O(K²)` peer stat는
+  stale global map을 피하고 commit 시점 정합성을 단순하게 유지하기 위한 tradeoff로 수용한다.
 - writer transaction에서 target 부재, source 전체 tuple, source path 부재, target file
   signature를 함께 검증한다.
-- `data_version`이 같아도 rename/INSERT 직전에 initial map의 같은-hash 모든 live row lexical
-  source 존재를 다시 검사하고 commit 후에도 재검증한다. filesystem-only 후보 변화는 최신
+- rename/INSERT 직전에 indexed bucket의 같은-hash 모든 live row lexical source 존재를 두 번
+  검사하고 commit 후에도 전체 peer를 재검증한다. filesystem-only 후보 변화는 최신
   unique/ambiguous 판정이나 후속 work item으로 처리한다.
 - source path는 UPDATE 직전과 commit 직후에도 확인한다. commit 뒤 재등장하면 old path를 bounded
   work queue에 넣어 새 generation으로 reconcile하고 끝까지 불안정할 때만 고정 reason을 남긴다.

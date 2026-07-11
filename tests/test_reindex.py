@@ -246,6 +246,70 @@ def test_cli_reindex_reembed_passes_current_embedding_pipeline(ctx, monkeypatch)
     ]
 
 
+def test_cli_reindex_prints_conflicts_and_returns_one(monkeypatch, capsys):
+    report = {
+        "created": 0,
+        "updated": 1,
+        "renamed": 0,
+        "unchanged": 0,
+        "embedded": 1,
+        "renames": [],
+        "recovered_pending": 2,
+        "retried": 3,
+        "missing_files": [],
+        "skipped_deleted": [],
+        "skipped_conflicts": [
+            {"path": "race.md", "reason": "file_changed", "attempts": 3}
+        ],
+    }
+    docs = SimpleNamespace(reindex_all=lambda **_kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **_kwargs: SimpleNamespace(docs=docs),
+    )
+
+    result = _cli_impl._reindex(SimpleNamespace(reembed=False))
+
+    output = capsys.readouterr().out
+    assert result == 1
+    assert "recovered_pending=2 retried=3 conflicts=1" in output
+    assert "race.md" in output
+    assert "file_changed" in output
+    assert "attempts=3" in output
+
+
+def test_cli_reindex_missing_and_deleted_warnings_still_return_zero(
+    monkeypatch, capsys
+):
+    report = {
+        "created": 0,
+        "updated": 0,
+        "renamed": 0,
+        "unchanged": 0,
+        "embedded": 0,
+        "renames": [],
+        "recovered_pending": 0,
+        "retried": 0,
+        "missing_files": ["missing.md"],
+        "skipped_deleted": ["deleted.md"],
+        "skipped_conflicts": [],
+    }
+    docs = SimpleNamespace(reindex_all=lambda **_kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **_kwargs: SimpleNamespace(docs=docs),
+    )
+
+    result = _cli_impl._reindex(SimpleNamespace(reembed=False))
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "missing.md" in output
+    assert "deleted.md" in output
+
+
 def test_reindex_reembed_after_rebind_repopulates_vectors(ctx, principals):
     # The `reindex --reembed` flow rebinds the model (drops + recreates the vector table)
     # then re-embeds every document. Simulate it here with the SAME model (no dim change):

@@ -37,6 +37,15 @@ class ProjectionPathMissing(FileProjectionError):
     """A lexical parent or final entry disappeared without becoming unsafe."""
 
 
+class StableFileError(FileProjectionError):
+    """A markdown file could not be adopted as one stable external generation."""
+
+    def __init__(self, reason: str, detail: str | None = None):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
 @dataclass(frozen=True)
 class FileSignature:
     dev: int
@@ -62,6 +71,15 @@ class StagedText:
     target: Path
     path: Path
     signature: FileSignature
+
+
+@dataclass(frozen=True)
+class StableMarkdown:
+    vault: Path
+    path: Path
+    relative_path: str
+    signature: FileSignature
+    text: str
 
 
 @dataclass(frozen=True)
@@ -269,9 +287,7 @@ def _open_directory_chain(
         os.close(current_fd)
 
 
-def _target_components(
-    vault: Path | str, target: Path | str
-) -> tuple[Path, Path, tuple[str, ...]]:
+def _target_components(vault: Path | str, target: Path | str) -> tuple[Path, Path, tuple[str, ...]]:
     root = _vault_root(vault)
     candidate = Path(target)
     if not candidate.is_absolute():
@@ -283,6 +299,13 @@ def _target_components(
     parts = relative.parts
     if not parts or any(part in ("", ".", "..") for part in parts):
         raise UnsafeProjectionPath("projection target contains an unsafe component")
+    relative_text = relative.as_posix()
+    if relative_text != relative_text.strip() or any(
+        "\\" in part
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in part)
+        for part in parts
+    ):
+        raise UnsafeProjectionPath("projection target contains a non-canonical component")
     return root, candidate, parts
 
 
@@ -633,3 +656,94 @@ def unlink_regular(
     target.unlink()
     fsync_directory(target.parent)
     return True
+
+
+def read_stable_markdown(vault: Path | str, path: Path | str) -> StableMarkdown:
+    """Read one no-follow regular-file generation and verify it before and after."""
+    try:
+        root, target, parts = _target_components(vault, path)
+        with _open_target_parent(root, target, create=False) as (
+            _root,
+            confined,
+            parent_fd,
+            name,
+            _parent,
+        ):
+            anchored_before = _stat_at_signature(parent_fd, name, confined)
+            nofollow = getattr(os, "O_NOFOLLOW", None)
+            if nofollow is None:
+                raise StableFileError(
+                    "file_unreadable",
+                    "this platform cannot open external files without following symlinks",
+                )
+            fd = os.open(
+                name,
+                os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                opened_before = _regular_signature(os.fstat(fd), confined)
+                if opened_before != anchored_before:
+                    raise StableFileError("file_changed", f"file changed while opening: {confined}")
+                chunks: list[bytes] = []
+                while True:
+                    try:
+                        chunk = os.read(fd, 1024 * 1024)
+                    except InterruptedError:
+                        continue
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                opened_after = _regular_signature(os.fstat(fd), confined)
+                anchored_after = _stat_at_signature(parent_fd, name, confined)
+            finally:
+                os.close(fd)
+        data = b"".join(chunks)
+        if (
+            opened_after != opened_before
+            or anchored_after != opened_before
+            or len(data) != opened_before.size
+        ):
+            raise StableFileError("file_changed", f"file changed while reading: {target}")
+    except StableFileError:
+        raise
+    except (FileNotFoundError, ProjectionPathMissing) as exc:
+        raise StableFileError("file_disappeared", str(exc)) from exc
+    except (OSError, FileProjectionError) as exc:
+        raise StableFileError("file_unreadable", str(exc)) from exc
+
+    # Re-open the lexical path after closing the original descriptors. A directory
+    # rename/symlink swap must not turn an anchored read into an adopted alias.
+    try:
+        with _open_target_parent(root, target, create=False) as (
+            _root,
+            post_target,
+            post_parent_fd,
+            post_name,
+            _post_parent,
+        ):
+            post = _stat_at_signature(post_parent_fd, post_name, post_target)
+    except (FileNotFoundError, ProjectionPathMissing) as exc:
+        raise StableFileError("file_disappeared", str(exc)) from exc
+    except (OSError, FileProjectionError) as exc:
+        raise StableFileError("file_changed", str(exc)) from exc
+    if post != opened_before:
+        raise StableFileError("file_changed", f"file changed after reading: {target}")
+
+    return StableMarkdown(
+        root,
+        target,
+        "/".join(parts),
+        opened_before,
+        data.decode("utf-8", errors="replace"),
+    )
+
+
+def stable_markdown_is_current(stable: StableMarkdown) -> bool:
+    """Whether the same lexical path still names the adopted file generation."""
+    try:
+        return (
+            confined_file_signature(stable.vault, stable.path, missing_ok=True) == stable.signature
+        )
+    except (OSError, FileProjectionError):
+        return False

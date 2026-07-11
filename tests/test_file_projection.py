@@ -747,3 +747,107 @@ def test_create_rejects_internal_namespace_before_db_commit(ctx, principals):
         assert conn.execute(
             "SELECT 1 FROM documents WHERE path_norm=?", (".trash/hidden.md",)
         ).fetchone() is None
+
+
+def test_read_stable_markdown_returns_text_and_exact_generation(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    target = vault / "note.md"
+    target.write_text("invalid: \udcff", encoding="utf-8", errors="surrogatepass")
+
+    stable = fp.read_stable_markdown(vault, target)
+
+    assert stable.path == target
+    assert stable.relative_path == "note.md"
+    assert stable.signature == fp.confined_file_signature(vault, target)
+    assert stable.text.startswith("invalid:")
+    assert fp.stable_markdown_is_current(stable)
+
+
+def test_read_stable_markdown_rejects_parent_symlink(tmp_path):
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    vault.mkdir()
+    outside.mkdir()
+    (outside / "note.md").write_text("outside", encoding="utf-8")
+    (vault / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, vault / "link" / "note.md")
+    assert raised.value.reason == "file_unreadable"
+
+
+def test_read_stable_markdown_reports_post_read_disappearance(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    target = vault / "note.md"
+    target.write_text("stable generation", encoding="utf-8")
+    real_stat = fp._stat_at_signature
+    calls = 0
+
+    def disappear_before_post_check(parent_fd, name, confined, *, missing_ok=False):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            target.unlink()
+        return real_stat(parent_fd, name, confined, missing_ok=missing_ok)
+
+    monkeypatch.setattr(fp, "_stat_at_signature", disappear_before_post_check)
+
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, target)
+
+    assert calls == 3
+    assert raised.value.reason == "file_disappeared"
+
+
+def test_read_stable_markdown_never_blocks_on_fifo_swap(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    target = vault / "note.md"
+    target.write_text("regular before open", encoding="utf-8")
+    real_open = fp.os.open
+    swapped = False
+
+    def swap_final_entry(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == target.name and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            assert flags & getattr(os, "O_NONBLOCK", 0)
+            target.unlink()
+            os.mkfifo(target)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(fp.os, "open", swap_final_entry)
+
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, target)
+
+    assert swapped
+    assert raised.value.reason == "file_unreadable"
+
+
+def test_read_stable_markdown_rejects_noncanonical_lexical_component(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    target = vault / "bad\nname.md"
+    target.write_text("external", encoding="utf-8")
+
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, target)
+
+    assert raised.value.reason == "file_unreadable"
+
+
+def test_projection_keeps_supported_internal_segment_whitespace(ctx, principals):
+    result = ctx.docs.create(
+        principals["editor"],
+        "dir /note.md",
+        "supported path",
+        embed=False,
+    )
+
+    assert result["path"] == "dir /note.md"
+    assert (ctx.docs.vault / "dir " / "note.md").read_text(encoding="utf-8") == (
+        "supported path"
+    )
