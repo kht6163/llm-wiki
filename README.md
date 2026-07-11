@@ -41,6 +41,7 @@ uv sync          # 의존성 설치 (torch는 CPU 전용 휠로 설치됨)
 | `GUI_PORT` | 웹 UI 포트 | `8080` |
 | `MCP_PORT` | MCP 서버 포트 | `8081` |
 | `HOST` | 바인드 호스트 | `127.0.0.1` |
+| `REQUEST_MAX_BYTES` | 웹·MCP 공통 HTTP 요청 본문 상한(바이트, 1–100 MiB) | `16777216` |
 | `VAULT_PATH` | 마크다운 `.md` 파일 저장 위치(vault) | `./vault` |
 | `DB_PATH` | SQLite DB 경로(메타·리비전·검색인덱스·그래프·사용자) | `./data/llm_wiki.db` |
 | `EMBEDDING_MODEL` | 로컬 임베딩 모델 | `intfloat/multilingual-e5-base` |
@@ -191,6 +192,7 @@ docker compose up -d                                             # 웹(8080) + M
 - torch는 pyproject의 `pytorch-cpu` 인덱스를 따라 **CPU 휠**로 설치되어 이미지가 가볍습니다.
 - 임베딩 모델 캐시는 `hf-models` 볼륨에 보존되어 재시작 시 재다운로드하지 않습니다.
 - `./data`(DB)·`./vault`(문서)는 호스트에 바인드 마운트됩니다. TLS 뒤라면 `COOKIE_SECURE=true`를 설정하세요.
+- Compose 포트는 기본적으로 호스트의 루프백에만 바인딩됩니다. 공개 접근은 TLS를 종료하는 리버스 프록시를 통하고, 프록시의 요청 본문 상한도 설정하세요. 프록시 상한은 애플리케이션의 `REQUEST_MAX_BYTES`를 보완할 뿐 대체하지 않습니다.
 - 헬스체크: 웹 `/healthz`(liveness)·`/readyz`(DB + 모델 로드 확인), MCP `:8081/healthz`. 이미지/compose에 `HEALTHCHECK`·메모리 제한·`no-new-privileges`가 적용됩니다.
 - 메트릭: Prometheus 노출 엔드포인트 `/metrics`(웹·MCP 양쪽 포트, 공유 레지스트리). 무인증이므로 스크레이프 대상 외에는 네트워크 레벨에서 차단하세요. `LOG_FILE`로 로테이션 로그 파일을 남길 수 있습니다.
 

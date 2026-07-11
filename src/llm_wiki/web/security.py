@@ -12,13 +12,14 @@ from urllib.parse import urlsplit
 from fastapi import HTTPException, Request
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 
 from ..logconf import bind_request_id, new_request_id, reset_request_id
 from ..ratelimit import RateLimiter
 
 # Re-exported for callers that still import RateLimiter from this module.
-__all__ = ["RateLimiter", "RequestIdMiddleware", "SecurityHeadersMiddleware",
-           "build_csp", "enforce_csrf", "get_csrf_token"]
+__all__ = ["RateLimiter", "RequestBodyLimitMiddleware", "RequestIdMiddleware",
+           "SecurityHeadersMiddleware", "build_csp", "enforce_csrf", "get_csrf_token"]
 
 _log = logging.getLogger("llm_wiki.web")
 
@@ -92,6 +93,63 @@ async def enforce_csrf(request: Request) -> None:
 
 
 # -- request correlation ---------------------------------------------------
+class RequestBodyLimitMiddleware:
+    """Reject HTTP request bodies that exceed ``max_bytes`` before parsing."""
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = int(max_bytes)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        content_length = next(
+            (value for key, value in scope.get("headers", [])
+             if key.lower() == b"content-length"),
+            None,
+        )
+        try:
+            declared = int(content_length) if content_length is not None else None
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > self.max_bytes:
+            await self._reject(scope, receive, send)
+            return
+
+        received = 0
+        rejected = False
+
+        async def limited_receive():
+            nonlocal received, rejected
+            if rejected:
+                return {"type": "http.disconnect"}
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    rejected = True
+                    await self._reject(scope, receive, send)
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def limited_send(message):
+            if not rejected:
+                await send(message)
+
+        try:
+            await self.app(scope, limited_receive, limited_send)
+        except Exception:
+            if not rejected:
+                raise
+
+    @staticmethod
+    async def _reject(scope, receive, send) -> None:
+        response = JSONResponse({"detail": "Request body too large."}, status_code=413)
+        await response(scope, receive, send)
+
+
 class RequestIdMiddleware:
     """Bind a per-request correlation id into the logging context so every llm_wiki
     log line for the request carries it, echo it back as the ``X-Request-ID`` response

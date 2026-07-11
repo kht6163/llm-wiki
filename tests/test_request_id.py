@@ -2,8 +2,10 @@
 response header (minted + inbound-honoured), and the 500 envelope surfacing the id."""
 import logging
 import re
+from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from llm_wiki.logconf import (
@@ -13,6 +15,7 @@ from llm_wiki.logconf import (
     new_request_id,
     reset_request_id,
 )
+from llm_wiki.metrics import _route_label
 from llm_wiki.web import create_web_app
 
 
@@ -41,6 +44,34 @@ def test_new_request_id_is_unique_and_short():
     a, b = new_request_id(), new_request_id()
     assert a != b
     assert len(a) == 12 and a.isalnum()
+
+
+def _request_for_metric(path: str, route_path: str | None = None) -> Request:
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [],
+        "http_version": "1.1",
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("test", 1),
+    }
+    if route_path is not None:
+        scope["route"] = SimpleNamespace(path=route_path)
+    return Request(scope)
+
+
+def test_route_label_bounds_unmatched_paths():
+    request = _request_for_metric("/arbitrary/not-found/path")
+    assert _route_label(request) == "__unmatched__"
+
+
+def test_route_label_uses_matched_route_template():
+    request = _request_for_metric("/doc/notes/example", "/doc/{path}")
+    assert _route_label(request) == "/doc/{path}"
 
 
 # -- web X-Request-ID header + 500 envelope --------------------------------

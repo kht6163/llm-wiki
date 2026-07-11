@@ -69,6 +69,7 @@ from ..util import (
 )
 from .security import (
     RateLimiter,
+    RequestBodyLimitMiddleware,
     RequestIdMiddleware,
     SecurityHeadersMiddleware,
     build_csp,
@@ -223,6 +224,9 @@ def create_web_app(app: AppContext) -> FastAPI:
     web.add_middleware(
         SessionMiddleware, secret_key=secret, same_site="lax",
         https_only=app.settings.cookie_secure, max_age=14 * 86400,
+    )
+    web.add_middleware(
+        RequestBodyLimitMiddleware, max_bytes=app.settings.request_max_bytes
     )
     # Outermost (added last): bind the correlation id before any other middleware runs
     # so all of them log under it and the X-Request-ID header is set on every response.

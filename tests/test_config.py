@@ -41,6 +41,19 @@ def test_shutdown_grace_defaults_and_bounds():
         Settings(shutdown_grace_s=301)
 
 
+def test_request_max_bytes_defaults_and_bounds():
+    one_mib = 1 * 1024 * 1024
+    hundred_mib = 100 * 1024 * 1024
+
+    assert Settings().request_max_bytes == 16 * 1024 * 1024
+    assert Settings(request_max_bytes=one_mib).request_max_bytes == one_mib
+    assert Settings(request_max_bytes=hundred_mib).request_max_bytes == hundred_mib
+    with pytest.raises(ValidationError):
+        Settings(request_max_bytes=one_mib - 1)
+    with pytest.raises(ValidationError):
+        Settings(request_max_bytes=hundred_mib + 1)
+
+
 def test_get_settings_wraps_validation_as_config_error(monkeypatch):
     monkeypatch.setenv("GUI_PORT", "8080")
     monkeypatch.setenv("MCP_PORT", "8080")  # collides with GUI_PORT

@@ -26,6 +26,7 @@ from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
 from .util import now_iso
 from .web import create_web_app
+from .web.security import RequestBodyLimitMiddleware
 
 SNAPSHOT_FORMAT = "llm-wiki-snapshot"
 
@@ -607,6 +608,9 @@ def _serve(args) -> int:
 
     web_app = create_web_app(ctx)
     mcp_app = create_mcp_server(ctx).streamable_http_app()
+    mcp_app.add_middleware(
+        RequestBodyLimitMiddleware, max_bytes=settings.request_max_bytes
+    )
 
     # Unauthenticated health + metrics routes on the MCP app (for orchestrators /
     # probes / Prometheus scraping the MCP port). The metrics registry is shared

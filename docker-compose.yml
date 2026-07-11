@@ -3,8 +3,8 @@ services:
     build: .
     image: llm-wiki:latest
     ports:
-      - "8080:8080"   # web UI
-      - "8081:8081"   # MCP (streamable-http)
+      - "127.0.0.1:8080:8080"   # web UI
+      - "127.0.0.1:8081:8081"   # MCP (streamable-http)
     environment:
       - HOST=0.0.0.0
       # - COOKIE_SECURE=true              # enable when serving behind TLS

@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     gui_port: int = 8080
     mcp_port: int = 8081
+    request_max_bytes: int = 16 * 1024 * 1024
 
     # Storage
     vault_path: Path = Path("./vault")
@@ -90,6 +91,17 @@ class Settings(BaseSettings):
     def _grace_in_range(cls, v: int) -> int:
         if not (1 <= int(v) <= 300):
             raise ValueError(f"shutdown_grace_s must be between 1 and 300 (got {v})")
+        return int(v)
+
+    @field_validator("request_max_bytes")
+    @classmethod
+    def _request_max_bytes_in_range(cls, v: int) -> int:
+        minimum = 1 * 1024 * 1024
+        maximum = 100 * 1024 * 1024
+        if not (minimum <= int(v) <= maximum):
+            raise ValueError(
+                f"request_max_bytes must be between {minimum} and {maximum} (got {v})"
+            )
         return int(v)
 
     @field_validator("gui_port", "mcp_port")

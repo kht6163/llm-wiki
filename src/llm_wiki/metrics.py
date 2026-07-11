@@ -126,10 +126,9 @@ def render_latest() -> tuple[bytes, str]:
 
 
 def _route_label(request) -> str:
-    """The matched route's path template (low cardinality), or the raw path if the
-    request didn't match a route (404)."""
+    """The matched route's path template, or a bounded unmatched sentinel."""
     route = request.scope.get("route")
-    return getattr(route, "path", None) or request.url.path
+    return getattr(route, "path", None) or "__unmatched__"
 
 
 class PrometheusMiddleware(BaseHTTPMiddleware):
