@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from llm_wiki import file_projection as fp
+from llm_wiki.db import Database
+from llm_wiki.util import path_norm, sha256_hex
 
 
 def test_file_signature_detects_same_length_rewrite_and_atomic_replace(tmp_path):
@@ -341,3 +343,366 @@ def test_file_signature_missing_ok_only_accepts_enoent(tmp_path):
     directory.mkdir()
     with pytest.raises(fp.UnsafeProjectionPath):
         fp.file_signature(directory, missing_ok=True)
+
+
+def _doc_id(ctx, rel: str) -> int:
+    with ctx.db.reader() as conn:
+        return int(
+            conn.execute(
+                "SELECT id FROM documents WHERE path_norm=?", (path_norm(rel),)
+            ).fetchone()[0]
+        )
+
+
+def test_projector_retries_latest_revision_instead_of_installing_stale_body(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "race.md", "v1")
+    doc_id = _doc_id(ctx, "race.md")
+    external_db = Database(ctx.db.path)
+    real_stage = fp.stage_text
+    injected = False
+
+    def stage_then_commit_v3(vault, target, body):
+        nonlocal injected
+        staged = real_stage(vault, target, body)
+        if body == "v2" and not injected:
+            injected = True
+            # A separate Database instance has a separate process-local lock. The
+            # stale stage must therefore be fenced by SQLite's cross-instance writer
+            # transaction, not by ctx.db's in-process RLock.
+            with external_db.writer() as conn:
+                conn.execute(
+                    "UPDATE documents SET version=3,content_hash=?,file_state='pending' "
+                    "WHERE id=? AND version=2",
+                    (sha256_hex("v3"), doc_id),
+                )
+                conn.execute(
+                    "INSERT INTO revisions(doc_id,version,body,title,content_hash,"
+                    "author_id,op,via,created_at) VALUES(?,3,'v3','race',?,NULL,'edit','web','now')",
+                    (doc_id, sha256_hex("v3")),
+                )
+        return staged
+
+    monkeypatch.setattr(fp, "stage_text", stage_then_commit_v3)
+    try:
+        docs.update(editor, "race.md", 1, "v2")
+    finally:
+        external_db.close()
+
+    assert (docs.vault / "race.md").read_text(encoding="utf-8") == "v3"
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT version,file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+    assert (row["version"], row["file_state"]) == (3, "clean")
+
+
+def test_projector_leaves_corrupt_exact_revision_pending(ctx, principals):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "corrupt.md", "canonical")
+    doc_id = _doc_id(ctx, "corrupt.md")
+    projected = docs.vault / "corrupt.md"
+    projected.write_text("sentinel", encoding="utf-8")
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,))
+        conn.execute(
+            "UPDATE revisions SET body='tampered' WHERE doc_id=? AND version=1",
+            (doc_id,),
+        )
+
+    result = docs._project_current(doc_id)
+    assert result.reason == "projection_corrupt" and not result.settled
+    assert projected.read_text(encoding="utf-8") == "sentinel"
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()[0] == "pending"
+
+
+def test_purge_intent_created_after_stage_fences_stale_projector(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "purge-race.md", "canonical")
+    doc_id = _doc_id(ctx, "purge-race.md")
+    live = docs.vault / "purge-race.md"
+    live.write_text("external live", encoding="utf-8")
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "UPDATE documents SET is_deleted=1,file_state='pending' WHERE id=?",
+            (doc_id,),
+        )
+
+    real_stage = fp.stage_text
+    injected = False
+
+    def stage_then_request_purge(vault, target, body):
+        nonlocal injected
+        staged = real_stage(vault, target, body)
+        if not injected:
+            injected = True
+            with ctx.db.writer() as conn:
+                conn.execute(
+                    "INSERT INTO document_purge_intents("
+                    "doc_id,path,path_norm,version,actor,via,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (doc_id, "purge-race.md", "purge-race.md", 1, "admin", "web", "now"),
+                )
+        return staged
+
+    monkeypatch.setattr(fp, "stage_text", stage_then_request_purge)
+    result = docs._project_current(doc_id)
+    assert result.reason == "purge_pending" and not result.settled
+    assert live.read_text(encoding="utf-8") == "external live"
+    assert not (docs.vault / ".trash" / "purge-race.md").exists()
+
+
+def test_deleted_projector_uses_revision_not_stale_live_file(ctx, principals):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "deleted.md", "canonical body")
+    doc_id = _doc_id(ctx, "deleted.md")
+    live = docs.vault / "deleted.md"
+    live.write_text("stale disk body", encoding="utf-8")
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "UPDATE documents SET is_deleted=1,file_state='pending' WHERE id=?",
+            (doc_id,),
+        )
+
+    result = docs._project_current(doc_id)
+    assert result.transitioned and result.settled
+    assert not live.exists()
+    assert (docs.vault / ".trash" / "deleted.md").read_text(
+        encoding="utf-8"
+    ) == "canonical body"
+
+
+def test_projection_failure_after_replace_stays_pending_and_recovers(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "retry.md", "canonical")
+    doc_id = _doc_id(ctx, "retry.md")
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,))
+    real_install = fp.install_staged
+    failed = False
+
+    def install_then_fail(staged, target):
+        nonlocal failed
+        installed = real_install(staged, target)
+        if not failed:
+            failed = True
+            raise OSError("injected post-replace failure")
+        return installed
+
+    monkeypatch.setattr(fp, "install_staged", install_then_fail)
+    result = docs._project_current(doc_id)
+    assert result.reason == "io_error" and not result.settled
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()[0] == "pending"
+    assert docs.recover_pending() == 1
+
+
+def test_target_directory_fsync_failure_stays_pending_then_converges(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "fsync-retry.md", "canonical after retry")
+    doc_id = _doc_id(ctx, "fsync-retry.md")
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,))
+
+    real_replace = fp.os.replace
+    real_fsync_directory_fd = fp._fsync_directory_fd
+    target_replaced = False
+    failed = False
+
+    def record_target_replace(*args, **kwargs):
+        nonlocal target_replaced
+        result = real_replace(*args, **kwargs)
+        target_replaced = True
+        return result
+
+    def fail_first_directory_fsync_after_replace(fd):
+        nonlocal failed
+        if target_replaced and not failed:
+            failed = True
+            raise OSError("injected target directory fsync failure")
+        return real_fsync_directory_fd(fd)
+
+    monkeypatch.setattr(fp.os, "replace", record_target_replace)
+    monkeypatch.setattr(fp, "_fsync_directory_fd", fail_first_directory_fsync_after_replace)
+    result = docs._project_current(doc_id)
+
+    assert result.reason == "io_error" and not result.settled
+    assert failed
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()[0] == "pending"
+
+    monkeypatch.setattr(fp.os, "replace", real_replace)
+    monkeypatch.setattr(fp, "_fsync_directory_fd", real_fsync_directory_fd)
+    assert docs.recover_pending() == 1
+    assert (docs.vault / "fsync-retry.md").read_text(
+        encoding="utf-8"
+    ) == "canonical after retry"
+    assert list((docs.vault / ".tmp").iterdir()) == []
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()[0] == "clean"
+
+
+def test_bounded_recovery_continues_after_one_document_conflict(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    ids: list[int] = []
+    for number in range(3):
+        rel = f"pending-{number}.md"
+        docs.create(editor, rel, f"body {number}")
+        ids.append(_doc_id(ctx, rel))
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id IN (?,?,?)", ids)
+    original = docs._project_current
+
+    def conflict_first(doc_id, *, max_attempts=3):
+        if doc_id == ids[0]:
+            return fp.ProjectionResult(
+                doc_id, "pending-0.md", False, False, "target_changed", max_attempts
+            )
+        return original(doc_id, max_attempts=max_attempts)
+
+    monkeypatch.setattr(docs, "_project_current", conflict_first)
+    report = docs._recover_pending_report(page_size=2)
+    assert report.recovered == 2
+    assert [issue.doc_id for issue in report.issues] == [ids[0]]
+    with ctx.db.reader() as conn:
+        states = {
+            int(row["id"]): row["file_state"]
+            for row in conn.execute(
+                "SELECT id,file_state FROM documents WHERE id IN (?,?,?)", ids
+            )
+        }
+    assert states == {ids[0]: "pending", ids[1]: "clean", ids[2]: "clean"}
+
+
+def test_bounded_recovery_continues_after_real_stage_io_error(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    ids: list[int] = []
+    for number in range(3):
+        rel = f"io-pending-{number}.md"
+        docs.create(editor, rel, f"body {number}")
+        ids.append(_doc_id(ctx, rel))
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id IN (?,?,?)", ids)
+
+    real_stage = fp.stage_text
+
+    def fail_first_stage(vault, target, body):
+        if Path(target).name == "io-pending-0.md":
+            raise OSError("injected stage failure")
+        return real_stage(vault, target, body)
+
+    monkeypatch.setattr(fp, "stage_text", fail_first_stage)
+    report = docs._recover_pending_report(page_size=1)
+
+    assert report.recovered == 2
+    assert [(issue.doc_id, issue.reason) for issue in report.issues] == [
+        (ids[0], "io_error")
+    ]
+    with ctx.db.reader() as conn:
+        states = {
+            int(row["id"]): row["file_state"]
+            for row in conn.execute(
+                "SELECT id,file_state FROM documents WHERE id IN (?,?,?)", ids
+            )
+        }
+    assert states == {ids[0]: "pending", ids[1]: "clean", ids[2]: "clean"}
+
+
+def test_recovery_uses_latest_state_after_page_fetch_and_keeps_max_id_frontier(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    ids: list[int] = []
+    for number in range(3):
+        rel = f"frontier-{number}.md"
+        docs.create(editor, rel, f"body {number}")
+        ids.append(_doc_id(ctx, rel))
+    docs.create(editor, "frontier-late.md", "late body")
+    late_id = _doc_id(ctx, "frontier-late.md")
+    with ctx.db.writer() as conn:
+        conn.execute("UPDATE documents SET file_state='pending' WHERE id IN (?,?,?)", ids)
+
+    external_db = Database(ctx.db.path)
+    original = docs._project_current
+    injected = False
+
+    def mutate_second_after_first(doc_id, *, max_attempts=3):
+        nonlocal injected
+        result = original(doc_id, max_attempts=max_attempts)
+        if doc_id == ids[0] and not injected:
+            injected = True
+            latest = "body 1 changed after page fetch"
+            with external_db.writer() as conn:
+                conn.execute(
+                    "UPDATE documents SET version=2,content_hash=?,file_state='pending' "
+                    "WHERE id=? AND version=1",
+                    (sha256_hex(latest), ids[1]),
+                )
+                conn.execute(
+                    "INSERT INTO revisions(doc_id,version,body,title,content_hash,"
+                    "author_id,op,via,created_at) VALUES(?,2,?,'frontier-1',?,NULL,"
+                    "'edit','web','now')",
+                    (ids[1], latest, sha256_hex(latest)),
+                )
+                # This ID is beyond the recovery run's initial pending MAX(id), so a
+                # newly-pending document is deliberately left for the next sweep.
+                conn.execute(
+                    "UPDATE documents SET file_state='pending' WHERE id=?", (late_id,)
+                )
+        return result
+
+    monkeypatch.setattr(docs, "_project_current", mutate_second_after_first)
+    try:
+        report = docs._recover_pending_report(page_size=2)
+    finally:
+        external_db.close()
+
+    assert report.recovered == 3
+    assert report.issues == ()
+    assert (docs.vault / "frontier-1.md").read_text(
+        encoding="utf-8"
+    ) == "body 1 changed after page fetch"
+    with ctx.db.reader() as conn:
+        states = {
+            int(row["id"]): row["file_state"]
+            for row in conn.execute(
+                "SELECT id,file_state FROM documents WHERE id IN (?,?,?,?)",
+                (*ids, late_id),
+            )
+        }
+    assert states == {
+        ids[0]: "clean",
+        ids[1]: "clean",
+        ids[2]: "clean",
+        late_id: "pending",
+    }
+
+
+def test_create_rejects_internal_namespace_before_db_commit(ctx, principals):
+    with pytest.raises(fp.UnsafeProjectionPath):
+        ctx.docs.create(principals["editor"], ".Trash/hidden.md", "body")
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM documents WHERE path_norm=?", (".trash/hidden.md",)
+        ).fetchone() is None

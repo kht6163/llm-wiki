@@ -19,11 +19,13 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from pathlib import Path
 from urllib.parse import quote
 
+from .. import file_projection as fp
 from .. import graph, indexing, search
 from ..db import Database
 from ..embedding import Embedder
@@ -107,6 +109,41 @@ _IMG_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s]+)(?:[ \t]+\"[^\"]*\")?\)")
 # week is generous; older rows are swept opportunistically on each keyed write to
 # bound the ledger's growth.
 _IDEM_RETENTION_DAYS = 7
+
+
+@dataclass(frozen=True)
+class ProjectionSnapshot:
+    """One canonical document generation captured by a single DB read."""
+
+    doc_id: int
+    path: str
+    path_norm: str
+    version: int
+    content_hash: str
+    is_deleted: bool
+    file_state: str
+    revision_version: int | None
+    revision_content_hash: str | None
+    body: str | None
+    has_purge_intent: bool
+    has_cleanup_intent: bool
+
+
+@dataclass(frozen=True)
+class RecoveryReport:
+    recovered: int
+    issues: tuple[fp.ProjectionResult, ...]
+
+
+class ProjectionPendingError(RuntimeError):
+    """A committed DB write whose filesystem projection remains recoverable."""
+
+    def __init__(self, result: fp.ProjectionResult):
+        detail = f": {result.detail}" if result.detail else ""
+        super().__init__(
+            f"Document file projection remains pending ({result.reason or 'unknown'}){detail}"
+        )
+        self.result = result
 
 
 def _attachment_subname(name: str, ext: str, data: bytes) -> str:
@@ -317,6 +354,342 @@ class DocumentService:
             dest = self.vault / ".trash" / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             os.replace(src, dest)
+
+    def _projection_snapshot(
+        self, conn: sqlite3.Connection, doc_id: int
+    ) -> ProjectionSnapshot | None:
+        """Load a document and its exact current revision in one SQLite snapshot."""
+        row = conn.execute(
+            "SELECT d.id,d.path,d.path_norm,d.version,d.content_hash,d.is_deleted,"
+            "d.file_state,r.version AS revision_version,"
+            "r.content_hash AS revision_content_hash,r.body,"
+            "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+            "AS has_purge_intent,"
+            "EXISTS(SELECT 1 FROM file_projection_cleanup c WHERE c.doc_id=d.id) "
+            "AS has_cleanup_intent "
+            "FROM documents d LEFT JOIN revisions r "
+            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
+            (int(doc_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return ProjectionSnapshot(
+            doc_id=int(row["id"]),
+            path=str(row["path"]),
+            path_norm=str(row["path_norm"]),
+            version=int(row["version"]),
+            content_hash=str(row["content_hash"]),
+            is_deleted=bool(row["is_deleted"]),
+            file_state=str(row["file_state"]),
+            revision_version=(
+                int(row["revision_version"])
+                if row["revision_version"] is not None
+                else None
+            ),
+            revision_content_hash=(
+                str(row["revision_content_hash"])
+                if row["revision_content_hash"] is not None
+                else None
+            ),
+            body=str(row["body"]) if row["body"] is not None else None,
+            has_purge_intent=bool(row["has_purge_intent"]),
+            has_cleanup_intent=bool(row["has_cleanup_intent"]),
+        )
+
+    def _projection_token_state(
+        self, conn: sqlite3.Connection, snapshot: ProjectionSnapshot
+    ) -> str:
+        """Revalidate a staged generation without loading its potentially large body."""
+        row = conn.execute(
+            "SELECT d.path,d.path_norm,d.version,d.content_hash,d.is_deleted,d.file_state,"
+            "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+            "AS has_purge_intent,"
+            "EXISTS(SELECT 1 FROM file_projection_cleanup c WHERE c.doc_id=d.id) "
+            "AS has_cleanup_intent,"
+            "EXISTS(SELECT 1 FROM revisions r WHERE r.doc_id=d.id "
+            "AND r.version=d.version AND r.content_hash=d.content_hash) AS exact_revision "
+            "FROM documents d WHERE d.id=?",
+            (snapshot.doc_id,),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        if row["has_purge_intent"]:
+            return "purge_pending"
+        if row["has_cleanup_intent"]:
+            return "cleanup_pending"
+        current_token = (
+            str(row["path"]),
+            str(row["path_norm"]),
+            int(row["version"]),
+            str(row["content_hash"]),
+            bool(row["is_deleted"]),
+        )
+        staged_token = (
+            snapshot.path,
+            snapshot.path_norm,
+            snapshot.version,
+            snapshot.content_hash,
+            snapshot.is_deleted,
+        )
+        if current_token != staged_token or not row["exact_revision"]:
+            return "changed"
+        if row["file_state"] == "clean":
+            return "settled"
+        if row["file_state"] != "pending":
+            return "changed"
+        return "current"
+
+    def _project_current(
+        self, doc_id: int, *, max_attempts: int = 3
+    ) -> fp.ProjectionResult:
+        """Install only the latest exact revision, fenced by a final writer token.
+
+        Staging is intentionally outside the SQLite writer. Publication, removal of
+        the opposite live/trash copy, and the exact ``pending -> clean`` transition
+        happen while the writer lock prevents another DB generation from committing.
+        """
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+
+        last_path: str | None = None
+        last_deleted: bool | None = None
+        for attempt in range(1, max_attempts + 1):
+            with self.db.reader() as conn:
+                snapshot = self._projection_snapshot(conn, int(doc_id))
+            if snapshot is None:
+                return fp.ProjectionResult(
+                    int(doc_id), None, True, False, "missing", attempt
+                )
+
+            last_path = snapshot.path
+            last_deleted = snapshot.is_deleted
+            if snapshot.has_purge_intent:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "purge_pending",
+                    attempt,
+                    snapshot.is_deleted,
+                )
+            if snapshot.has_cleanup_intent:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "cleanup_pending",
+                    attempt,
+                    snapshot.is_deleted,
+                )
+            if snapshot.file_state == "clean":
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    True,
+                    False,
+                    "already_settled",
+                    attempt,
+                    snapshot.is_deleted,
+                )
+            if (
+                snapshot.file_state != "pending"
+                or snapshot.revision_version != snapshot.version
+                or snapshot.revision_content_hash != snapshot.content_hash
+                or snapshot.body is None
+                or sha256_hex(snapshot.body) != snapshot.content_hash
+            ):
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "projection_corrupt",
+                    attempt,
+                    snapshot.is_deleted,
+                    "The current document row and exact revision do not agree.",
+                )
+
+            staged: fp.StagedText | None = None
+            current_installed = False
+            try:
+                live_target = fp.managed_path(self.vault, snapshot.path, namespace="live")
+                trash_target = fp.managed_path(
+                    self.vault, snapshot.path, namespace="trash"
+                )
+                target = trash_target if snapshot.is_deleted else live_target
+                staged = fp.stage_text(self.vault, target, snapshot.body)
+
+                with self.db.writer() as conn:
+                    token_state = self._projection_token_state(conn, snapshot)
+                    if token_state == "changed":
+                        continue
+                    if token_state == "missing":
+                        return fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "missing",
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+                    if token_state == "settled":
+                        return fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "already_settled",
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+                    if token_state in ("purge_pending", "cleanup_pending"):
+                        return fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            False,
+                            False,
+                            token_state,
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+
+                    installed = fp.install_staged(staged, target)
+                    current_installed = True
+                    if snapshot.is_deleted:
+                        fp.unlink_regular(live_target, vault=self.vault)
+                        file_mtime = None
+                    else:
+                        fp.unlink_regular(trash_target, vault=self.vault)
+                        file_mtime = installed.mtime_ns / 1_000_000_000
+                    changed = conn.execute(
+                        "UPDATE documents SET file_state='clean',file_mtime=? "
+                        "WHERE id=? AND path=? AND path_norm=? AND version=? "
+                        "AND content_hash=? AND is_deleted=? AND file_state='pending' "
+                        "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p "
+                        "WHERE p.doc_id=?) "
+                        "AND NOT EXISTS(SELECT 1 FROM file_projection_cleanup c "
+                        "WHERE c.doc_id=?) "
+                        "AND EXISTS(SELECT 1 FROM revisions r WHERE r.doc_id=? "
+                        "AND r.version=? AND r.content_hash=?)",
+                        (
+                            file_mtime,
+                            snapshot.doc_id,
+                            snapshot.path,
+                            snapshot.path_norm,
+                            snapshot.version,
+                            snapshot.content_hash,
+                            int(snapshot.is_deleted),
+                            snapshot.doc_id,
+                            snapshot.doc_id,
+                            snapshot.doc_id,
+                            snapshot.version,
+                            snapshot.content_hash,
+                        ),
+                    )
+                    if changed.rowcount != 1:
+                        raise RuntimeError(
+                            "projection fence changed inside the serialized writer"
+                        )
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    True,
+                    True,
+                    None,
+                    attempt,
+                    snapshot.is_deleted,
+                    current_installed=current_installed,
+                )
+            except (OSError, fp.FileProjectionError) as exc:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "io_error",
+                    attempt,
+                    snapshot.is_deleted,
+                    f"{type(exc).__name__}: {exc}",
+                    current_installed,
+                )
+            finally:
+                if staged is not None:
+                    try:
+                        fp.cleanup_staged(staged)
+                    except (OSError, fp.FileProjectionError) as exc:
+                        log.warning(
+                            "Could not clean staged projection for document %d: %s",
+                            snapshot.doc_id,
+                            exc,
+                        )
+
+        return fp.ProjectionResult(
+            int(doc_id),
+            last_path,
+            False,
+            False,
+            "target_changed",
+            max_attempts,
+            last_deleted,
+        )
+
+    def _require_projection(self, doc_id: int) -> fp.ProjectionResult:
+        result = self._project_current(doc_id)
+        if not result.settled:
+            raise ProjectionPendingError(result)
+        return result
+
+    def _recover_pending_report(self, *, page_size: int = 64) -> RecoveryReport:
+        """Visit a bounded ID frontier and continue after per-document failures."""
+        page_size = clamp_int(page_size, 1, 1024)
+        pending_where = (
+            "d.file_state='pending' "
+            "OR EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+            "OR EXISTS(SELECT 1 FROM file_projection_cleanup c WHERE c.doc_id=d.id)"
+        )
+        with self.db.reader() as conn:
+            max_id = int(
+                conn.execute(
+                    f"SELECT COALESCE(MAX(d.id),0) FROM documents d WHERE {pending_where}"
+                ).fetchone()[0]
+            )
+        cursor = 0
+        recovered = 0
+        issues: list[fp.ProjectionResult] = []
+        while cursor < max_id:
+            with self.db.reader() as conn:
+                rows = conn.execute(
+                    f"SELECT d.id FROM documents d WHERE d.id>? AND d.id<=? "
+                    f"AND ({pending_where}) ORDER BY d.id LIMIT ?",
+                    (cursor, max_id, page_size),
+                ).fetchall()
+            if not rows:
+                break
+            ids = [int(row["id"]) for row in rows]
+            for current_id in ids:
+                try:
+                    result = self._project_current(current_id)
+                except Exception as exc:
+                    log.exception(
+                        "recover_pending: document %d raised unexpectedly", current_id
+                    )
+                    result = fp.ProjectionResult(
+                        current_id,
+                        None,
+                        False,
+                        False,
+                        "recovery_error",
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
+                if result.transitioned:
+                    recovered += 1
+                if not result.settled:
+                    issues.append(result)
+            cursor = ids[-1]
+        return RecoveryReport(recovered, tuple(issues))
 
     # ---- idempotency ----------------------------------------------------
     def _idem_lookup(self, scope: str, user_id: int, key: str) -> dict | None:
@@ -1128,6 +1501,10 @@ class DocumentService:
             raise ForbiddenError(
                 f"Role '{principal.role}' cannot create documents (read/search only).")
         rel = normalize_rel_path(path)
+        # Reject internal namespaces and unsafe existing path components before the
+        # canonical DB write commits. Parent directories may be created later by the
+        # staged projector, after the row is durably marked pending.
+        fp.managed_path(self.vault, rel, namespace="live")
         norm, folder, stem = path_norm(rel), folder_of(rel), basename_stem(rel).lower()
         content = content or ""
         meta = parse_frontmatter(content)[0]
@@ -1157,7 +1534,9 @@ class DocumentService:
                     "VALUES(?,?,?,?,?,?, 'pending', 1, 0, ?,?,?,?)",
                     (rel, norm, final_title, 1, chash, folder, now, principal.user_id, now, principal.user_id),
                 )
-                doc_id, new_version = cur.lastrowid, 1
+                if cur.lastrowid is None:
+                    raise RuntimeError("document insert did not return an id")
+                doc_id, new_version = int(cur.lastrowid), 1
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'create', ?, ?)",
@@ -1171,11 +1550,9 @@ class DocumentService:
             audit.record(conn, actor=principal.username, via=principal.via,
                          action="doc_create", target=rel, detail=f"v{new_version}")
 
-        mtime = self._write_file(rel, content)
-        with self.db.writer() as conn:
-            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+        self._require_projection(int(doc_id))
         if embed:
-            self._embed(doc_id)
+            self._embed(int(doc_id))
         DOC_WRITES.labels("create").inc()
         self._emit("create", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via)
@@ -1192,6 +1569,7 @@ class DocumentService:
         if base_version is None:
             raise ValidationError("base_version is required for updates.")
         rel = normalize_rel_path(path)
+        fp.managed_path(self.vault, rel, namespace="live")
         norm, folder = path_norm(rel), folder_of(rel)
         content = content or ""
         meta = parse_frontmatter(content)[0]
@@ -1254,11 +1632,9 @@ class DocumentService:
                     "%Y-%m-%dT%H:%M:%SZ")
                 conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
 
-        mtime = self._write_file(rel, content)
-        with self.db.writer() as conn:
-            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+        self._require_projection(int(doc_id))
         if content_changed and embed:
-            self._embed(doc_id)
+            self._embed(int(doc_id))
         DOC_WRITES.labels("update").inc()
         self._emit("update", rel, new_version, title=final_title,
                    updated_by=principal.username, via=principal.via,
@@ -2026,31 +2402,18 @@ class DocumentService:
 
     # ---- maintenance ----------------------------------------------------
     def recover_pending(self) -> int:
-        """Finish any file projection a crash left half-done (file_state='pending').
-        Live docs are re-written from their latest revision; deleted docs whose
-        ``_trash_file`` never ran have their leftover file trashed now. Both then
-        clear to 'clean'. Idempotent."""
-        with self.db.reader() as conn:
-            live = conn.execute(
-                "SELECT id, path FROM documents WHERE file_state='pending' AND is_deleted=0"
-            ).fetchall()
-            gone = conn.execute(
-                "SELECT id, path FROM documents WHERE file_state='pending' AND is_deleted=1"
-            ).fetchall()
-            bodies = {r["id"]: (r["path"], self._latest_body(conn, r["id"])) for r in live}
-            trash = [(r["id"], r["path"]) for r in gone]
-        for doc_id, (rel, body) in bodies.items():
-            mtime = self._write_file(rel, body)
-            with self.db.writer() as conn:
-                conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
-        for doc_id, rel in trash:
-            self._trash_file(rel)
-            with self.db.writer() as conn:
-                conn.execute("UPDATE documents SET file_state='clean' WHERE id=?", (doc_id,))
-        if bodies or trash:
-            log.info("recover_pending: re-projected %d file(s), trashed %d leftover delete(s)",
-                     len(bodies), len(trash))
-        return len(bodies) + len(trash)
+        """Finish a bounded frontier of pending projections and report issues in logs."""
+        report = self._recover_pending_report()
+        if report.recovered:
+            log.info("recover_pending: settled %d document projection(s)", report.recovered)
+        for issue in report.issues:
+            log.warning(
+                "recover_pending: document %d remains pending (%s)%s",
+                issue.doc_id,
+                issue.reason or "unknown",
+                f": {issue.detail}" if issue.detail else "",
+            )
+        return report.recovered
 
     def embed_pending(self) -> int:
         """Embed any documents still flagged ``vector_dirty`` (no-op when none are).
