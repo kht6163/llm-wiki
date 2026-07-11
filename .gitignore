@@ -37,3 +37,4 @@ coverage.xml
 # Isolated Codex/Superpowers worktrees
 /.worktrees/
 /.superpowers/
+/docs/superpowers/
