@@ -101,6 +101,53 @@ def file_signature(path: Path | str, *, missing_ok: bool = False) -> FileSignatu
     return _regular_signature(value, target)
 
 
+def confined_file_signature(
+    vault: Path | str, path: Path | str, *, missing_ok: bool = False
+) -> FileSignature | None:
+    """Return a regular-file signature through a vault-anchored directory chain.
+
+    Unlike a plain lexical ``lstat``, the directory descriptors used here cannot
+    follow a parent symlink that is swapped in between validation and lookup.
+    """
+    target = Path(path)
+    try:
+        with _open_target_parent(vault, target, create=False) as (
+            _root,
+            confined,
+            parent_fd,
+            name,
+            _parent,
+        ):
+            return _stat_at_signature(
+                parent_fd, name, confined, missing_ok=missing_ok
+            )
+    except ProjectionPathMissing:
+        if missing_ok:
+            return None
+        raise FileNotFoundError(target) from None
+
+
+def confirm_confined_absence(vault: Path | str, path: Path | str) -> bool:
+    """Confirm an absent target and durably fence its existing parent directory."""
+    try:
+        with _open_target_parent(vault, path, create=False) as (
+            _root,
+            confined,
+            parent_fd,
+            name,
+            _parent,
+        ):
+            if _stat_at_signature(parent_fd, name, confined, missing_ok=True) is not None:
+                return False
+            _fsync_directory_fd(parent_fd)
+            return True
+    except ProjectionPathMissing:
+        # A missing lexical ancestor also proves the final entry absent. Our file
+        # primitives never remove parent directories, so there is no unflushed
+        # target unlink for this helper to persist at that level.
+        return True
+
+
 def fsync_directory(path: Path | str) -> None:
     """Persist directory-entry changes without following a directory symlink."""
     directory = Path(path)

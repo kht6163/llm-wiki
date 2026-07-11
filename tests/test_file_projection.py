@@ -345,6 +345,47 @@ def test_file_signature_missing_ok_only_accepts_enoent(tmp_path):
         fp.file_signature(directory, missing_ok=True)
 
 
+def test_confined_file_signature_is_anchored_to_the_vault(tmp_path):
+    vault = tmp_path / "vault"
+    outside = tmp_path / "outside"
+    vault.mkdir()
+    outside.mkdir()
+    target = vault / "note.md"
+    target.write_text("body", encoding="utf-8")
+
+    assert fp.confined_file_signature(vault, target) == fp.file_signature(target)
+    assert fp.confined_file_signature(
+        vault, vault / "missing" / "note.md", missing_ok=True
+    ) is None
+
+    (vault / "link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(fp.UnsafeProjectionPath):
+        fp.confined_file_signature(
+            vault, vault / "link" / "note.md", missing_ok=True
+        )
+
+
+def test_confirm_confined_absence_fsyncs_the_existing_parent(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    parent = vault / "old"
+    parent.mkdir(parents=True)
+    synced: list[tuple[int, int]] = []
+    real_fsync = fp.os.fsync
+
+    def recording_fsync(fd):
+        value = os.fstat(fd)
+        if stat.S_ISDIR(value.st_mode):
+            synced.append((int(value.st_dev), int(value.st_ino)))
+        real_fsync(fd)
+
+    monkeypatch.setattr(fp.os, "fsync", recording_fsync)
+    assert fp.confirm_confined_absence(vault, parent / "gone.md")
+    assert (int(parent.stat().st_dev), int(parent.stat().st_ino)) in synced
+
+    (parent / "present.md").write_text("body", encoding="utf-8")
+    assert not fp.confirm_confined_absence(vault, parent / "present.md")
+
+
 def _doc_id(ctx, rel: str) -> int:
     with ctx.db.reader() as conn:
         return int(

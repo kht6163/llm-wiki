@@ -19,7 +19,7 @@ import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from itertools import groupby
 from pathlib import Path
@@ -133,6 +133,13 @@ class ProjectionSnapshot:
 class RecoveryReport:
     recovered: int
     issues: tuple[fp.ProjectionResult, ...]
+
+
+@dataclass(frozen=True)
+class CleanupIssue:
+    path: str
+    reason: str
+    detail: str | None = None
 
 
 class ProjectionPendingError(RuntimeError):
@@ -397,7 +404,11 @@ class DocumentService:
         )
 
     def _projection_token_state(
-        self, conn: sqlite3.Connection, snapshot: ProjectionSnapshot
+        self,
+        conn: sqlite3.Connection,
+        snapshot: ProjectionSnapshot,
+        *,
+        allow_cleanup: bool = False,
     ) -> str:
         """Revalidate a staged generation without loading its potentially large body."""
         row = conn.execute(
@@ -415,8 +426,6 @@ class DocumentService:
             return "missing"
         if row["has_purge_intent"]:
             return "purge_pending"
-        if row["has_cleanup_intent"]:
-            return "cleanup_pending"
         current_token = (
             str(row["path"]),
             str(row["path_norm"]),
@@ -434,10 +443,159 @@ class DocumentService:
         if current_token != staged_token or not row["exact_revision"]:
             return "changed"
         if row["file_state"] == "clean":
+            if row["has_cleanup_intent"]:
+                return "cleanup_pending"
             return "settled"
         if row["file_state"] != "pending":
             return "changed"
+        if row["has_cleanup_intent"]:
+            return "current_cleanup" if allow_cleanup else "cleanup_pending"
         return "current"
+
+    def _install_projection_target(
+        self,
+        snapshot: ProjectionSnapshot,
+        staged: fp.StagedText,
+        target: Path,
+        live_target: Path,
+        trash_target: Path,
+    ) -> float | None:
+        installed = fp.install_staged(staged, target)
+        if snapshot.is_deleted:
+            fp.unlink_regular(live_target, vault=self.vault)
+            return None
+        fp.unlink_regular(trash_target, vault=self.vault)
+        return installed.mtime_ns / 1_000_000_000
+
+    def _mark_projection_clean(
+        self,
+        conn: sqlite3.Connection,
+        snapshot: ProjectionSnapshot,
+        file_mtime: float | None,
+    ) -> None:
+        changed = conn.execute(
+            "UPDATE documents SET file_state='clean',file_mtime=? "
+            "WHERE id=? AND path=? AND path_norm=? AND version=? "
+            "AND content_hash=? AND is_deleted=? AND file_state='pending' "
+            "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p "
+            "WHERE p.doc_id=?) "
+            "AND NOT EXISTS(SELECT 1 FROM file_projection_cleanup c "
+            "WHERE c.doc_id=?) "
+            "AND EXISTS(SELECT 1 FROM revisions r WHERE r.doc_id=? "
+            "AND r.version=? AND r.content_hash=?)",
+            (
+                file_mtime,
+                snapshot.doc_id,
+                snapshot.path,
+                snapshot.path_norm,
+                snapshot.version,
+                snapshot.content_hash,
+                int(snapshot.is_deleted),
+                snapshot.doc_id,
+                snapshot.doc_id,
+                snapshot.doc_id,
+                snapshot.version,
+                snapshot.content_hash,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("projection fence changed inside the serialized writer")
+
+    @staticmethod
+    def _expected_cleanup_signature(row: sqlite3.Row) -> fp.FileSignature | None:
+        if not row["expected_exists"]:
+            return None
+        values = (
+            row["expected_dev"],
+            row["expected_ino"],
+            row["expected_size"],
+            row["expected_mtime_ns"],
+            row["expected_ctime_ns"],
+        )
+        if any(value is None for value in values):
+            raise RuntimeError("cleanup intent has an incomplete file signature")
+        return fp.FileSignature(*(int(value) for value in values))
+
+    def _process_cleanup_batch(
+        self,
+        conn: sqlite3.Connection,
+        snapshot: ProjectionSnapshot,
+        *,
+        after_norm: str,
+        batch_size: int = 64,
+    ) -> tuple[str | None, tuple[CleanupIssue, ...]]:
+        """Visit one cleanup keyset page, preserving only unsafe/conflicting rows."""
+        rows = conn.execute(
+            "SELECT path,path_norm,expected_exists,expected_dev,expected_ino,"
+            "expected_size,expected_mtime_ns,expected_ctime_ns "
+            "FROM file_projection_cleanup WHERE doc_id=? AND path_norm>? "
+            "ORDER BY path_norm LIMIT ?",
+            (snapshot.doc_id, after_norm, clamp_int(batch_size, 1, 64)),
+        ).fetchall()
+        if not rows:
+            return None, ()
+
+        issues: list[CleanupIssue] = []
+        for row in rows:
+            rel = str(row["path"])
+            norm = str(row["path_norm"])
+
+            # A stale intent must never remove the document's current target. Moves
+            # back to an old path normally delete this row in their own transaction;
+            # this guard also makes manually repaired/inconsistent rows harmless.
+            if norm == snapshot.path_norm:
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (snapshot.doc_id, norm),
+                )
+                continue
+
+            owner = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? LIMIT 1",
+                (norm,),
+            ).fetchone()
+            if owner is not None:
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (snapshot.doc_id, norm),
+                )
+                continue
+
+            try:
+                target = fp.managed_path(self.vault, rel, namespace="live")
+                current = fp.confined_file_signature(
+                    self.vault, target, missing_ok=True
+                )
+                if current is None:
+                    if fp.confirm_confined_absence(self.vault, target):
+                        conn.execute(
+                            "DELETE FROM file_projection_cleanup "
+                            "WHERE doc_id=? AND path_norm=?",
+                            (snapshot.doc_id, norm),
+                        )
+                    else:
+                        issues.append(CleanupIssue(rel, "cleanup_changed"))
+                    continue
+                expected = self._expected_cleanup_signature(row)
+                if expected is None or current != expected:
+                    issues.append(CleanupIssue(rel, "cleanup_changed"))
+                    continue
+                if not fp.unlink_regular(target, expected=expected, vault=self.vault):
+                    issues.append(CleanupIssue(rel, "cleanup_changed"))
+                    continue
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (snapshot.doc_id, norm),
+                )
+            except (OSError, fp.FileProjectionError) as exc:
+                issues.append(
+                    CleanupIssue(
+                        rel,
+                        "cleanup_io_error",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        return str(rows[-1]["path_norm"]), tuple(issues)
 
     def _project_current(
         self, doc_id: int, *, max_attempts: int = 3
@@ -473,17 +631,7 @@ class DocumentService:
                     attempt,
                     snapshot.is_deleted,
                 )
-            if snapshot.has_cleanup_intent:
-                return fp.ProjectionResult(
-                    snapshot.doc_id,
-                    snapshot.path,
-                    False,
-                    False,
-                    "cleanup_pending",
-                    attempt,
-                    snapshot.is_deleted,
-                )
-            if snapshot.file_state == "clean":
+            if snapshot.file_state == "clean" and not snapshot.has_cleanup_intent:
                 return fp.ProjectionResult(
                     snapshot.doc_id,
                     snapshot.path,
@@ -494,7 +642,7 @@ class DocumentService:
                     snapshot.is_deleted,
                 )
             if (
-                snapshot.file_state != "pending"
+                snapshot.file_state not in ("clean", "pending")
                 or snapshot.revision_version != snapshot.version
                 or snapshot.revision_content_hash != snapshot.content_hash
                 or snapshot.body is None
@@ -510,72 +658,26 @@ class DocumentService:
                     snapshot.is_deleted,
                     "The current document row and exact revision do not agree.",
                 )
+            canonical_body = snapshot.body
+            assert canonical_body is not None
 
-            staged: fp.StagedText | None = None
-            current_installed = False
-            try:
-                live_target = fp.managed_path(self.vault, snapshot.path, namespace="live")
-                trash_target = fp.managed_path(
-                    self.vault, snapshot.path, namespace="trash"
-                )
-                target = trash_target if snapshot.is_deleted else live_target
-                staged = fp.stage_text(self.vault, target, snapshot.body)
-
+            if snapshot.file_state == "clean":
+                # Older/legacy call sites can temporarily leave cleanup authority on
+                # a row they marked clean. Re-open that exact generation as pending so
+                # recovery can discharge the durable intents instead of looping on
+                # cleanup_pending forever.
                 with self.db.writer() as conn:
-                    token_state = self._projection_token_state(conn, snapshot)
-                    if token_state == "changed":
-                        continue
-                    if token_state == "missing":
-                        return fp.ProjectionResult(
-                            snapshot.doc_id,
-                            snapshot.path,
-                            True,
-                            False,
-                            "missing",
-                            attempt,
-                            snapshot.is_deleted,
-                        )
-                    if token_state == "settled":
-                        return fp.ProjectionResult(
-                            snapshot.doc_id,
-                            snapshot.path,
-                            True,
-                            False,
-                            "already_settled",
-                            attempt,
-                            snapshot.is_deleted,
-                        )
-                    if token_state in ("purge_pending", "cleanup_pending"):
-                        return fp.ProjectionResult(
-                            snapshot.doc_id,
-                            snapshot.path,
-                            False,
-                            False,
-                            token_state,
-                            attempt,
-                            snapshot.is_deleted,
-                        )
-
-                    installed = fp.install_staged(staged, target)
-                    current_installed = True
-                    if snapshot.is_deleted:
-                        fp.unlink_regular(live_target, vault=self.vault)
-                        file_mtime = None
-                    else:
-                        fp.unlink_regular(trash_target, vault=self.vault)
-                        file_mtime = installed.mtime_ns / 1_000_000_000
-                    changed = conn.execute(
-                        "UPDATE documents SET file_state='clean',file_mtime=? "
+                    reopened = conn.execute(
+                        "UPDATE documents SET file_state='pending' "
                         "WHERE id=? AND path=? AND path_norm=? AND version=? "
-                        "AND content_hash=? AND is_deleted=? AND file_state='pending' "
+                        "AND content_hash=? AND is_deleted=? AND file_state='clean' "
                         "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p "
                         "WHERE p.doc_id=?) "
-                        "AND NOT EXISTS(SELECT 1 FROM file_projection_cleanup c "
+                        "AND EXISTS(SELECT 1 FROM file_projection_cleanup c "
                         "WHERE c.doc_id=?) "
                         "AND EXISTS(SELECT 1 FROM revisions r WHERE r.doc_id=? "
                         "AND r.version=? AND r.content_hash=?)",
                         (
-                            file_mtime,
                             snapshot.doc_id,
                             snapshot.path,
                             snapshot.path_norm,
@@ -589,20 +691,94 @@ class DocumentService:
                             snapshot.content_hash,
                         ),
                     )
-                    if changed.rowcount != 1:
-                        raise RuntimeError(
-                            "projection fence changed inside the serialized writer"
-                        )
+                if reopened.rowcount != 1:
+                    continue
+                snapshot = replace(snapshot, file_state="pending")
+
+            current_installed = False
+            live_target: Path
+            trash_target: Path
+            target: Path
+            try:
+                live_target = fp.managed_path(self.vault, snapshot.path, namespace="live")
+                trash_target = fp.managed_path(
+                    self.vault, snapshot.path, namespace="trash"
+                )
+                target = trash_target if snapshot.is_deleted else live_target
+            except (OSError, fp.FileProjectionError) as exc:
                 return fp.ProjectionResult(
                     snapshot.doc_id,
                     snapshot.path,
-                    True,
-                    True,
-                    None,
+                    False,
+                    False,
+                    "io_error",
                     attempt,
                     snapshot.is_deleted,
-                    current_installed=current_installed,
+                    f"{type(exc).__name__}: {exc}",
                 )
+
+            # Publish the canonical current target before removing any historical
+            # paths. If cleanup spans transactions, this leaves a usable latest file
+            # while the DB remains explicitly pending.
+            staged: fp.StagedText | None = None
+            retry_snapshot = False
+            cleanup_required = False
+            immediate_result: fp.ProjectionResult | None = None
+            try:
+                staged = fp.stage_text(self.vault, target, canonical_body)
+                with self.db.writer() as conn:
+                    token_state = self._projection_token_state(
+                        conn, snapshot, allow_cleanup=True
+                    )
+                    if token_state == "changed":
+                        retry_snapshot = True
+                    elif token_state == "missing":
+                        immediate_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "missing",
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+                    elif token_state == "settled":
+                        immediate_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "already_settled",
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+                    elif token_state in ("purge_pending", "cleanup_pending"):
+                        immediate_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            False,
+                            False,
+                            token_state,
+                            attempt,
+                            snapshot.is_deleted,
+                        )
+                    elif token_state in ("current", "current_cleanup"):
+                        file_mtime = self._install_projection_target(
+                            snapshot,
+                            staged,
+                            target,
+                            live_target,
+                            trash_target,
+                        )
+                        current_installed = True
+                        if token_state == "current":
+                            self._mark_projection_clean(conn, snapshot, file_mtime)
+                        else:
+                            cleanup_required = True
+                    else:
+                        raise RuntimeError(
+                            f"unknown projection token state: {token_state}"
+                        )
             except (OSError, fp.FileProjectionError) as exc:
                 return fp.ProjectionResult(
                     snapshot.doc_id,
@@ -625,6 +801,209 @@ class DocumentService:
                             snapshot.doc_id,
                             exc,
                         )
+
+            if retry_snapshot:
+                continue
+            if immediate_result is not None:
+                return immediate_result
+            if not cleanup_required:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    True,
+                    True,
+                    None,
+                    attempt,
+                    snapshot.is_deleted,
+                    current_installed=current_installed,
+                )
+
+            # Visit every cleanup row once in path_norm order. A conflict advances
+            # the cursor and remains durable for the next recovery instead of
+            # starving later batches.
+            cursor = ""
+            cleanup_issues: list[CleanupIssue] = []
+            terminal_result: fp.ProjectionResult | None = None
+            while True:
+                batch_cursor: str | None = None
+                batch_issues: tuple[CleanupIssue, ...] = ()
+                with self.db.writer() as conn:
+                    token_state = self._projection_token_state(
+                        conn, snapshot, allow_cleanup=True
+                    )
+                    if token_state == "changed":
+                        retry_snapshot = True
+                    elif token_state == "missing":
+                        terminal_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "missing",
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state == "settled":
+                        terminal_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "already_settled",
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state in ("purge_pending", "cleanup_pending"):
+                        terminal_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            False,
+                            False,
+                            token_state,
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state == "current_cleanup":
+                        batch_cursor, batch_issues = self._process_cleanup_batch(
+                            conn, snapshot, after_norm=cursor
+                        )
+                    elif token_state != "current":
+                        raise RuntimeError(
+                            f"unknown projection token state: {token_state}"
+                        )
+
+                cleanup_issues.extend(batch_issues)
+                if retry_snapshot or terminal_result is not None:
+                    break
+                if batch_cursor is None:
+                    break
+                cursor = batch_cursor
+
+            if retry_snapshot:
+                continue
+            if terminal_result is not None:
+                return terminal_result
+            if cleanup_issues:
+                reason = (
+                    "cleanup_io_error"
+                    if any(issue.reason == "cleanup_io_error" for issue in cleanup_issues)
+                    else "cleanup_changed"
+                )
+                sample = ", ".join(issue.path for issue in cleanup_issues[:3])
+                detail = (
+                    f"{len(cleanup_issues)} cleanup path(s) remain unresolved"
+                    + (f": {sample}" if sample else "")
+                )
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    reason,
+                    attempt,
+                    snapshot.is_deleted,
+                    detail,
+                    current_installed,
+                )
+
+            # Cleanup crossed at least one writer boundary. Re-stage and publish the
+            # canonical target in the same final writer transaction as exact clean,
+            # fencing external edits made while historical paths were processed.
+            final_staged: fp.StagedText | None = None
+            final_result: fp.ProjectionResult | None = None
+            try:
+                final_staged = fp.stage_text(self.vault, target, canonical_body)
+                with self.db.writer() as conn:
+                    token_state = self._projection_token_state(conn, snapshot)
+                    if token_state == "changed":
+                        retry_snapshot = True
+                    elif token_state == "missing":
+                        final_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "missing",
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state == "settled":
+                        final_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            True,
+                            False,
+                            "already_settled",
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state in ("purge_pending", "cleanup_pending"):
+                        final_result = fp.ProjectionResult(
+                            snapshot.doc_id,
+                            snapshot.path,
+                            False,
+                            False,
+                            token_state,
+                            attempt,
+                            snapshot.is_deleted,
+                            current_installed=current_installed,
+                        )
+                    elif token_state == "current":
+                        file_mtime = self._install_projection_target(
+                            snapshot,
+                            final_staged,
+                            target,
+                            live_target,
+                            trash_target,
+                        )
+                        current_installed = True
+                        self._mark_projection_clean(conn, snapshot, file_mtime)
+                    else:
+                        raise RuntimeError(
+                            f"unknown projection token state: {token_state}"
+                        )
+            except (OSError, fp.FileProjectionError) as exc:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "io_error",
+                    attempt,
+                    snapshot.is_deleted,
+                    f"{type(exc).__name__}: {exc}",
+                    current_installed,
+                )
+            finally:
+                if final_staged is not None:
+                    try:
+                        fp.cleanup_staged(final_staged)
+                    except (OSError, fp.FileProjectionError) as exc:
+                        log.warning(
+                            "Could not clean final staged projection for document %d: %s",
+                            snapshot.doc_id,
+                            exc,
+                        )
+
+            if retry_snapshot:
+                continue
+            if final_result is not None:
+                return final_result
+            return fp.ProjectionResult(
+                snapshot.doc_id,
+                snapshot.path,
+                True,
+                True,
+                None,
+                attempt,
+                snapshot.is_deleted,
+                current_installed=current_installed,
+            )
 
         return fp.ProjectionResult(
             int(doc_id),
@@ -2011,24 +2390,98 @@ class DocumentService:
         norm, new_norm = path_norm(rel), path_norm(new_rel)
         if norm == new_norm:
             return self.get(rel)
+        fp.managed_path(self.vault, new_rel, namespace="live")
         new_folder, new_stem = folder_of(new_rel), basename_stem(new_rel).lower()
         now = now_iso()
         with self.db.writer() as conn:
             row = conn.execute(
-                "SELECT id, version, title, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+                "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.content_hash,"
+                "d.is_deleted,r.body,r.content_hash AS revision_content_hash "
+                "FROM documents d LEFT JOIN revisions r "
+                "ON r.doc_id=d.id AND r.version=d.version WHERE d.path_norm=?",
+                (norm,),
+            ).fetchone()
             if not row or row["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
+            source_rel = str(row["path"])
+            source_norm = str(row["path_norm"])
+            body = str(row["body"]) if row["body"] is not None else None
+            if (
+                body is None
+                or row["revision_content_hash"] != row["content_hash"]
+                or sha256_hex(body) != row["content_hash"]
+            ):
+                raise RuntimeError("current document revision is missing or corrupt")
             clash = conn.execute(
                 "SELECT 1 FROM documents WHERE path_norm=?", (new_norm,)).fetchone()
             if clash:
                 raise ConflictError("The destination path is already occupied.", path=new_rel)
-            doc_id, new_version = row["id"], row["version"] + 1
-            body = self._latest_body(conn, doc_id)
-            conn.execute(
-                "UPDATE documents SET path=?, path_norm=?, folder=?, version=version+1, "
-                "file_state='pending', updated_at=?, updated_by=? WHERE id=?",
-                (new_rel, new_norm, new_folder, now, principal.user_id, doc_id),
+            doc_id, new_version = int(row["id"]), int(row["version"]) + 1
+
+            # Capture the exact source file generation before changing the canonical
+            # path. The DB writer fence serializes this authority with every managed
+            # publisher; the full signature prevents a later external generation from
+            # being deleted by a delayed cleanup.
+            source_target = fp.managed_path(
+                self.vault, source_rel, namespace="live"
             )
+            source_signature = fp.confined_file_signature(
+                self.vault, source_target, missing_ok=True
+            )
+            conn.execute(
+                "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                (doc_id, new_norm),
+            )
+            signature_values = (
+                (
+                    source_signature.dev,
+                    source_signature.ino,
+                    source_signature.size,
+                    source_signature.mtime_ns,
+                    source_signature.ctime_ns,
+                )
+                if source_signature is not None
+                else (None, None, None, None, None)
+            )
+            conn.execute(
+                "INSERT INTO file_projection_cleanup("
+                "doc_id,path,path_norm,expected_exists,expected_dev,expected_ino,"
+                "expected_size,expected_mtime_ns,expected_ctime_ns,queued_version,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(doc_id,path_norm) DO UPDATE SET path=excluded.path,"
+                "expected_exists=excluded.expected_exists,expected_dev=excluded.expected_dev,"
+                "expected_ino=excluded.expected_ino,expected_size=excluded.expected_size,"
+                "expected_mtime_ns=excluded.expected_mtime_ns,"
+                "expected_ctime_ns=excluded.expected_ctime_ns,"
+                "queued_version=excluded.queued_version,created_at=excluded.created_at",
+                (
+                    doc_id,
+                    source_rel,
+                    source_norm,
+                    int(source_signature is not None),
+                    *signature_values,
+                    new_version,
+                    now,
+                ),
+            )
+            changed = conn.execute(
+                "UPDATE documents SET path=?, path_norm=?, folder=?, version=version+1, "
+                "file_state='pending', updated_at=?, updated_by=? "
+                "WHERE id=? AND path=? AND path_norm=? AND version=?",
+                (
+                    new_rel,
+                    new_norm,
+                    new_folder,
+                    now,
+                    principal.user_id,
+                    doc_id,
+                    source_rel,
+                    source_norm,
+                    int(row["version"]),
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ConflictError("The document changed before it could be moved.", path=source_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'rename', ?, ?)",
@@ -2039,20 +2492,20 @@ class DocumentService:
             graph.unresolve_incoming(conn, doc_id)
             graph.backfill_links_for(conn, doc_id, new_norm, new_stem)
             audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_move", target=f"{rel} -> {new_rel}")
-        self._trash_file(rel)
-        mtime = self._write_file(new_rel, body)
-        with self.db.writer() as conn:
-            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?", (mtime, doc_id))
+                         action="doc_move", target=f"{source_rel} -> {new_rel}")
+        self._require_projection(doc_id)
         DOC_WRITES.labels("move").inc()
         # Keyed on the OLD path so a viewer of the moved doc can follow it to `to`.
-        self._emit("move", rel, new_version, to=new_rel,
+        self._emit("move", source_rel, new_version, to=new_rel,
                    updated_by=principal.username, via=principal.via)
         result = self.get(new_rel)
         if fix_references:
             # Re-resolution above fixed the GRAPH, but bodies still contain the old
             # link text; rewrite those so the references don't show up broken.
-            result = {**result, "references": self.rename_references(principal, rel, new_rel)}
+            result = {
+                **result,
+                "references": self.rename_references(principal, source_rel, new_rel),
+            }
         self._bump_nav()
         return result
 
