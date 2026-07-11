@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import replace
@@ -8,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from llm_wiki import file_projection as fp
+
+_REAL_FSTAT = os.fstat
 
 
 def _vault(tmp_path: Path) -> Path:
@@ -18,8 +21,9 @@ def _vault(tmp_path: Path) -> Path:
 
 def _assert_closed(fds: list[int]) -> None:
     for fd in fds:
-        with pytest.raises(OSError):
-            os.fstat(fd)
+        with pytest.raises(OSError) as raised:
+            _REAL_FSTAT(fd)
+        assert raised.value.errno == errno.EBADF
 
 
 def test_missing_paths_and_absence_have_distinct_contracts(tmp_path):
@@ -382,6 +386,11 @@ def test_stage_open_and_cleanup_failures_close_fds(tmp_path, monkeypatch):
     monkeypatch.setattr(fp.os, "fdopen", fail_fdopen)
     with pytest.raises(OSError, match="fdopen"):
         fp.stage_text(vault, target, "secret")
+    scratch_files = list((vault / ".tmp").iterdir())
+    assert len(scratch_files) == 2
+    assert set(unknown_generation) < set(scratch_files)
+    assert all(path.read_bytes() == b"" for path in scratch_files)
+    assert not target.exists()
     monkeypatch.setattr(fp.os, "stat", real_stat)
     _assert_closed(opened)
 
@@ -557,6 +566,16 @@ def test_stable_read_reports_platform_generation_read_and_post_read_failures(tmp
     monkeypatch.setattr(fp.os, "read", interrupt_once)
     stable = fp.read_stable_markdown(vault, target)
     assert interrupted and stable.text == "body"
+
+
+def test_stable_read_replaces_invalid_utf8_bytes(tmp_path):
+    vault = _vault(tmp_path)
+    target = vault / "invalid.md"
+    target.write_bytes(b"before\xffafter")
+
+    stable = fp.read_stable_markdown(vault, target)
+
+    assert stable.text == "before\ufffdafter"
 
 
 def test_stable_read_detects_size_and_post_read_generation_changes(tmp_path, monkeypatch):
