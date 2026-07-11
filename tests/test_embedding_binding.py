@@ -4,6 +4,7 @@ from threading import Barrier
 
 import pytest
 
+from llm_wiki import indexing
 from llm_wiki.db import Database, get_meta
 from llm_wiki.embedding import Embedder
 from llm_wiki.embedding_contract import EmbeddingBinding, EmbeddingBindingChanged
@@ -232,6 +233,32 @@ def test_verify_embedding_binding_requires_active_transaction(tmp_path):
         assert not conn.in_transaction
         with pytest.raises(RuntimeError, match="active transaction"):
             db.verify_embedding_binding(conn, binding)
+
+
+def test_embed_doc_rejects_embedder_identity_before_model_call(tmp_path):
+    db, _ = _initialize(tmp_path)
+    doc_id = _insert_document(db, "identity.md")
+    with db.writer() as conn:
+        conn.execute(
+            "UPDATE documents SET vector_dirty=1 WHERE id=?", (doc_id,)
+        )
+        conn.execute(
+            "INSERT INTO chunks("
+            "doc_id, ordinal, heading, text, char_start, char_end, heading_path"
+            ") VALUES(?, 0, NULL, 'body', 0, 4, NULL)",
+            (doc_id,),
+        )
+
+    class WrongEmbedder:
+        model_name = "test/wrong-model"
+        dim = DIM
+        pipeline = PIPELINE
+
+        def embed_passages(self, _texts):
+            raise AssertionError("binding mismatch must fail before model call")
+
+    with pytest.raises(EmbeddingBindingChanged, match="embedder"):
+        indexing.embed_doc(db, WrongEmbedder(), doc_id)
 
 
 def test_rebind_without_any_binding_starts_at_epoch_one(tmp_path):

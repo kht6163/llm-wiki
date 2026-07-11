@@ -8,6 +8,7 @@ holding the SQLite writer.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -15,6 +16,7 @@ from collections.abc import Callable
 
 from . import graph
 from .embedding import Embedder
+from .embedding_contract import EmbeddingBinding, EmbeddingBindingChanged
 from .markdown_utils import chunk_markdown, extract_links, parse_frontmatter
 from .metrics import (
     EMBED_CHUNKS,
@@ -87,46 +89,134 @@ def _embed_text(row) -> str:
     return f"{hp}\n\n{text}" if hp else text
 
 
-def embed_doc(db, embedder: Embedder, doc_id: int) -> None:
-    """Compute + upsert vectors for one document's chunks, then clear vector_dirty.
-    Runs outside the write transaction that produced the chunks.
+def _embedding_snapshot(
+    conn: sqlite3.Connection, doc_id: int
+) -> tuple[int, tuple[tuple[int, str], ...]] | None:
+    """Read the publisher CAS token and ordered passage inputs in one statement."""
+    rows = conn.execute(
+        "SELECT d.version AS doc_version, c.id AS chunk_id, c.text, c.heading_path "
+        "FROM documents d LEFT JOIN chunks c ON c.doc_id=d.id "
+        "WHERE d.id=? AND d.vector_dirty=1 AND d.is_deleted=0 "
+        "ORDER BY c.ordinal, c.id",
+        (doc_id,),
+    ).fetchall()
+    if not rows:
+        return None
+    passages = tuple(
+        (int(row["chunk_id"]), _embed_text(row))
+        for row in rows
+        if row["chunk_id"] is not None
+    )
+    return int(rows[0]["doc_version"]), passages
 
-    Concurrency: another edit may rechunk this doc between the read below and the
-    write. We match by (chunk_id, text) — not id alone, since SQLite reuses rowids
-    after a delete — and only write a vector when the chunk's text still matches what
-    we embedded. vector_dirty is cleared only when every current chunk was matched;
-    otherwise the changed chunks stay dirty for a later embed."""
+
+def _verify_embedder_identity(
+    expected: EmbeddingBinding, embedder: Embedder
+) -> None:
+    actual_identity = (embedder.model_name, embedder.pipeline)
+    expected_identity = (expected.model, expected.pipeline)
+    if actual_identity != expected_identity:
+        raise EmbeddingBindingChanged(
+            f"Process embedder {actual_identity} does not match expected binding "
+            f"{expected_identity}."
+        )
+    actual = (embedder.model_name, int(embedder.dim), embedder.pipeline)
+    wanted = (expected.model, expected.dim, expected.pipeline)
+    if actual != wanted:
+        raise EmbeddingBindingChanged(
+            f"Process embedder {actual} does not match expected binding {wanted}."
+        )
+
+
+def embed_doc(
+    db,
+    embedder: Embedder,
+    doc_id: int,
+    batch_size: int = 64,
+    on_batch: Callable[[int], None] | None = None,
+) -> bool:
+    """Atomically publish one dirty document's vectors for a stable input snapshot.
+
+    Encoding and serialization happen without a SQLite writer lock. Publication then
+    fences the process embedding generation and compares the document version plus
+    every ordered passage input in one short writer transaction. A document race is a
+    normal ``False`` result; a generation change raises ``EmbeddingBindingChanged`` so
+    an old process cannot silently publish into a newly rebound vector table.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    expected = db.expected_embedding_binding()
+    _verify_embedder_identity(expected, embedder)
     with db.reader() as conn:
-        rows = conn.execute(
-            "SELECT id, text, heading_path FROM chunks WHERE doc_id=? ORDER BY ordinal", (doc_id,)
-        ).fetchall()
-    if rows:
-        t0 = time.perf_counter()
-        embs = embedder.embed_passages([_embed_text(r) for r in rows])
-        EMBED_DURATION.observe(time.perf_counter() - t0)
-        EMBED_CHUNKS.inc(len(rows))
-    else:
-        embs = []
-    embedded = {r["id"]: (r["text"], emb) for r, emb in zip(rows, embs, strict=False)}
-    with db.writer() as conn:
-        current = {
-            r["id"]: r["text"]
-            for r in conn.execute("SELECT id, text FROM chunks WHERE doc_id=?", (doc_id,))
-        }
-        all_matched = True
-        for cid, ctext in current.items():
-            hit = embedded.get(cid)
-            if hit is not None and hit[0] == ctext:
-                # vec0 doesn't honor INSERT OR REPLACE; delete any prior vector first.
-                conn.execute("DELETE FROM chunk_vectors WHERE chunk_id=?", (cid,))
-                conn.execute(
-                    "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
-                    (cid, Embedder.serialize(hit[1])),
+        snapshot = _embedding_snapshot(conn, doc_id)
+    if snapshot is None:
+        return False
+    version, passages = snapshot
+
+    serialized: list[tuple[int, bytes]] = []
+    if passages:
+        for offset in range(0, len(passages), batch_size):
+            batch = passages[offset:offset + batch_size]
+            texts = [text for _chunk_id, text in batch]
+            EMBED_CHUNKS.inc(len(texts))
+            t0 = time.perf_counter()
+            try:
+                outputs = embedder.embed_passages(texts)
+            finally:
+                EMBED_DURATION.observe(time.perf_counter() - t0)
+            try:
+                output_count = len(outputs)
+            except TypeError as exc:
+                raise ValueError(
+                    "embedding output must be a sized sequence of vectors"
+                ) from exc
+            if output_count != len(batch):
+                raise ValueError(
+                    "embedding output count does not match passage input count: "
+                    f"expected {len(batch)}, got {output_count}"
                 )
-            else:
-                all_matched = False
-        if all_matched:  # current set fully (re)embedded — true also when there are no chunks
-            conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
+            for (chunk_id, _text), vector in zip(batch, outputs, strict=True):
+                try:
+                    values = [float(value) for value in vector]
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "embedding output vector must contain numeric values"
+                    ) from exc
+                if len(values) != expected.dim:
+                    raise ValueError(
+                        "embedding output dimension does not match binding: "
+                        f"expected {expected.dim}, got {len(values)}"
+                    )
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError(
+                        "embedding output vector must contain only finite values"
+                    )
+                serialized.append((chunk_id, Embedder.serialize(values)))
+            if on_batch is not None:
+                on_batch(len(batch))
+
+    with db.writer() as conn:
+        db.verify_embedding_binding(conn, expected)
+        if _embedding_snapshot(conn, doc_id) != snapshot:
+            return False
+        updated = conn.execute(
+            "UPDATE documents SET vector_dirty=0 "
+            "WHERE id=? AND version=? AND vector_dirty=1 AND is_deleted=0",
+            (doc_id, version),
+        )
+        if updated.rowcount != 1:
+            return False
+        if passages:
+            conn.executemany(
+                "DELETE FROM chunk_vectors WHERE chunk_id=?",
+                [(chunk_id,) for chunk_id, _text in passages],
+            )
+            conn.executemany(
+                "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?,?)",
+                serialized,
+            )
+    return True
 
 
 def embed_pending(db, embedder: Embedder, doc_id: int | None = None, batch_size: int = 64,
