@@ -142,6 +142,17 @@ class CleanupIssue:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class PurgeIntentSnapshot:
+    doc_id: int
+    path: str
+    path_norm: str
+    version: int
+    file_state: str
+    actor: str
+    via: str
+
+
 class ProjectionPendingError(RuntimeError):
     """A committed DB write whose filesystem projection remains recoverable."""
 
@@ -597,6 +608,288 @@ class DocumentService:
                 )
         return str(rows[-1]["path_norm"]), tuple(issues)
 
+    @staticmethod
+    def _purge_intent_snapshot(
+        conn: sqlite3.Connection, doc_id: int
+    ) -> PurgeIntentSnapshot | None:
+        row = conn.execute(
+            "SELECT p.doc_id,p.path,p.path_norm,p.version,p.actor,p.via,"
+            "d.path AS document_path,d.path_norm AS document_path_norm,"
+            "d.version AS document_version,d.file_state,d.is_deleted "
+            "FROM document_purge_intents p JOIN documents d ON d.id=p.doc_id "
+            "WHERE p.doc_id=?",
+            (int(doc_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        if (
+            not row["is_deleted"]
+            or row["file_state"] != "pending"
+            or row["document_path"] != row["path"]
+            or row["document_path_norm"] != row["path_norm"]
+            or int(row["document_version"]) != int(row["version"])
+        ):
+            raise RuntimeError("purge intent and tombstone generation do not agree")
+        return PurgeIntentSnapshot(
+            doc_id=int(row["doc_id"]),
+            path=str(row["path"]),
+            path_norm=str(row["path_norm"]),
+            version=int(row["version"]),
+            file_state=str(row["file_state"]),
+            actor=str(row["actor"]),
+            via=str(row["via"]),
+        )
+
+    def _process_purge_cleanup_batch(
+        self,
+        conn: sqlite3.Connection,
+        intent: PurgeIntentSnapshot,
+        *,
+        after_norm: str,
+        batch_size: int = 64,
+    ) -> tuple[str | None, tuple[CleanupIssue, ...]]:
+        """Discharge one purge cleanup page; only actual I/O errors remain durable."""
+        rows = conn.execute(
+            "SELECT path,path_norm,expected_exists,expected_dev,expected_ino,"
+            "expected_size,expected_mtime_ns,expected_ctime_ns "
+            "FROM file_projection_cleanup WHERE doc_id=? AND path_norm>? "
+            "ORDER BY path_norm LIMIT ?",
+            (intent.doc_id, after_norm, clamp_int(batch_size, 1, 64)),
+        ).fetchall()
+        if not rows:
+            return None, ()
+
+        issues: list[CleanupIssue] = []
+        for row in rows:
+            rel = str(row["path"])
+            norm = str(row["path_norm"])
+
+            # The current tombstone owns this normalized namespace, but its canonical
+            # file is in .trash. A stale live cleanup row for the same path can be
+            # retired without touching either namespace.
+            if norm == intent.path_norm:
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (intent.doc_id, norm),
+                )
+                continue
+
+            owner = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? LIMIT 1", (norm,)
+            ).fetchone()
+            if owner is not None:
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (intent.doc_id, norm),
+                )
+                continue
+
+            try:
+                target = fp.managed_path(self.vault, rel, namespace="live")
+                current = fp.confined_file_signature(
+                    self.vault, target, missing_ok=True
+                )
+                if current is None:
+                    if not fp.confirm_confined_absence(self.vault, target):
+                        # A new generation appeared. Purge preserves it and retires
+                        # the old document's cleanup authority.
+                        pass
+                else:
+                    expected = self._expected_cleanup_signature(row)
+                    if expected is not None and current == expected:
+                        # False means it changed/disappeared between stat and unlink;
+                        # either way the new/external generation is preserved.
+                        removed = fp.unlink_regular(
+                            target, expected=expected, vault=self.vault
+                        )
+                        if not removed:
+                            after = fp.confined_file_signature(
+                                self.vault, target, missing_ok=True
+                            )
+                            if after is None:
+                                fp.confirm_confined_absence(self.vault, target)
+                conn.execute(
+                    "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
+                    (intent.doc_id, norm),
+                )
+            except (OSError, fp.FileProjectionError) as exc:
+                issues.append(
+                    CleanupIssue(
+                        rel,
+                        "purge_cleanup_io_error",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        return str(rows[-1]["path_norm"]), tuple(issues)
+
+    def _finish_purge(self, doc_id: int) -> fp.ProjectionResult:
+        """Finish one immutable purge request, idempotently and audit-exactly-once."""
+        cursor = ""
+        issues: list[CleanupIssue] = []
+        last_intent: PurgeIntentSnapshot | None = None
+        while True:
+            batch_cursor: str | None = None
+            batch_issues: tuple[CleanupIssue, ...] = ()
+            with self.db.writer() as conn:
+                intent = self._purge_intent_snapshot(conn, int(doc_id))
+                if intent is None:
+                    document = conn.execute(
+                        "SELECT path FROM documents WHERE id=?", (int(doc_id),)
+                    ).fetchone()
+                    return fp.ProjectionResult(
+                        int(doc_id),
+                        str(document["path"]) if document is not None else None,
+                        document is None,
+                        False,
+                        "missing" if document is None else "purge_intent_missing",
+                        1,
+                        True,
+                    )
+                last_intent = intent
+                batch_cursor, batch_issues = self._process_purge_cleanup_batch(
+                    conn, intent, after_norm=cursor
+                )
+            issues.extend(batch_issues)
+            if batch_cursor is None:
+                break
+            cursor = batch_cursor
+
+        assert last_intent is not None
+        if issues:
+            with self.db.reader() as conn:
+                intent_exists = conn.execute(
+                    "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
+                    (last_intent.doc_id,),
+                ).fetchone() is not None
+                document_exists = conn.execute(
+                    "SELECT 1 FROM documents WHERE id=?", (last_intent.doc_id,)
+                ).fetchone() is not None
+                cleanup_remains = conn.execute(
+                    "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
+                    (last_intent.doc_id,),
+                ).fetchone() is not None
+            if not intent_exists:
+                return fp.ProjectionResult(
+                    last_intent.doc_id,
+                    last_intent.path,
+                    not document_exists,
+                    False,
+                    "missing" if not document_exists else "purge_intent_missing",
+                    1,
+                    True,
+                )
+            if cleanup_remains:
+                sample = ", ".join(issue.path for issue in issues[:3])
+                return fp.ProjectionResult(
+                    last_intent.doc_id,
+                    last_intent.path,
+                    False,
+                    False,
+                    "purge_cleanup_io_error",
+                    1,
+                    True,
+                    f"{len(issues)} purge cleanup path(s) failed"
+                    + (f": {sample}" if sample else ""),
+                )
+
+        try:
+            with self.db.writer() as conn:
+                intent = self._purge_intent_snapshot(conn, int(doc_id))
+                if intent is None:
+                    document = conn.execute(
+                        "SELECT path FROM documents WHERE id=?", (int(doc_id),)
+                    ).fetchone()
+                    return fp.ProjectionResult(
+                        int(doc_id),
+                        str(document["path"]) if document is not None else None,
+                        document is None,
+                        False,
+                        "missing" if document is None else "purge_intent_missing",
+                        1,
+                        True,
+                    )
+                if conn.execute(
+                    "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
+                    (intent.doc_id,),
+                ).fetchone() is not None:
+                    return fp.ProjectionResult(
+                        intent.doc_id,
+                        intent.path,
+                        False,
+                        False,
+                        "purge_cleanup_pending",
+                        1,
+                        True,
+                    )
+
+                trash = fp.managed_path(
+                    self.vault, intent.path, namespace="trash"
+                )
+                trash_signature = fp.confined_file_signature(
+                    self.vault, trash, missing_ok=True
+                )
+                if trash_signature is not None:
+                    if not fp.unlink_regular(
+                        trash, expected=trash_signature, vault=self.vault
+                    ):
+                        raise fp.FileGenerationChanged(
+                            f"purge trash changed during removal: {trash}"
+                        )
+                elif not fp.confirm_confined_absence(self.vault, trash):
+                    raise fp.FileGenerationChanged(
+                        f"purge trash changed during removal: {trash}"
+                    )
+
+                graph.unresolve_incoming(conn, intent.doc_id)
+                deleted = conn.execute(
+                    "DELETE FROM documents WHERE id=? AND path=? AND path_norm=? "
+                    "AND version=? AND is_deleted=1 AND file_state='pending' "
+                    "AND EXISTS(SELECT 1 FROM document_purge_intents p "
+                    "WHERE p.doc_id=? AND p.path=? AND p.path_norm=? AND p.version=?) "
+                    "AND NOT EXISTS(SELECT 1 FROM file_projection_cleanup c "
+                    "WHERE c.doc_id=?)",
+                    (
+                        intent.doc_id,
+                        intent.path,
+                        intent.path_norm,
+                        intent.version,
+                        intent.doc_id,
+                        intent.path,
+                        intent.path_norm,
+                        intent.version,
+                        intent.doc_id,
+                    ),
+                )
+                if deleted.rowcount != 1:
+                    raise RuntimeError("purge tombstone fence changed before deletion")
+                audit.record(
+                    conn,
+                    actor=intent.actor,
+                    via=intent.via,
+                    action="doc_purge",
+                    target=intent.path,
+                )
+            return fp.ProjectionResult(
+                intent.doc_id,
+                intent.path,
+                True,
+                True,
+                None,
+                1,
+                True,
+            )
+        except (OSError, fp.FileProjectionError) as exc:
+            return fp.ProjectionResult(
+                last_intent.doc_id,
+                last_intent.path,
+                False,
+                False,
+                "purge_io_error",
+                1,
+                True,
+                f"{type(exc).__name__}: {exc}",
+            )
+
     def _project_current(
         self, doc_id: int, *, max_attempts: int = 3
     ) -> fp.ProjectionResult:
@@ -1050,7 +1343,18 @@ class DocumentService:
             ids = [int(row["id"]) for row in rows]
             for current_id in ids:
                 try:
-                    result = self._project_current(current_id)
+                    with self.db.reader() as conn:
+                        has_purge_intent = conn.execute(
+                            "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
+                            (current_id,),
+                        ).fetchone() is not None
+                    result = (
+                        self._finish_purge(current_id)
+                        if has_purge_intent
+                        else self._project_current(current_id)
+                    )
+                    if result.reason == "purge_pending":
+                        result = self._finish_purge(current_id)
                 except Exception as exc:
                     log.exception(
                         "recover_pending: document %d raised unexpectedly", current_id
@@ -1893,19 +2197,52 @@ class DocumentService:
 
         with self.db.writer() as conn:
             row = conn.execute(
-                "SELECT id, version, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+                "SELECT d.id,d.path,d.version,d.is_deleted,"
+                "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                "AS has_purge_intent FROM documents d WHERE d.path_norm=?",
+                (norm,),
+            ).fetchone()
             if row and not row["is_deleted"]:
                 raise self._conflict(conn, row["id"], rel,
                                      message="A document already exists at this path.")
             if row and row["is_deleted"]:  # revive a tombstone
-                doc_id = row["id"]
-                new_version = row["version"] + 1
-                conn.execute(
+                if row["has_purge_intent"]:
+                    raise ConflictError(
+                        "Permanent deletion is already in progress.", path=rel
+                    )
+                # A normalized-path match may differ only in spelling/casing. Keep
+                # the tombstone's canonical path so the common live projector removes
+                # the exact existing trash copy instead of orphaning it.
+                rel = str(row["path"])
+                norm = path_norm(rel)
+                folder = folder_of(rel)
+                stem = basename_stem(rel).lower()
+                fp.managed_path(self.vault, rel, namespace="live")
+                doc_id = int(row["id"])
+                new_version = int(row["version"]) + 1
+                changed = conn.execute(
                     "UPDATE documents SET path=?, title=?, version=?, content_hash=?, folder=?, "
                     "file_state='pending', vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? "
-                    "WHERE id=?",
-                    (rel, final_title, new_version, chash, folder, now, principal.user_id, doc_id),
+                    "WHERE id=? AND version=? AND is_deleted=1 "
+                    "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=?)",
+                    (
+                        rel,
+                        final_title,
+                        new_version,
+                        chash,
+                        folder,
+                        now,
+                        principal.user_id,
+                        doc_id,
+                        int(row["version"]),
+                        doc_id,
+                    ),
                 )
+                if changed.rowcount != 1:
+                    raise ConflictError(
+                        "The deleted document changed before it could be revived.",
+                        path=rel,
+                    )
             else:
                 cur = conn.execute(
                     "INSERT INTO documents(path, path_norm, title, version, content_hash, folder, "
@@ -2624,24 +2961,47 @@ class DocumentService:
         now = now_iso()
         with self.db.writer() as conn:
             row = conn.execute(
-                "SELECT id, version, title, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
+                "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.content_hash,"
+                "d.is_deleted,r.body,r.content_hash AS revision_content_hash,"
+                "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                "AS has_purge_intent FROM documents d LEFT JOIN revisions r "
+                "ON r.doc_id=d.id AND r.version=d.version WHERE d.path_norm=?",
+                (norm,),
+            ).fetchone()
             if not row or row["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
-            doc_id = row["id"]
+            if row["has_purge_intent"]:
+                raise ConflictError("Permanent deletion is already in progress.", path=rel)
+            actual_rel = str(row["path"])
+            fp.managed_path(self.vault, actual_rel, namespace="live")
+            doc_id = int(row["id"])
             if base_version is not None and int(base_version) != row["version"]:
-                raise self._conflict(conn, doc_id, rel)
-            body = self._latest_body(conn, doc_id)
-            new_version = row["version"] + 1
-            # file_state='pending' guards the post-commit _trash_file the same way
-            # create()/update() guard their file write: a crash between this commit
-            # and the trash leaves the row pending, and recover_pending() finishes
-            # the trash on the next start (it would otherwise be an on-disk orphan
-            # the DB has already marked deleted).
-            conn.execute(
+                raise self._conflict(conn, doc_id, actual_rel)
+            body = str(row["body"]) if row["body"] is not None else None
+            if (
+                body is None
+                or row["revision_content_hash"] != row["content_hash"]
+                or sha256_hex(body) != row["content_hash"]
+            ):
+                raise RuntimeError("current document revision is missing or corrupt")
+            new_version = int(row["version"]) + 1
+            changed = conn.execute(
                 "UPDATE documents SET is_deleted=1, version=version+1, file_state='pending', "
-                "vector_dirty=0, updated_at=?, updated_by=? WHERE id=?",
-                (now, principal.user_id, doc_id),
+                "vector_dirty=0, updated_at=?, updated_by=? "
+                "WHERE id=? AND path=? AND path_norm=? AND version=? AND is_deleted=0 "
+                "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=?)",
+                (
+                    now,
+                    principal.user_id,
+                    doc_id,
+                    actual_rel,
+                    str(row["path_norm"]),
+                    int(row["version"]),
+                    doc_id,
+                ),
             )
+            if changed.rowcount != 1:
+                raise self._conflict(conn, doc_id, actual_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'delete', ?, ?)",
@@ -2652,15 +3012,13 @@ class DocumentService:
             graph.unresolve_incoming(conn, doc_id)
             conn.execute("DELETE FROM links WHERE src_doc_id=?", (doc_id,))
             audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_delete", target=rel, detail=f"v{new_version}")
-        self._trash_file(rel)
-        with self.db.writer() as conn:
-            conn.execute("UPDATE documents SET file_state='clean' WHERE id=?", (doc_id,))
+                         action="doc_delete", target=actual_rel, detail=f"v{new_version}")
+        self._require_projection(doc_id)
         DOC_WRITES.labels("delete").inc()
-        self._emit("delete", rel, new_version,
+        self._emit("delete", actual_rel, new_version,
                    updated_by=principal.username, via=principal.via)
         self._bump_nav()
-        return {"ok": True, "path": rel, "deleted": True}
+        return {"ok": True, "path": actual_rel, "deleted": True}
 
     def list_deleted(self, limit: int = 100, offset: int = 0) -> list[dict]:
         """Soft-deleted documents (the trash), most-recently-deleted first. Each carries
@@ -2688,26 +3046,51 @@ class DocumentService:
                 f"Role '{principal.role}' cannot restore documents (read/search only).")
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
-        stem = basename_stem(rel)
         now = now_iso()
         with self.db.writer() as conn:
             row = conn.execute(
-                "SELECT id, version, title, folder, is_deleted FROM documents WHERE path_norm=?",
-                (norm,)).fetchone()
+                "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.folder,d.content_hash,"
+                "d.is_deleted,r.body,r.content_hash AS revision_content_hash,"
+                "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                "AS has_purge_intent FROM documents d LEFT JOIN revisions r "
+                "ON r.doc_id=d.id AND r.version=d.version WHERE d.path_norm=?",
+                (norm,),
+            ).fetchone()
             if not row:
                 raise NotFoundError("No document at this path.", path=rel)
             if not row["is_deleted"]:
                 raise ValidationError("Document is not deleted; nothing to restore.")
-            doc_id, title, folder = row["id"], row["title"], row["folder"]
-            body = self._latest_body(conn, doc_id)
-            new_version = row["version"] + 1
-            # file_state='pending' guards the post-commit file re-projection, mirroring
-            # create()/delete(): a crash before the write is finished by recover_pending().
-            conn.execute(
+            actual_rel = str(row["path"])
+            if row["has_purge_intent"]:
+                raise ConflictError("Permanent deletion is already in progress.", path=actual_rel)
+            fp.managed_path(self.vault, actual_rel, namespace="live")
+            doc_id, title, folder = int(row["id"]), row["title"], row["folder"]
+            body = str(row["body"]) if row["body"] is not None else None
+            if (
+                body is None
+                or row["revision_content_hash"] != row["content_hash"]
+                or sha256_hex(body) != row["content_hash"]
+            ):
+                raise RuntimeError("current document revision is missing or corrupt")
+            new_version = int(row["version"]) + 1
+            changed = conn.execute(
                 "UPDATE documents SET version=version+1, content_hash=?, file_state='pending', "
-                "vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? WHERE id=?",
-                (sha256_hex(body), now, principal.user_id, doc_id),
+                "vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? "
+                "WHERE id=? AND path=? AND path_norm=? AND version=? AND is_deleted=1 "
+                "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=?)",
+                (
+                    sha256_hex(body),
+                    now,
+                    principal.user_id,
+                    doc_id,
+                    actual_rel,
+                    str(row["path_norm"]),
+                    int(row["version"]),
+                    doc_id,
+                ),
             )
+            if changed.rowcount != 1:
+                raise ConflictError("The deleted document changed before restore.", path=actual_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'edit', ?, ?)",
@@ -2718,48 +3101,186 @@ class DocumentService:
             indexing.reindex_fts(conn, doc_id, title, body)
             indexing.rechunk(conn, doc_id, body)
             indexing.reindex_links(conn, doc_id, body, folder)
-            graph.backfill_links_for(conn, doc_id, norm, stem)
+            graph.backfill_links_for(
+                conn,
+                doc_id,
+                str(row["path_norm"]),
+                basename_stem(actual_rel).lower(),
+            )
             audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_restore", target=rel, detail=f"v{new_version}")
-        mtime = self._write_file(rel, body)
-        with self.db.writer() as conn:
-            conn.execute("UPDATE documents SET file_state='clean', file_mtime=? WHERE id=?",
-                         (mtime, doc_id))
+                         action="doc_restore", target=actual_rel, detail=f"v{new_version}")
+        self._require_projection(doc_id)
         self._embed(doc_id)
         DOC_WRITES.labels("restore").inc()
-        self._emit("restore", rel, new_version, updated_by=principal.username, via=principal.via)
+        self._emit(
+            "restore",
+            actual_rel,
+            new_version,
+            updated_by=principal.username,
+            via=principal.via,
+        )
         self._bump_nav()
-        return {"ok": True, "path": rel, "version": new_version, "restored": True}
+        return {
+            "ok": True,
+            "path": actual_rel,
+            "version": new_version,
+            "restored": True,
+        }
 
     def purge(self, principal: Principal, path: str) -> dict:
-        """Permanently delete a TRASHED document and all its history (admin only) — there
-        is no undo. Refuses a live document (soft-delete it first). The row's revisions /
-        tags / links are removed by FK cascade (its chunks + vectors were already cleared
-        on soft delete); the .trash copy of the file is removed best-effort."""
+        """Durably request and finish permanent deletion of a soft-deleted document."""
         if not principal.can_admin:
             raise ForbiddenError("Only an admin can permanently delete a document.")
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
-        with self.db.writer() as conn:
-            row = conn.execute(
-                "SELECT id, is_deleted FROM documents WHERE path_norm=?", (norm,)).fetchone()
-            if not row:
+        doc_id: int | None = None
+        actual_rel = rel
+
+        for _attempt in range(3):
+            with self.db.reader() as conn:
+                row = conn.execute(
+                    "SELECT d.id,d.path,d.path_norm,d.version,d.content_hash,"
+                    "d.file_state,d.is_deleted,"
+                    "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                    "AS has_purge_intent FROM documents d WHERE d.path_norm=?",
+                    (norm,),
+                ).fetchone()
+            if row is None:
                 raise NotFoundError("No document at this path.", path=rel)
             if not row["is_deleted"]:
                 raise ValidationError("Document is not in the trash; delete it first.")
-            doc_id = row["id"]
-            graph.unresolve_incoming(conn, doc_id)  # break any inbound links before the row goes
-            conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_purge", target=rel)
-        try:  # remove the trashed file copy (best-effort; DB is canonical)
-            trashed = safe_join(self.vault / ".trash", rel)
-            if trashed.is_file():
-                trashed.unlink()
-        except OSError:
-            pass
+
+            doc_id = int(row["id"])
+            actual_rel = str(row["path"])
+            if row["has_purge_intent"]:
+                break
+
+            initial_token = (
+                actual_rel,
+                str(row["path_norm"]),
+                int(row["version"]),
+                str(row["content_hash"]),
+                bool(row["is_deleted"]),
+            )
+            initially_pending = row["file_state"] == "pending"
+            projection: fp.ProjectionResult | None = None
+            if initially_pending:
+                projection = self._project_current(doc_id)
+                if (
+                    not projection.settled
+                    and not projection.current_installed
+                    and projection.reason != "purge_pending"
+                ):
+                    raise ProjectionPendingError(projection)
+
+            retry = False
+            with self.db.writer() as conn:
+                current = conn.execute(
+                    "SELECT d.id,d.path,d.path_norm,d.version,d.content_hash,"
+                    "d.file_state,d.is_deleted,"
+                    "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                    "AS has_purge_intent,"
+                    "EXISTS(SELECT 1 FROM revisions r WHERE r.doc_id=d.id "
+                    "AND r.version=d.version AND r.content_hash=d.content_hash) "
+                    "AS exact_revision FROM documents d WHERE d.id=?",
+                    (doc_id,),
+                ).fetchone()
+                if current is None:
+                    retry = True
+                elif current["has_purge_intent"]:
+                    actual_rel = str(current["path"])
+                elif not current["is_deleted"]:
+                    raise ConflictError(
+                        "The document was restored before purge could begin.",
+                        path=actual_rel,
+                    )
+                else:
+                    current_token = (
+                        str(current["path"]),
+                        str(current["path_norm"]),
+                        int(current["version"]),
+                        str(current["content_hash"]),
+                        bool(current["is_deleted"]),
+                    )
+                    if current_token != initial_token or not current["exact_revision"]:
+                        retry = True
+                    else:
+                        if initially_pending:
+                            if (
+                                projection is not None
+                                and not projection.settled
+                                and not projection.current_installed
+                            ):
+                                raise ProjectionPendingError(projection)
+                            live = fp.managed_path(
+                                self.vault, actual_rel, namespace="live"
+                            )
+                            if not fp.confirm_confined_absence(self.vault, live):
+                                raise ProjectionPendingError(
+                                    fp.ProjectionResult(
+                                        doc_id,
+                                        actual_rel,
+                                        False,
+                                        False,
+                                        "purge_live_present",
+                                        1,
+                                        True,
+                                        "The pending tombstone still has a live file.",
+                                        bool(
+                                            projection
+                                            and projection.current_installed
+                                        ),
+                                    )
+                                )
+                        conn.execute(
+                            "INSERT INTO document_purge_intents("
+                            "doc_id,path,path_norm,version,actor,via,created_at) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            (
+                                doc_id,
+                                str(current["path"]),
+                                str(current["path_norm"]),
+                                int(current["version"]),
+                                principal.username,
+                                principal.via,
+                                now_iso(),
+                            ),
+                        )
+                        marked = conn.execute(
+                            "UPDATE documents SET file_state='pending' "
+                            "WHERE id=? AND path=? AND path_norm=? AND version=? "
+                            "AND content_hash=? AND is_deleted=1 "
+                            "AND EXISTS(SELECT 1 FROM document_purge_intents p "
+                            "WHERE p.doc_id=?)",
+                            (
+                                doc_id,
+                                str(current["path"]),
+                                str(current["path_norm"]),
+                                int(current["version"]),
+                                str(current["content_hash"]),
+                                doc_id,
+                            ),
+                        )
+                        if marked.rowcount != 1:
+                            raise RuntimeError(
+                                "purge intent committed without its tombstone fence"
+                            )
+                        actual_rel = str(current["path"])
+            if retry:
+                continue
+            break
+        else:
+            raise ConflictError(
+                "The deleted document kept changing while purge was requested.",
+                path=actual_rel,
+            )
+
+        assert doc_id is not None
+        result = self._finish_purge(doc_id)
+        if not result.settled:
+            raise ProjectionPendingError(result)
         self._bump_nav()
-        return {"ok": True, "path": rel, "purged": True}
+        return {"ok": True, "path": actual_rel, "purged": True}
 
     # ---- favorites (per-user pins) --------------------------------------
     def toggle_favorite(self, principal: Principal, path: str) -> dict:
