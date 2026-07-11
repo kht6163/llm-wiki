@@ -1,4 +1,5 @@
 """#10 single-command full snapshot/restore (DB + vault + manifest as one .tar)."""
+import hashlib
 import io
 import json
 import sqlite3
@@ -590,3 +591,146 @@ def test_restore_second_publish_failure_rolls_back_every_live_target(
     assert (vault / "original.txt").read_text() == "original"
     assert wal.read_bytes() == b"original wal"
     assert shm.read_bytes() == b"original shm"
+
+
+def test_restore_backup_cleanup_failure_is_success_with_cli_warning(
+    tmp_path, monkeypatch, capsys
+):
+    archive = _snapshot_for_restore(tmp_path, "cleanup-source")
+    settings = _settings(tmp_path, "cleanup-target")
+    settings.db_path.parent.mkdir()
+    settings.db_path.write_bytes(b"original db")
+    settings.vault_path.mkdir()
+    (settings.vault_path / "original.txt").write_text("original")
+    real_remove = snapshot_writer._remove_path
+    preserved: list[Path] = []
+
+    def fail_backup_cleanup(path):
+        if ".restore-backup-" in path.name:
+            preserved.append(path)
+            raise OSError("simulated backup cleanup failure")
+        return real_remove(path)
+
+    monkeypatch.setattr(snapshot_writer, "_remove_path", fail_backup_cleanup)
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        _cli_impl, "build_context", lambda **kw: build_context(settings, full=False)
+    )
+
+    assert _cli_impl._restore(SimpleNamespace(in_=str(archive), force=True)) == 0
+
+    output = capsys.readouterr().out
+    assert "WARNING: restored successfully but backup cleanup failed" in output
+    assert preserved
+    assert all(path.exists() for path in preserved)
+    assert (settings.vault_path / "note.md").exists()
+
+
+def test_restore_report_does_not_claim_recovery_before_cli_recovery(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "report-source")
+    report = snapshot_writer.restore_snapshot(
+        archive, tmp_path / "report.db", tmp_path / "report-vault", force=False
+    )
+
+    assert not hasattr(report, "recovered")
+
+
+def test_restore_cli_reports_preserved_backup_when_rollback_fails(
+    tmp_path, monkeypatch, capsys
+):
+    archive = _snapshot_for_restore(tmp_path, "rollback-source")
+    settings = _settings(tmp_path, "rollback-target")
+    settings.db_path.parent.mkdir()
+    settings.db_path.write_bytes(b"original db")
+    settings.vault_path.mkdir()
+    (settings.vault_path / "original.txt").write_text("original")
+    real_replace = snapshot_writer.os.replace
+    preserved: list[Path] = []
+    rollback_errors: list[snapshot_writer.RestoreRollbackError] = []
+
+    def fail_publish_and_db_rollback(source, destination):
+        source_path, destination_path = Path(source), Path(destination)
+        if (
+            destination_path == settings.vault_path
+            and ".restore-stage-" in source_path.name
+        ):
+            raise OSError("simulated vault publish failure")
+        if (
+            destination_path == settings.db_path
+            and ".restore-backup-" in source_path.name
+        ):
+            preserved.append(source_path)
+            raise OSError("simulated database rollback failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(snapshot_writer.os, "replace", fail_publish_and_db_rollback)
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    real_restore = _cli_impl.restore_snapshot
+
+    def record_rollback_error(*args, **kwargs):
+        try:
+            return real_restore(*args, **kwargs)
+        except snapshot_writer.RestoreRollbackError as exc:
+            rollback_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", record_rollback_error)
+
+    assert _cli_impl._restore(SimpleNamespace(in_=str(archive), force=True)) == 1
+
+    output = capsys.readouterr().out
+    assert "restore failed:" in output
+    assert "backups preserved at" in output
+    assert preserved and preserved[0].exists()
+    assert str(preserved[0]) in output
+    assert (settings.vault_path / "original.txt").read_text() == "original"
+    assert rollback_errors[0].backup_paths == (preserved[0],)
+    assert str(rollback_errors[0].publish_error) == "simulated vault publish failure"
+    assert str(rollback_errors[0].rollback_errors[0]) == "simulated database rollback failure"
+
+
+@pytest.mark.parametrize("corruption", ["database", "managed"])
+def test_restore_rejects_staged_database_projection_mismatch_without_live_changes(
+    tmp_path, corruption
+):
+    original = _snapshot_for_restore(tmp_path, f"projection-{corruption}-source")
+    damaged = tmp_path / f"projection-{corruption}.tar"
+    scratch_db = tmp_path / f"projection-{corruption}.db"
+
+    def corrupt_projection(members):
+        result = []
+        for member, data in members:
+            if corruption == "database" and member.name == "wiki.db":
+                scratch_db.write_bytes(data)
+                with sqlite3.connect(scratch_db) as conn:
+                    conn.execute(
+                        "UPDATE revisions SET body=? WHERE version=1",
+                        ("# Note\n\ntampered database",),
+                    )
+                data = scratch_db.read_bytes()
+            elif corruption == "managed" and member.name == "vault/note.md":
+                data = b"# Note\n\ntampered projection"
+            elif corruption == "managed" and member.name == "manifest.json":
+                manifest = json.loads(data)
+                entry = next(
+                    item for item in manifest["files"] if item["path"] == "vault/note.md"
+                )
+                body = b"# Note\n\ntampered projection"
+                entry["size"] = len(body)
+                entry["sha256"] = hashlib.sha256(body).hexdigest()
+                data = json.dumps(manifest).encode()
+            result.append((member, data))
+        return result
+
+    _rewrite_snapshot(original, damaged, corrupt_projection)
+    db_path = tmp_path / f"live-{corruption}.db"
+    vault = tmp_path / f"live-{corruption}-vault"
+    db_path.write_bytes(b"original db")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+
+    with pytest.raises(ValueError, match="hash mismatch|document mismatch"):
+        snapshot_writer.restore_snapshot(damaged, db_path, vault, force=True)
+
+    assert db_path.read_bytes() == b"original db"
+    assert (vault / "original.txt").read_text() == "original"

@@ -36,8 +36,27 @@ class SnapshotReport:
 class RestoreReport:
     schema_version: int | None
     doc_count: int
-    recovered: int = 0
     embedding_model: str | None = None
+    backup_cleanup_warnings: tuple[Path, ...] = ()
+
+
+class RestoreRollbackError(ValueError):
+    """Publication failed and one or more original targets could not be restored."""
+
+    def __init__(
+        self,
+        publish_error: BaseException,
+        rollback_errors: list[OSError],
+        backup_paths: tuple[Path, ...],
+    ) -> None:
+        self.publish_error = publish_error
+        self.rollback_errors = tuple(rollback_errors)
+        self.backup_paths = backup_paths
+        locations = ", ".join(str(path) for path in backup_paths) or "unknown locations"
+        super().__init__(
+            "restore publication failed and rollback could not complete; "
+            f"backups preserved at {locations}"
+        )
 
 
 @dataclass(frozen=True)
@@ -461,7 +480,9 @@ def _backup_name(path: Path) -> Path:
     return path.with_name(f".{path.name}.restore-backup-{uuid.uuid4().hex}")
 
 
-def _publish_restore(staged_db: Path, staged_vault: Path, db_path: Path, vault: Path) -> None:
+def _publish_restore(
+    staged_db: Path, staged_vault: Path, db_path: Path, vault: Path
+) -> tuple[Path, ...]:
     targets = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"), vault]
     journal: list[tuple[Path, Path]] = []
     published: list[Path] = []
@@ -488,13 +509,22 @@ def _publish_restore(staged_db: Path, staged_vault: Path, db_path: Path, vault: 
             except OSError as exc:
                 rollback_errors.append(exc)
         if rollback_errors:
-            raise RuntimeError(
-                "restore publication failed and rollback could not complete; "
-                "restore backups were preserved"
+            preserved = tuple(
+                backup
+                for _, backup in journal
+                if backup.exists() or backup.is_symlink()
+            )
+            raise RestoreRollbackError(
+                publish_error, rollback_errors, preserved
             ) from publish_error
         raise
+    cleanup_warnings: list[Path] = []
     for _, backup in journal:
-        _remove_path(backup)
+        try:
+            _remove_path(backup)
+        except OSError:
+            cleanup_warnings.append(backup)
+    return tuple(cleanup_warnings)
 
 
 def restore_snapshot(
@@ -554,7 +584,9 @@ def restore_snapshot(
         schema_version, doc_count = _validate_staged_database(
             staged_db, staged_vault, manifest, files
         )
-        _publish_restore(staged_db, staged_vault, db_path, vault)
+        backup_cleanup_warnings = _publish_restore(
+            staged_db, staged_vault, db_path, vault
+        )
     finally:
         _remove_path(staged_db)
         _remove_path(staged_vault)
@@ -564,4 +596,5 @@ def restore_snapshot(
         schema_version,
         doc_count,
         embedding_model=embedding_model if isinstance(embedding_model, str) else None,
+        backup_cleanup_warnings=backup_cleanup_warnings,
     )

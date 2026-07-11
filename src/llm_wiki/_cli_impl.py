@@ -488,6 +488,11 @@ def _restore(args) -> int:
         print(f"restore failed: {exc}")
         return 1
 
+    for backup in report.backup_cleanup_warnings:
+        print(
+            "WARNING: restored successfully but backup cleanup failed; "
+            f"backup preserved at {backup}"
+        )
     if report.embedding_model and report.embedding_model != settings.embedding_model:
         print(f"WARNING: snapshot embedding_model '{report.embedding_model}' differs from "
               f"configured '{settings.embedding_model}'. Run 'llm-wiki reindex --reembed'.")
