@@ -377,6 +377,8 @@ def create_web_app(app: AppContext) -> FastAPI:
             return "attachment_upload"
         if path.startswith("/doc/") and path.endswith("/delete"):
             return "doc_delete"
+        if path.startswith("/doc/") and "/rev/" in path and path.endswith("/restore"):
+            return "doc_restore"
         if path.startswith("/doc/") and path.endswith("/edit"):
             return "doc_update"
         if path.startswith("/settings/keys"):
@@ -660,7 +662,9 @@ def create_web_app(app: AppContext) -> FastAPI:
             docs.restore(p, path)
             request.session["flash"] = f"복원했습니다: {path}"
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_restore", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             request.session["flash"] = f"복원 실패: {e.message}"
         return RedirectResponse("/trash", status_code=303)
 
@@ -670,7 +674,9 @@ def create_web_app(app: AppContext) -> FastAPI:
             docs.purge(p, path)
             request.session["flash"] = f"완전히 삭제했습니다: {path}"
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_purge", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             request.session["flash"] = f"삭제 실패: {e.message}"
         return RedirectResponse("/trash", status_code=303)
 
@@ -824,14 +830,18 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             doc = docs.create(p, path, content, title=title or None)
         except PathError as e:
-            audit_write_rejection(request, p, e, action="doc_create", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             # Stay on the form with the typed content preserved (an invalid path is a
             # field error, not a dead end) instead of bouncing to the global error page.
             return render("edit.html", request, status=400, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
                           error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.list_folders())
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_create", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
                           error=e.message, can_write=p.can_write, folders=docs.list_folders())
@@ -854,18 +864,24 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             doc = docs.update(p, path, base_version, content, title=title or None)
         except ConflictError as e:
-            audit_write_rejection(request, p, e, action="doc_update", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             return render("edit.html", request, status=409, is_new=False, path=path, title=title,
                           content=content, base_version=e.extra.get("current_version"),
                           conflict=e.extra, error=None, can_write=p.can_write,
                           conflict_diff=_diff_lines(content, e.extra.get("current_content") or ""))
         except PathError as e:
-            audit_write_rejection(request, p, e, action="doc_update", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             return render("edit.html", request, status=400, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
                           error=f"잘못된 경로입니다: {e}", can_write=p.can_write)
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_update", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             return render("edit.html", request, status=e.http_status, is_new=False, path=path,
                           title=title, content=content, base_version=base_version, conflict=None,
                           error=e.message, can_write=p.can_write)
@@ -877,7 +893,9 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             docs.delete(p, path, base_version)
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_delete", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             request.session["flash"] = f"Delete failed: {e.message}"
             return RedirectResponse("/doc/" + quote(path), status_code=303)
         return RedirectResponse("/", status_code=303)
@@ -928,11 +946,15 @@ def create_web_app(app: AppContext) -> FastAPI:
         try:
             doc = docs.restore_revision(p, path, version)
         except ConflictError as e:
-            audit_write_rejection(request, p, e, action="doc_restore", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             request.session["flash"] = "복원 실패: 그 사이 다른 변경이 있었습니다. 다시 시도하세요."
             return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
         except WikiError as e:
-            audit_write_rejection(request, p, e, action="doc_restore", target=path)
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=path
+            )
             request.session["flash"] = f"복원 실패: {e.message}"
             return RedirectResponse("/doc/" + quote(path) + "/history", status_code=303)
         request.session["flash"] = f"v{version} 내용으로 복원했습니다 (현재 v{doc['version']})."

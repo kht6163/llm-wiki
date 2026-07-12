@@ -395,26 +395,161 @@ def test_bearer_auth_raw_and_unauthorized_raw(ctx, principals):
     assert response.status_code == 200 and response.text == "body"
 
 
-def test_write_action_classifier_and_audit_outage(ctx, principals, monkeypatch, caplog):
-    app = create_web_app(ctx)
-    handler = app.exception_handlers[web_mod.WikiError]
-    classifier = dict(zip(handler.__code__.co_freevars, handler.__closure__, strict=True))[
-        "write_action_for_path"
-    ].cell_contents
-    assert [classifier(path) for path in (
-        "/new", "/trash/a/restore", "/trash/a/purge", "/api/doc/a/move",
-        "/api/doc/a/properties", "/api/upload", "/doc/a/delete", "/doc/a/edit",
-        "/settings/keys", "/other",
-    )] == [
-        "doc_create", "doc_restore", "doc_purge", "doc_move", "doc_update",
-        "attachment_upload", "doc_delete", "doc_update", "key_change", "write_rejected",
-    ]
-
-    client = TestClient(app)
+def test_write_actions_are_classified_through_public_http_routes(
+    ctx, principals, monkeypatch, caplog
+):
+    client = _client(ctx, principals)
     _login(client)
     csrf = _token(client, "/new")
-    monkeypatch.setattr(web_mod.audit, "record_tx", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("audit down")))
-    response = client.post("/api/folders", data={"path": "../bad", "csrf_token": csrf})
+    ctx.docs.create(principals["editor"], "route.md", "v1")
+
+    def latest() -> dict:
+        with ctx.db.reader() as conn:
+            row = conn.execute(
+                "SELECT action, target, outcome, detail FROM audit_log "
+                "WHERE actor='alice' AND outcome != 'ok' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row)
+
+    def reject(exc):
+        def raising(*args, **kwargs):
+            raise exc
+
+        return raising
+
+    original = ctx.docs.create
+    monkeypatch.setattr(ctx.docs, "create", reject(PathError("bad path")))
+    response = client.post(
+        "/new", data={"path": "bad.md", "content": "secret", "csrf_token": csrf}
+    )
+    assert response.status_code == 400 and "잘못된 경로" in response.text
+    assert latest() == {
+        "action": "doc_create", "target": "bad.md", "outcome": "error", "detail": "code=bad_path"
+    }
+    monkeypatch.setattr(ctx.docs, "create", original)
+
+    original = ctx.docs.update
+    monkeypatch.setattr(ctx.docs, "update", reject(ValidationError("rejected update")))
+    response = client.post(
+        "/doc/route.md/edit",
+        data={"content": "secret", "base_version": 1, "csrf_token": csrf},
+    )
+    assert response.status_code == 400 and "rejected update" in response.text
+    assert latest() == {
+        "action": "doc_update", "target": "route.md", "outcome": "error", "detail": "code=validation"
+    }
+    monkeypatch.setattr(ctx.docs, "update", original)
+
+    original = ctx.docs.delete
+    monkeypatch.setattr(ctx.docs, "delete", reject(ConflictError("delete race")))
+    response = client.post(
+        "/doc/route.md/delete", data={"base_version": 1, "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303 and response.headers["location"] == "/doc/route.md"
+    assert latest() == {
+        "action": "doc_delete", "target": "route.md", "outcome": "conflict", "detail": "code=conflict"
+    }
+    monkeypatch.setattr(ctx.docs, "delete", original)
+
+    original = ctx.docs.restore
+    monkeypatch.setattr(ctx.docs, "restore", reject(NotFoundError("not trashed")))
+    response = client.post(
+        "/trash/route.md/restore", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303 and response.headers["location"] == "/trash"
+    assert latest() == {
+        "action": "doc_restore", "target": "route.md", "outcome": "error", "detail": "code=not_found"
+    }
+    monkeypatch.setattr(ctx.docs, "restore", original)
+
+    original = ctx.docs.purge
+    monkeypatch.setattr(ctx.docs, "purge", reject(ValidationError("not deleted")))
+    response = client.post(
+        "/trash/route.md/purge", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303 and response.headers["location"] == "/trash"
+    assert latest() == {
+        "action": "doc_purge", "target": "route.md", "outcome": "error", "detail": "code=validation"
+    }
+    monkeypatch.setattr(ctx.docs, "purge", original)
+
+    original = ctx.docs.restore_revision
+    monkeypatch.setattr(ctx.docs, "restore_revision", reject(ConflictError("restore race")))
+    response = client.post(
+        "/doc/route.md/rev/1/restore", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert response.status_code == 303 and response.headers["location"].endswith("/history")
+    assert latest() == {
+        "action": "doc_restore", "target": "route.md", "outcome": "conflict", "detail": "code=conflict"
+    }
+    monkeypatch.setattr(ctx.docs, "restore_revision", original)
+
+    original = ctx.docs.move
+    monkeypatch.setattr(ctx.docs, "move", reject(ValidationError("bad destination")))
+    response = client.post(
+        "/api/doc/route.md/move", data={"new_path": "new.md", "csrf_token": csrf}
+    )
+    assert response.status_code == 400 and response.json()["error"]["code"] == "validation"
+    assert latest() == {
+        "action": "doc_move", "target": "/api/doc/route.md/move",
+        "outcome": "error", "detail": "code=validation",
+    }
+    monkeypatch.setattr(ctx.docs, "move", original)
+
+    original = ctx.docs.replace_properties
+    monkeypatch.setattr(ctx.docs, "replace_properties", reject(ConflictError("property race")))
+    response = client.post(
+        "/api/doc/route.md/properties",
+        json={"base_version": 1, "properties": []}, headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 409 and response.json()["error"]["code"] == "conflict"
+    assert latest() == {
+        "action": "doc_update", "target": "/api/doc/route.md/properties",
+        "outcome": "conflict", "detail": "code=conflict",
+    }
+    monkeypatch.setattr(ctx.docs, "replace_properties", original)
+
+    original = ctx.docs.save_attachment
+    monkeypatch.setattr(ctx.docs, "save_attachment", reject(ValidationError("bad attachment")))
+    response = client.post(
+        "/api/upload", files={"file": ("pic.png", b"png", "image/png")},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 400 and response.json()["error"]["code"] == "validation"
+    assert latest() == {
+        "action": "attachment_upload", "target": "/api/upload",
+        "outcome": "error", "detail": "code=validation",
+    }
+    monkeypatch.setattr(ctx.docs, "save_attachment", original)
+
+    original = web_mod.create_api_key
+    monkeypatch.setattr(web_mod, "create_api_key", reject(ValidationError("key rejected")))
+    response = client.post("/settings/keys", data={"name": "bad", "csrf_token": csrf})
+    assert response.status_code == 400 and response.headers["x-error-code"] == "validation"
+    assert latest() == {
+        "action": "key_change", "target": "/settings/keys",
+        "outcome": "error", "detail": "code=validation",
+    }
+    monkeypatch.setattr(web_mod, "create_api_key", original)
+
+    original = ctx.docs.create_folder
+    monkeypatch.setattr(ctx.docs, "create_folder", reject(PathError("bad folder")))
+    response = client.post("/api/folders", data={"path": "bad", "csrf_token": csrf})
+    assert response.status_code == 400 and response.json()["error"] == "bad_path"
+    assert latest() == {
+        "action": "write_rejected", "target": "/api/folders",
+        "outcome": "error", "detail": "code=bad_path",
+    }
+    monkeypatch.setattr(ctx.docs, "create_folder", original)
+
+    monkeypatch.setattr(
+        web_mod.audit,
+        "record_tx",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit down")),
+    )
+    monkeypatch.setattr(ctx.docs, "create_folder", reject(PathError("bad folder")))
+    response = client.post("/api/folders", data={"path": "bad", "csrf_token": csrf})
     assert response.status_code == 400 and response.json()["error"] == "bad_path"
     assert "failed to audit rejected web write" in caplog.text
 
