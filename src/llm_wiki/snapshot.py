@@ -32,6 +32,9 @@ MAX_SNAPSHOT_MEMBERS = 100_000
 MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SNAPSHOT_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 MAX_SNAPSHOT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_TAR_EXTENSION_BYTES = 4 * 1024 * 1024
+_MAX_TAR_EXTENSION_TOTAL_BYTES = 64 * 1024 * 1024
+_MAX_TAR_EXTENSION_CHAIN = 16
 _RESTORE_JOURNAL_FORMAT = "llm-wiki-restore-journal"
 _RESTORE_JOURNAL_VERSION = 2
 
@@ -117,6 +120,10 @@ class SnapshotArchiveReadError(ValueError):
             f"{primary_error}; snapshot archive descriptor cleanup also failed: "
             f"{cleanup_errors[0]}"
         )
+
+
+class _SnapshotTarHeaderError(ValueError):
+    """Raw tar framing is malformed before bounded tarfile parsing begins."""
 
 
 @dataclass(frozen=True)
@@ -549,6 +556,144 @@ def _copy_archive_file(source: IO[bytes], target: Path) -> tuple[int, str]:
             digest.update(chunk)
             size += len(chunk)
     return size, digest.hexdigest()
+
+
+def _parse_tar_number(field: bytes) -> int:
+    if not field:
+        raise _SnapshotTarHeaderError("invalid snapshot tar header")
+    if field[0] in (0x80, 0xFF):
+        value = int.from_bytes(field[1:], "big")
+        if field[0] == 0xFF:
+            value -= 256 ** (len(field) - 1)
+        return value
+    try:
+        raw = field.split(b"\0", 1)[0].strip(b" ")
+        return int(raw or b"0", 8)
+    except ValueError as exc:
+        raise _SnapshotTarHeaderError("invalid snapshot tar header") from exc
+
+
+def _validate_tar_checksum(header: bytes) -> None:
+    expected = _parse_tar_number(header[148:156])
+    unsigned = sum(header[:148]) + 256 + sum(header[156:])
+    signed = (
+        sum(value if value < 128 else value - 256 for value in header[:148])
+        + 256
+        + sum(value if value < 128 else value - 256 for value in header[156:])
+    )
+    if expected not in (unsigned, signed):
+        raise _SnapshotTarHeaderError("invalid snapshot tar header checksum")
+
+
+def _padded_tar_size(size: int) -> int:
+    return (size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE * tarfile.BLOCKSIZE
+
+
+def _validate_tar_headers(source: IO[bytes]) -> None:
+    """Bound tar extension processing before handing the stable FD to tarfile."""
+    source.seek(0, os.SEEK_END)
+    archive_size = source.tell()
+    source.seek(0)
+    extension_bytes = 0
+    extension_chain = 0
+    member_count = 0
+    total_size = 0
+    zero_blocks = 0
+
+    def read_block() -> bytes:
+        block = source.read(tarfile.BLOCKSIZE)
+        if len(block) != tarfile.BLOCKSIZE:
+            raise _SnapshotTarHeaderError("truncated snapshot archive")
+        return block
+
+    def reserve_payload(
+        size: int, *, extension: bool, capture: bool = False
+    ) -> bytes:
+        nonlocal extension_bytes, total_size
+        if size < 0:
+            raise _SnapshotTarHeaderError("invalid snapshot tar header")
+        padded = _padded_tar_size(size)
+        if extension:
+            extension_bytes += padded
+            if (
+                size > _MAX_TAR_EXTENSION_BYTES
+                or extension_bytes > _MAX_TAR_EXTENSION_TOTAL_BYTES
+            ):
+                raise ValueError("tar extension metadata size limit exceeded")
+        else:
+            if size > MAX_SNAPSHOT_MEMBER_BYTES:
+                raise ValueError("snapshot member size limit exceeded")
+            total_size += size
+            if total_size > MAX_SNAPSHOT_TOTAL_BYTES:
+                raise ValueError("snapshot total size limit exceeded")
+        end = source.tell() + padded
+        if end > archive_size:
+            raise _SnapshotTarHeaderError("truncated snapshot archive")
+        captured = bytearray()
+        remaining = size
+        while capture and remaining:
+            chunk = source.read(min(tarfile.BLOCKSIZE, remaining))
+            if not chunk:
+                raise _SnapshotTarHeaderError("truncated snapshot archive")
+            captured.extend(chunk)
+            remaining -= len(chunk)
+        source.seek(end)
+        return bytes(captured)
+
+    try:
+        while source.tell() < archive_size:
+            header = read_block()
+            if header == b"\0" * tarfile.BLOCKSIZE:
+                zero_blocks += 1
+                if zero_blocks == 2:
+                    return
+                continue
+            if zero_blocks:
+                raise _SnapshotTarHeaderError("invalid snapshot tar end marker")
+            _validate_tar_checksum(header)
+            size = _parse_tar_number(header[124:136])
+            typeflag = header[156:157] or tarfile.REGTYPE
+            is_extension = typeflag in {
+                tarfile.XHDTYPE,
+                tarfile.XGLTYPE,
+                tarfile.SOLARIS_XHDTYPE,
+                tarfile.GNUTYPE_LONGNAME,
+                tarfile.GNUTYPE_LONGLINK,
+            }
+            if is_extension:
+                extension_chain += 1
+                if extension_chain > _MAX_TAR_EXTENSION_CHAIN:
+                    raise ValueError("tar extension chain limit exceeded")
+                pax_data = reserve_payload(
+                    size,
+                    extension=True,
+                    capture=typeflag
+                    in {tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE},
+                )
+                if b" GNU.sparse." in pax_data:
+                    raise ValueError("GNU sparse metadata is not supported")
+                continue
+
+            extension_chain = 0
+            member_count += 1
+            if member_count > MAX_SNAPSHOT_MEMBERS:
+                raise ValueError("snapshot member count limit exceeded")
+            if typeflag == tarfile.GNUTYPE_SPARSE:
+                sparse_extensions = 0
+                is_extended = bool(header[482])
+                while is_extended:
+                    sparse_extensions += 1
+                    if sparse_extensions > _MAX_TAR_EXTENSION_CHAIN:
+                        raise ValueError("tar extension chain limit exceeded")
+                    extension = read_block()
+                    extension_bytes += tarfile.BLOCKSIZE
+                    if extension_bytes > _MAX_TAR_EXTENSION_TOTAL_BYTES:
+                        raise ValueError("tar extension metadata size limit exceeded")
+                    is_extended = bool(extension[504])
+            reserve_payload(size, extension=False)
+        raise _SnapshotTarHeaderError("truncated snapshot archive")
+    finally:
+        source.seek(0)
 
 
 @contextmanager
@@ -1495,6 +1640,7 @@ def restore_snapshot(
     try:
         try:
             with _open_stable_snapshot_archive(src) as archive_source:
+                _validate_tar_headers(archive_source)
                 with tarfile.open(fileobj=archive_source, mode="r:") as archive:
                     manifest, members = _read_restore_manifest(archive)
                     files = _manifest_files(manifest)
@@ -1528,7 +1674,7 @@ def restore_snapshot(
                             entry = files[path]
                             if size != entry["size"] or digest != entry["sha256"]:
                                 raise ValueError("manifest payload verification failed")
-        except tarfile.TarError as exc:
+        except (_SnapshotTarHeaderError, tarfile.TarError) as exc:
             raise ValueError("invalid snapshot archive") from exc
 
         schema_version, doc_count = _validate_staged_database(

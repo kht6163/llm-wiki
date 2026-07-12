@@ -106,6 +106,34 @@ def _write_members(target: Path, members: list[tuple[tarfile.TarInfo, bytes | No
             archive.addfile(copied, io.BytesIO(data) if data is not None else None)
 
 
+def _raw_tar_header(
+    name: str,
+    typeflag: bytes,
+    size: int,
+    *,
+    sparse_extended: bool = False,
+) -> bytes:
+    info = tarfile.TarInfo(name)
+    info.type = typeflag
+    info.size = size
+    header = bytearray(info.tobuf(format=tarfile.GNU_FORMAT))
+    if sparse_extended:
+        header[482] = 1
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+    return bytes(header)
+
+
+class _TrackingArchive(io.BytesIO):
+    def __init__(self, data: bytes):
+        super().__init__(data)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return super().read(size)
+
+
 def _rewrite(source: Path, target: Path, transform) -> None:
     _write_members(target, transform(_read_members(source)))
 
@@ -133,6 +161,264 @@ def _restore_rejects_without_live_changes(archive: Path, root: Path, match: str)
         snapshot.restore_snapshot(archive, db_path, vault, force=True)
     assert _tree_snapshot(root) == before
     assert _restore_artifacts(db_path, vault) == set()
+
+
+@pytest.mark.parametrize(
+    "typeflag",
+    [
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+    ],
+)
+def test_restore_rejects_oversized_tar_extension_before_tarfile_parsing(
+    tmp_path, monkeypatch, typeflag
+):
+    archive = tmp_path / f"oversized-{typeflag.decode()}.tar"
+    archive.write_bytes(
+        _raw_tar_header(
+            "metadata",
+            typeflag,
+            snapshot._MAX_TAR_EXTENSION_BYTES + 1,
+        )
+        + b"\0" * 1024
+    )
+
+    def parser_must_not_run(*_args, **_kwargs):
+        raise AssertionError("tarfile parser reached oversized extension metadata")
+
+    monkeypatch.setattr(snapshot.tarfile, "open", parser_must_not_run)
+
+    with pytest.raises(ValueError, match="tar extension metadata size limit"):
+        snapshot.restore_snapshot(
+            archive,
+            tmp_path / "data" / "wiki.db",
+            tmp_path / "vault",
+            force=True,
+        )
+
+
+def test_restore_rejects_oversized_gnu_sparse_before_tarfile_parsing(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "oversized-sparse.tar"
+    archive.write_bytes(
+        _raw_tar_header(
+            "wiki.db",
+            tarfile.GNUTYPE_SPARSE,
+            snapshot.MAX_SNAPSHOT_MEMBER_BYTES + 1,
+        )
+        + b"\0" * 1024
+    )
+
+    def parser_must_not_run(*_args, **_kwargs):
+        raise AssertionError("tarfile parser reached oversized sparse metadata")
+
+    monkeypatch.setattr(snapshot.tarfile, "open", parser_must_not_run)
+
+    with pytest.raises(ValueError, match="snapshot member size limit"):
+        snapshot.restore_snapshot(
+            archive,
+            tmp_path / "data" / "wiki.db",
+            tmp_path / "vault",
+            force=True,
+        )
+
+
+def test_restore_rejects_pax_gnu_sparse_before_tarfile_readline(
+    tmp_path, monkeypatch
+):
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+        info = tarfile.TarInfo("wiki.db")
+        info.size = 1
+        info.pax_headers = {
+            "GNU.sparse.major": "1",
+            "GNU.sparse.minor": "0",
+        }
+        archive.addfile(info, io.BytesIO(b"x"))
+    source = tmp_path / "pax-sparse.tar"
+    source.write_bytes(raw.getvalue())
+
+    def parser_must_not_run(*_args, **_kwargs):
+        raise AssertionError("tarfile parser reached PAX GNU sparse metadata")
+
+    monkeypatch.setattr(snapshot.tarfile, "open", parser_must_not_run)
+
+    with pytest.raises(ValueError, match="GNU sparse metadata is not supported"):
+        snapshot.restore_snapshot(
+            source,
+            tmp_path / "data" / "wiki.db",
+            tmp_path / "vault",
+            force=True,
+        )
+
+
+def test_tar_header_preflight_bounds_reads_and_extension_chains():
+    extension = _raw_tar_header("metadata", tarfile.XHDTYPE, 0)
+    archive = _TrackingArchive(
+        extension * (snapshot._MAX_TAR_EXTENSION_CHAIN + 1) + b"\0" * 1024
+    )
+
+    with pytest.raises(ValueError, match="tar extension chain limit"):
+        snapshot._validate_tar_headers(archive)
+
+    assert archive.read_sizes
+    assert max(archive.read_sizes) <= tarfile.BLOCKSIZE
+
+
+def test_tar_header_preflight_bounds_gnu_sparse_extension_chain():
+    sparse = _raw_tar_header(
+        "wiki.db", tarfile.GNUTYPE_SPARSE, 0, sparse_extended=True
+    )
+    extension = bytearray(tarfile.BLOCKSIZE)
+    extension[504] = 1
+    archive = _TrackingArchive(
+        sparse
+        + bytes(extension) * (snapshot._MAX_TAR_EXTENSION_CHAIN + 1)
+        + b"\0" * 1024
+    )
+
+    with pytest.raises(ValueError, match="tar extension chain limit"):
+        snapshot._validate_tar_headers(archive)
+
+    assert max(archive.read_sizes) <= tarfile.BLOCKSIZE
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        b"short header",
+        _raw_tar_header("wiki.db", tarfile.REGTYPE, 1),
+        _raw_tar_header("metadata", tarfile.XHDTYPE, 1),
+    ],
+)
+def test_tar_header_preflight_rejects_truncation(data):
+    with pytest.raises(ValueError, match="truncated snapshot archive"):
+        snapshot._validate_tar_headers(_TrackingArchive(data))
+
+
+@pytest.mark.parametrize("archive_format", [tarfile.PAX_FORMAT, tarfile.GNU_FORMAT])
+def test_tar_header_preflight_preserves_pax_and_gnu_long_names(archive_format):
+    raw = io.BytesIO()
+    long_name = f"vault/{'nested-' * 30}note.md"
+    with tarfile.open(fileobj=raw, mode="w", format=archive_format) as archive:
+        info = tarfile.TarInfo(long_name)
+        info.size = 4
+        archive.addfile(info, io.BytesIO(b"body"))
+    source = _TrackingArchive(raw.getvalue())
+
+    snapshot._validate_tar_headers(source)
+
+    assert source.tell() == 0
+    assert max(source.read_sizes) <= tarfile.BLOCKSIZE
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        (b"", "invalid snapshot tar header"),
+        (b"not-octal\0\0\0", "invalid snapshot tar header"),
+    ],
+)
+def test_tar_number_parser_rejects_invalid_fields(field, message):
+    with pytest.raises(ValueError, match=message):
+        snapshot._parse_tar_number(field)
+
+
+def test_tar_number_parser_supports_negative_base256_for_rejection():
+    assert snapshot._parse_tar_number(b"\xff" * 12) == -1
+    header = bytearray(_raw_tar_header("wiki.db", tarfile.REGTYPE, 0))
+    header[124:136] = b"\xff" * 12
+    header[148:156] = b"        "
+    header[148:156] = f"{sum(header):06o}\0 ".encode("ascii")
+
+    with pytest.raises(ValueError, match="invalid snapshot tar header"):
+        snapshot._validate_tar_headers(
+            _TrackingArchive(bytes(header) + b"\0" * 1024)
+        )
+
+
+def test_tar_header_preflight_rejects_bad_checksum_and_end_marker():
+    damaged = bytearray(_raw_tar_header("wiki.db", tarfile.REGTYPE, 0))
+    damaged[0] ^= 1
+    with pytest.raises(ValueError, match="checksum"):
+        snapshot._validate_tar_headers(
+            _TrackingArchive(bytes(damaged) + b"\0" * 1024)
+        )
+
+    valid = _raw_tar_header("wiki.db", tarfile.REGTYPE, 0)
+    with pytest.raises(ValueError, match="end marker"):
+        snapshot._validate_tar_headers(
+            _TrackingArchive(b"\0" * 512 + valid + b"\0" * 1024)
+        )
+
+
+def test_tar_header_preflight_rejects_empty_archive_and_interrupted_pax_read():
+    with pytest.raises(ValueError, match="truncated snapshot archive"):
+        snapshot._validate_tar_headers(_TrackingArchive(b""))
+
+    class InterruptedPax(_TrackingArchive):
+        def read(self, size: int = -1) -> bytes:
+            if self.tell() == tarfile.BLOCKSIZE:
+                self.read_sizes.append(size)
+                return b""
+            return super().read(size)
+
+    header = _raw_tar_header("metadata", tarfile.XHDTYPE, 1)
+    with pytest.raises(ValueError, match="truncated snapshot archive"):
+        snapshot._validate_tar_headers(
+            InterruptedPax(header + b"x" + b"\0" * 1535)
+        )
+
+
+def test_tar_header_preflight_bounds_sparse_metadata_bytes(monkeypatch):
+    sparse = _raw_tar_header(
+        "wiki.db", tarfile.GNUTYPE_SPARSE, 0, sparse_extended=True
+    )
+    extension = bytes(tarfile.BLOCKSIZE)
+    monkeypatch.setattr(snapshot, "_MAX_TAR_EXTENSION_TOTAL_BYTES", 0)
+
+    with pytest.raises(ValueError, match="metadata size limit"):
+        snapshot._validate_tar_headers(
+            _TrackingArchive(sparse + extension + b"\0" * 1024)
+        )
+
+
+def test_tar_header_preflight_bounds_raw_member_scan(monkeypatch):
+    member = _raw_tar_header("payload", tarfile.REGTYPE, 0)
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBERS", 1)
+
+    with pytest.raises(ValueError, match="member count limit"):
+        snapshot._validate_tar_headers(
+            _TrackingArchive(member + member + b"\0" * 1024)
+        )
+
+
+@pytest.mark.parametrize("limit_name", ["count", "member", "total"])
+def test_restore_manifest_retains_post_tarfile_size_defense(monkeypatch, limit_name):
+    first = tarfile.TarInfo("manifest.json")
+    first.size = 2
+    second = tarfile.TarInfo("wiki.db")
+    second.size = 2
+
+    class Archive:
+        def __iter__(self):
+            return iter([first, second])
+
+    if limit_name == "count":
+        monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBERS", 1)
+        message = "member count limit"
+    elif limit_name == "member":
+        monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBER_BYTES", 1)
+        message = "member size limit"
+    else:
+        monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_TOTAL_BYTES", 3)
+        message = "total size limit"
+
+    with pytest.raises(ValueError, match=message):
+        snapshot._read_restore_manifest(Archive())
 
 
 def test_write_rejects_unsafe_and_inconsistent_source_generations(
