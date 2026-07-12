@@ -1,21 +1,16 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
-import { flush, loadStatic } from "./static-test-utils.js";
+import { describe, expect, test, vi } from "vitest";
+import { flush, getObservers, loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
-afterEach(() => vi.unstubAllGlobals());
+useStaticIsolation();
 
 async function setup(fetchImpl = vi.fn()) {
   document.body.innerHTML = `
     <div id="doc-rendered"><input type="checkbox" data-ti="3" disabled></div>
     <div id="rt-meta" data-path="folder/a b.md" data-version="7"></div>`;
   window.WIKI = { canWrite: true, csrf: "token" };
-  const observers = [];
-  vi.stubGlobal("MutationObserver", class {
-    constructor(callback) { this.callback = callback; observers.push(this); }
-    observe = vi.fn();
-  });
   vi.stubGlobal("fetch", fetchImpl);
   await loadStatic("tasks");
-  return { box: document.querySelector("input"), meta: document.querySelector("#rt-meta"), observer: observers[0] };
+  return { box: document.querySelector("input"), meta: document.querySelector("#rt-meta"), observer: getObservers("MutationObserver")[0] };
 }
 
 describe("tasks.js", () => {
@@ -57,11 +52,11 @@ describe("tasks.js", () => {
   });
 
   test("rolls back failed API and network toggles", async () => {
-    const responses = [
-      Promise.resolve({ json: () => Promise.resolve({ ok: false }) }),
-      Promise.reject(new Error("offline")),
+    const responseFactories = [
+      () => Promise.resolve({ json: () => Promise.resolve({ ok: false }) }),
+      () => Promise.reject(new Error("offline")),
     ];
-    const { box, meta } = await setup(vi.fn(() => responses.shift()));
+    const { box, meta } = await setup(vi.fn(() => responseFactories.shift()()));
     meta.removeAttribute("data-version");
 
     box.checked = true;

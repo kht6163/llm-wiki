@@ -1,10 +1,7 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
-import { flush, loadStatic } from "./static-test-utils.js";
+import { describe, expect, test, vi } from "vitest";
+import { flush, loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
-afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-});
+useStaticIsolation();
 
 function markup(rows = true) {
   return `

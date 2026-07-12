@@ -60,7 +60,10 @@
   }
 
   function show(a) {
-    var path = decodeURIComponent(a.getAttribute("href").slice(5));
+    var href = a.getAttribute("href") || "";
+    var m = href.match(/^\/doc\/(.+)$/);
+    if (!m) return;
+    var path = decodeURIComponent(m[1]);
     activePath = path;
     if (cache[path]) { place(a, cache[path]); return; }
     placeLoading(a);

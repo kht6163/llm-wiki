@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { flush, loadStatic } from "./static-test-utils.js";
+import { beforeEach, describe, expect, test, vi } from "vitest";
+import { flush, loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
 let pending;
+
+useStaticIsolation();
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -9,11 +11,6 @@ beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve, reject) => pending.push({ resolve, reject }))));
   vi.stubGlobal("scrollX", 10);
   vi.stubGlobal("scrollY", 20);
-});
-
-afterEach(() => {
-  vi.useRealTimers();
-  vi.unstubAllGlobals();
 });
 
 function hover(el) {
@@ -26,8 +23,10 @@ describe("preview.js", () => {
     document.body.innerHTML = `
       <a class="title" href="/doc/folder/a%20b.md"><span>first</span></a>
       <a class="title" href="/doc/empty.md">empty</a>
+      <a class="title" href="/doc/">root</a>
+      <a class="title" href="/doc/remove.md">removed</a>
       <a class="title" href="/other">other</a>`;
-    const [first, empty, other] = document.querySelectorAll("a");
+    const [first, empty, root, removed, other] = document.querySelectorAll("a");
     first.getBoundingClientRect = () => ({ left: 4, bottom: 8 });
     empty.getBoundingClientRect = () => ({ left: 1, bottom: 2 });
     await loadStatic("preview");
@@ -58,6 +57,10 @@ describe("preview.js", () => {
     expect(pop.querySelector(".dp-title").textContent).toBe("");
     expect(pop.querySelector(".dp-excerpt").textContent).toBe("(내용 없음)");
 
+    hover(root);
+    removed.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    removed.removeAttribute("href");
+    vi.advanceTimersByTime(250);
     hover(other);
     document.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
     document.dispatchEvent(new MouseEvent("mouseout", { bubbles: true }));

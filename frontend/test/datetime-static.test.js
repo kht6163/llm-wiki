@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
-import { loadStatic } from "./static-test-utils.js";
+import { describe, expect, test, vi } from "vitest";
+import { loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
-afterEach(() => vi.restoreAllMocks());
+useStaticIsolation();
 
 describe("datetime.js", () => {
   test("localizes valid timestamps once and supports inserted roots", async () => {
@@ -42,4 +42,3 @@ describe("datetime.js", () => {
     expect(document.querySelector("time").dataset.localized).toBe("1");
   });
 });
-

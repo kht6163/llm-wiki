@@ -1,34 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { loadStatic } from "./static-test-utils.js";
+import { getObservers, loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
 let intersections;
 let mutations;
 
+useStaticIsolation();
+
 beforeEach(() => {
-  intersections = [];
-  mutations = [];
-  vi.stubGlobal("IntersectionObserver", class {
-    constructor(callback, options) {
-      this.callback = callback;
-      this.options = options;
-      this.observe = vi.fn();
-      this.disconnect = vi.fn();
-      intersections.push(this);
-    }
-  });
-  vi.stubGlobal("MutationObserver", class {
-    constructor(callback) {
-      this.callback = callback;
-      this.observe = vi.fn();
-      mutations.push(this);
-    }
-  });
+  intersections = getObservers("IntersectionObserver");
+  mutations = getObservers("MutationObserver");
 });
 
 afterEach(() => {
   history.replaceState(null, "", "/");
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
 });
 
 function page(headings = "") {
