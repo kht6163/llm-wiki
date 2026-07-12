@@ -11,7 +11,8 @@
     "build": "node build.mjs",
     "test": "vitest run",
     "coverage": "vitest run --coverage",
-    "e2e": "node e2e/run.mjs"
+    "e2e": "node e2e/run.mjs",
+    "e2e:unit": "node --test e2e/run.node-test.mjs"
   },
   "dependencies": {
     "cropperjs": "^1.6.2",

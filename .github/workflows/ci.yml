@@ -108,6 +108,13 @@ jobs:
       - name: Install Chromium and system dependencies
         run: npx playwright install --with-deps chromium
 
+      - name: Browser fixture tests
+        run: npm run e2e:unit
+
+      - name: Python browser fixture tests
+        run: uv run pytest frontend/e2e/test_server.py -q
+        working-directory: .
+
       - name: Browser critical flows
         run: npm run e2e
 

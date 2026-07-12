@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
+import socket
 from pathlib import Path
 
 import uvicorn
@@ -20,6 +22,19 @@ from llm_wiki.search import DEFAULT_FUSION
 from llm_wiki.services.auth import Principal, create_user
 from llm_wiki.services.documents import DocumentService
 from llm_wiki.web.app import create_web_app
+
+READY_PREFIX = "LLM_WIKI_E2E_READY "
+
+
+def bind_listener() -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2048)
+        return listener
+    except Exception:
+        listener.close()
+        raise
 
 
 class DeterministicEmbedder(Embedder):
@@ -47,17 +62,18 @@ class DeterministicEmbedder(Embedder):
     def embed_query(self, text: str) -> list[float]:
         return self._vector(text)
 
-def build_test_app(root: Path) -> FastAPI:
-    port = int(os.environ["LLM_WIKI_E2E_PORT"])
-    settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]  # pydantic-settings source control
-        host="127.0.0.1",
-        gui_port=port,
-        mcp_port=int(os.environ["LLM_WIKI_E2E_MCP_PORT"]),
-        vault_path=root / "vault",
-        db_path=root / "data" / "wiki.db",
-        embedding_model=DeterministicEmbedder.model_name,
-        session_secret="playwright-session-secret",
+
+def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
+    settings = Settings.model_validate(
+        {
+            "host": "127.0.0.1",
+            "gui_port": gui_port,
+            "mcp_port": mcp_port,
+            "vault_path": root / "vault",
+            "db_path": root / "data" / "wiki.db",
+            "embedding_model": DeterministicEmbedder.model_name,
+            "session_secret": "playwright-session-secret",
+        }
     )
     settings.ensure_dirs()
     db = Database(settings.db_path)
@@ -75,7 +91,7 @@ def build_test_app(root: Path) -> FastAPI:
     admin = Principal(user_id, "admin", "admin")
     docs.create(admin, "start.md", "# 시작 안내\n\n키보드 탐색 기준 문서")
     docs.create(admin, "conflict.md", "# 충돌 문서\n\n최초 본문")
-    return create_web_app(
+    web = create_web_app(
         AppContext(
             settings=settings,
             db=db,
@@ -84,14 +100,21 @@ def build_test_app(root: Path) -> FastAPI:
             events=events,
         )
     )
+    web.state.e2e_db = db
+    return web
 
 
 if __name__ == "__main__":
     root = Path(os.environ["LLM_WIKI_E2E_ROOT"]).resolve()
-    uvicorn.run(
-        build_test_app(root),
-        host="127.0.0.1",
-        port=int(os.environ["LLM_WIKI_E2E_PORT"]),
-        log_level="warning",
-        access_log=False,
-    )
+    listener = bind_listener()
+    host, port = listener.getsockname()
+    mcp_port = 1 if port != 1 else 2
+    app = build_test_app(root, gui_port=port, mcp_port=mcp_port)
+    config = uvicorn.Config(app, log_level="warning", access_log=False)
+    server = uvicorn.Server(config)
+    print(READY_PREFIX + json.dumps({"url": f"http://{host}:{port}"}), flush=True)
+    try:
+        server.run(sockets=[listener])
+    finally:
+        app.state.e2e_db.close()
+        listener.close()
