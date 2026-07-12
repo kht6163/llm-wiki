@@ -238,7 +238,7 @@ def _bm25(conn, match: str, limit: int, *, folder: str | None = None,
         frag, fparams = _filter_sql(filters)
         sql.append(frag)
         params += fparams
-    sql.append(" ORDER BY rank LIMIT ?")
+    sql.append(" ORDER BY rank, d.path_norm LIMIT ?")
     params.append(limit)
     rows = conn.execute("".join(sql), params).fetchall()
     return [(r["doc_id"], r["rank"]) for r in rows]
@@ -290,23 +290,26 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
     chunk_map = {
         c["id"]: c
         for c in conn.execute(
-            f"SELECT id, doc_id, ordinal, heading, text, heading_path, char_start, char_end "
-            f"FROM chunks WHERE id IN ({ph})", ids
+            f"SELECT c.id, c.doc_id, c.ordinal, c.heading, c.text, c.heading_path, "
+            f"c.char_start, c.char_end, d.path_norm "
+            f"FROM chunks c JOIN documents d ON d.id=c.doc_id WHERE c.id IN ({ph})", ids
         )
     }
     best: dict[int, dict] = {}  # doc_id -> matched-chunk info
-    for r in rows:
-        ch = chunk_map.get(r["chunk_id"])
-        if not ch:
-            continue
+    resolved = [(r, chunk_map[r["chunk_id"]]) for r in rows if r["chunk_id"] in chunk_map]
+    resolved.sort(key=lambda pair: (
+        pair[0]["distance"], pair[1]["path_norm"], pair[1]["ordinal"]
+    ))
+    for r, ch in resolved:
         d = ch["doc_id"]
         if d not in best or r["distance"] < best[d]["distance"]:
             best[d] = {
                 "distance": r["distance"], "heading": ch["heading"], "text": ch["text"],
                 "heading_path": ch["heading_path"], "chunk_id": ch["id"], "ordinal": ch["ordinal"],
                 "char_start": ch["char_start"], "char_end": ch["char_end"],
+                "path_norm": ch["path_norm"],
             }
-    return sorted(best.items(), key=lambda kv: kv[1]["distance"])
+    return sorted(best.items(), key=lambda kv: (kv[1]["distance"], kv[1]["path_norm"]))
 
 
 def _rerank_boost(title: str | None, vi: dict | None, q_norm: str,
@@ -368,15 +371,21 @@ def _rank(conn, query: str, *, mode: str, k: int,
     else:
         ids = list(set(bm_rank) | set(vec_rank))
 
-    # Title-match reranking needs each candidate's title; fetch them in one query
-    # (only when a title boost is actually enabled).
+    # Stable fused-score ordering needs each candidate's canonical path. Fetch title in
+    # the same query so optional title reranking adds no extra round-trip.
     q_norm = " ".join((query or "").lower().split())
     titles: dict[int, str] = {}
-    if ids and (params.title_exact_boost or params.title_prefix_boost):
+    stable_paths: dict[int, str] = {}
+    if ids:
         idlist = list(ids)
         ph = ",".join("?" * len(idlist))
-        titles = {r["id"]: (r["title"] or "") for r in conn.execute(
-            f"SELECT id, title FROM documents WHERE id IN ({ph})", idlist)}
+        candidate_rows = conn.execute(
+            f"SELECT id, title, path_norm FROM documents WHERE id IN ({ph})", idlist
+        )
+        for row in candidate_rows:
+            stable_paths[row["id"]] = row["path_norm"]
+            if params.title_exact_boost or params.title_prefix_boost:
+                titles[row["id"]] = row["title"] or ""
 
     scored = []
     for did in ids:
@@ -387,7 +396,7 @@ def _rank(conn, query: str, *, mode: str, k: int,
             s += 1.0 / (params.rrf_k + vec_rank[did])
         s += _rerank_boost(titles.get(did), vec_info.get(did), q_norm, params)
         scored.append((did, s))
-    scored.sort(key=lambda x: -x[1])
+    scored.sort(key=lambda x: (-x[1], stable_paths[x[0]]))
     return scored, vec_info, match
 
 

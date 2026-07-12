@@ -607,6 +607,33 @@ def test_search_vector_orphans_reranking_and_rank_modes(monkeypatch):
     assert search._vector(conn, b"v", 3) == []
     assert search._vector(conn, b"v", 3) == []
 
+    class TiedVectorConn:
+        def execute(self, sql, _params=()):
+            if "FROM chunk_vectors" in sql:
+                return _Rows(
+                    [
+                        {"chunk_id": 21, "distance": 0.25},
+                        {"chunk_id": 10, "distance": 0.25},
+                        {"chunk_id": 20, "distance": 0.25},
+                    ]
+                )
+            return _Rows(
+                [
+                    {"id": 10, "doc_id": 1, "ordinal": 0, "heading": None,
+                     "text": "a", "heading_path": None, "char_start": 0,
+                     "char_end": 1, "path_norm": "zeta.md"},
+                    {"id": 20, "doc_id": 2, "ordinal": 0, "heading": None,
+                     "text": "b0", "heading_path": None, "char_start": 0,
+                     "char_end": 2, "path_norm": "alpha.md"},
+                    {"id": 21, "doc_id": 2, "ordinal": 1, "heading": None,
+                     "text": "b1", "heading_path": None, "char_start": 2,
+                     "char_end": 4, "path_norm": "alpha.md"},
+                ]
+            )
+
+    tied = search._vector(TiedVectorConn(), b"v", 3)
+    assert [(doc_id, info["ordinal"]) for doc_id, info in tied] == [(2, 0), (1, 0)]
+
     params = search.FusionParams(proximity_weight=0.5)
     assert search._rerank_boost("", None, "q", params) == 0
     assert search._rerank_boost("q", {"distance": 2.0}, "q", params) == params.title_exact_boost
@@ -618,12 +645,20 @@ def test_search_vector_orphans_reranking_and_rank_modes(monkeypatch):
     monkeypatch.setattr(
         search,
         "_vector",
-        lambda *_a, **_k: [(2, {"distance": 0.2}), (3, {"distance": 0.3})],
+        lambda *_a, **_k: [
+            (2, {"distance": 0.2}),
+            (1, {"distance": 0.3}),
+            (3, {"distance": 0.4}),
+        ],
     )
 
     class Titles:
         def execute(self, _sql, _params=()):
-            return _Rows([{"id": 1, "title": "query"}, {"id": 2, "title": "other"}])
+            return _Rows([
+                {"id": 1, "title": "unrelated", "path_norm": "zeta.md"},
+                {"id": 2, "title": "other", "path_norm": "middle.md"},
+                {"id": 3, "title": "", "path_norm": "alpha.md"},
+            ])
 
     with pytest.raises(RuntimeError, match="prepared"):
         search._rank(Titles(), "query", mode="vector", k=3, folder=None, tags=None)
@@ -635,8 +670,8 @@ def test_search_vector_orphans_reranking_and_rank_modes(monkeypatch):
         Titles(), "query", mode="hybrid", k=3, folder=None, tags=None, query_vector=b"v"
     )
     assert [x[0] for x in bm] == [1, 2]
-    assert {x[0] for x in vec} == {2, 3}
-    assert {x[0] for x in hybrid} == {1, 2, 3}
+    assert [x[0] for x in vec] == [2, 1, 3]
+    assert [x[0] for x in hybrid] == [2, 1, 3]
 
 
 def test_search_pass_filters_without_batch_and_passage_boundaries():

@@ -3,7 +3,11 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from llm_wiki import search as search_module
+from llm_wiki.config import Settings
+from llm_wiki.runtime import build_context
 from llm_wiki.search import parse_query_filters
+from llm_wiki.services.auth import Principal, create_user
 
 
 def test_parser_normalizes_repeated_inline_tags_in_request_order():
@@ -95,6 +99,80 @@ def test_workbench_page_keeps_hybrid_pool_stable_and_bounds_huge_pages(ctx, prin
     assert set(first_paths).isdisjoint(second_paths)
     assert huge.items == () and huge.total_or_more is None and huge.bounded
     assert len(bounded_edge.items) == 10 and bounded_edge.has_next
+
+
+@pytest.mark.parametrize("mode", ["bm25", "vector", "hybrid"])
+def test_tied_pages_are_stable_across_calls_and_insertion_orders(tmp_path, monkeypatch, mode):
+    paths = ["delta.md", "alpha.md", "charlie.md", "bravo.md"]
+
+    if mode == "hybrid":
+        monkeypatch.setattr(
+            search_module,
+            "_prepare_query_vector",
+            lambda db, _embedder, _query: (db.expected_embedding_binding(), b"vector"),
+        )
+
+        def bm25_by_path(conn, *_args, **_kwargs):
+            rows = conn.execute("SELECT id FROM documents ORDER BY path_norm")
+            return [(row["id"], 0.25) for row in rows]
+
+        def vector_by_reverse_path(conn, *_args, **_kwargs):
+            rows = conn.execute("SELECT id FROM documents ORDER BY path_norm DESC")
+            return [
+                (row["id"], {
+                    "distance": 0.25, "heading": None, "text": "same tied pagination needle",
+                    "heading_path": None, "chunk_id": row["id"], "ordinal": 0,
+                    "char_start": 0, "char_end": 27,
+                })
+                for row in rows
+            ]
+
+        monkeypatch.setattr(search_module, "_bm25", bm25_by_path)
+        monkeypatch.setattr(search_module, "_vector", vector_by_reverse_path)
+
+    def traverse(name, insertion_order):
+        settings = Settings(
+            vault_path=tmp_path / name / "vault",
+            db_path=tmp_path / name / "wiki.db",
+            embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+            session_secret="test-secret",
+        )
+        context = build_context(settings, full=True)
+        user_id = create_user(context.db, "editor", "secret12", "editor")
+        editor = Principal(user_id, "editor", "editor")
+        for path in insertion_order:
+            context.docs.create(
+                editor,
+                path,
+                "same tied pagination needle",
+                embed=mode == "vector",
+            )
+
+        first = context.docs.search_workbench_page(
+            "same tied pagination needle", mode=mode, page=1, per_page=2
+        )
+        second = context.docs.search_workbench_page(
+            "same tied pagination needle", mode=mode, page=2, per_page=2
+        )
+        repeated = context.docs.search_workbench_page(
+            "same tied pagination needle", mode=mode, page=1, per_page=2
+        )
+        first_paths = [item.path for item in first.items]
+        traversed = first_paths + [item.path for item in second.items]
+        assert first_paths == [item.path for item in repeated.items]
+        assert len(traversed) == len(set(traversed)) == len(paths)
+        context.db.close()
+        return traversed
+
+    forward = traverse("forward", paths)
+    reverse = traverse("reverse", reversed(paths))
+
+    expected = (
+        ["alpha.md", "delta.md", "bravo.md", "charlie.md"]
+        if mode == "hybrid"
+        else sorted(paths)
+    )
+    assert forward == reverse == expected
 
 
 def test_workbench_exposes_the_600_result_boundary(ctx, principals):
