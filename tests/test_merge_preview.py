@@ -140,6 +140,23 @@ def test_merge_preview_preserves_exact_engine_placeholder_offsets(
     assert preview["conflicts"][0]["base"] == expected_base
 
 
+def test_merge_preview_converts_non_bmp_offset_to_utf16_code_units(ctx, principals):
+    docs = ctx.docs
+    editor = principals["editor"]
+    prefix = "😀\nrepeat🔥\nanchor\n"
+    base = prefix + "repeat🔥\ntail\n"
+    mine = prefix + "MINE🧠\ntail\n"
+    current = prefix + "CURRENT🚀\ntail\n"
+    docs.create(editor, "emoji-offset.md", base)
+    docs.update(editor, "emoji-offset.md", 1, current)
+
+    preview = docs.merge_preview(editor, "emoji-offset.md", 1, mine)
+
+    assert preview["merged"] == base
+    assert preview["conflicts"][0]["base"] == "repeat🔥\n"
+    assert preview["conflicts"][0]["merged_start"] == len(prefix.encode("utf-16-le")) // 2
+
+
 def test_merge_preview_missing_base_is_explicit_manual_fallback(ctx, principals, monkeypatch):
     docs = ctx.docs
     editor = principals["editor"]

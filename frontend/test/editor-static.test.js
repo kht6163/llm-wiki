@@ -155,6 +155,7 @@ describe("editor.js", () => {
     event(textarea, "input");
     expect(document.activeElement).toBe(textarea);
     expect(document.querySelector("#sb-words").textContent).toBe("2 단어");
+    expect(event(window, "beforeunload").defaultPrevented).toBe(true);
     document.querySelector("#load-current").click();
     expect(textarea.value).toBe("server text");
 
@@ -162,6 +163,28 @@ describe("editor.js", () => {
     document.querySelector("form").addEventListener("submit", submitted);
     document.querySelector('button[type="submit"]').click();
     expect(submitted).toHaveBeenCalledOnce();
+  });
+
+  test.each([
+    ["null", null],
+    ["empty", {}],
+    ["missing getView", { getValue: () => "stale", setTheme: () => {} }],
+    ["missing getValue", { getView: () => null, setTheme: () => {} }],
+    ["missing setTheme", { getValue: () => "stale", getView: () => null }],
+  ])("uses the authoritative textarea when mount API is %s", async (_label, candidate) => {
+    editorPage();
+    const textarea = document.querySelector("#editor");
+    textarea.hidden = true;
+    window.WikiMdEditor.mount.mockReturnValue(candidate);
+
+    await loadStatic("editor");
+
+    const mount = document.querySelector("#md-editor-mount");
+    expect(textarea.hidden).toBe(false);
+    expect(mount.hidden).toBe(true);
+    expect(typeof mount.wikiUseTextareaFallback).toBe("function");
+    expect(mount.wikiEditorApi.getValue()).toBe("initial");
+    expect(mount.wikiEditorApi.getView()).toBeNull();
   });
 
   test("mounts with theme, CSRF precedence, changes and CJK-aware counts", async () => {

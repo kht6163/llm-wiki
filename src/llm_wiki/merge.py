@@ -16,7 +16,7 @@ class MergeHunk:
     mine: str
     current: str
     resolved: str | None
-    merged_start: int | None = None
+    merged_start: int | None = None  # Python code-point offset in MergeResult.text
 
 
 @dataclass(frozen=True, slots=True)

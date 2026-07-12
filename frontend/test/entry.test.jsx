@@ -105,6 +105,8 @@ describe("WikiMdEditor global API", () => {
     await act(async () => {
       firstApi = window.WikiMdEditor.mount(firstHost, { initialValue: "immediate" });
       expect(firstApi.getValue()).toBe("immediate");
+      expect(typeof firstApi.setTheme).toBe("function");
+      firstApi.setTheme("light");
       secondApi = window.WikiMdEditor.mount(secondHost, {});
       expect(secondApi.getValue()).toBe("");
     });

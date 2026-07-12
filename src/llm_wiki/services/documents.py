@@ -1564,6 +1564,8 @@ class DocumentService:
 
         result = three_way_merge(str(base), mine, current)
         preview["merged"] = result.text
+        # The merge engine indexes Python code points; browser String.slice() uses
+        # UTF-16 code units. Convert the exact merged prefix before serializing.
         preview["conflicts"] = [
             {
                 "start_line": hunk.start_line,
@@ -1571,7 +1573,10 @@ class DocumentService:
                 "mine": hunk.mine,
                 "current": hunk.current,
                 "resolved": hunk.resolved,
-                "merged_start": hunk.merged_start,
+                "merged_start": len(
+                    result.text[: cast(int, hunk.merged_start)].encode("utf-16-le")
+                )
+                // 2,
             }
             for hunk in result.conflicts
         ]

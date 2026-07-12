@@ -32,6 +32,8 @@
     var view = api && typeof api.getView === "function" ? api.getView() : null;
     if (view) {
       view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+    } else if (mount && typeof mount.wikiUseTextareaFallback === "function") {
+      mount.wikiUseTextareaFallback();
     }
     textarea.value = text;
   }

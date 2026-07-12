@@ -64,6 +64,7 @@ function mount(el, opts) {
   // import would be a second CM instance and fail to resolve.
   const api = {
     getValue: () => opts.initialValue || "",
+    setTheme: () => {},
     getView: () => {
       try { return editorRef && editorRef.current && editorRef.current.getEditorView(); }
       catch (e) { return null; }

@@ -35,6 +35,7 @@
   var mountEl = document.getElementById("md-editor-mount");
   if (!form || !textarea) return;
   var enhanced = Boolean(mountEl && window.WikiMdEditor);
+  var textareaAuthoritative = false;
   var W = window.WIKI || {};
   var csrf = (form.querySelector('input[name="csrf_token"]') || {}).value || W.csrf || "";
 
@@ -80,6 +81,23 @@
     if (elC) elC.textContent = v.length + " 자";
   }
 
+  var fallbackApi = {
+    getValue: function () { return textarea.value; },
+    getView: function () { return null; },
+    setTheme: function () {},
+  };
+
+  function useTextareaFallback() {
+    textareaAuthoritative = true;
+    textarea.hidden = false;
+    if (mountEl) {
+      mountEl.hidden = true;
+      mountEl.wikiTextareaAuthoritative = true;
+    }
+  }
+
+  if (mountEl) mountEl.wikiUseTextareaFallback = useTextareaFallback;
+
   var api;
   if (enhanced) {
     api = window.WikiMdEditor.mount(mountEl, {
@@ -89,16 +107,19 @@
       onChange: function (v) { textarea.value = v; count(v); },
       onSave: function (v) { textarea.value = v; submit(); },
     });
+    if (!api || typeof api.getValue !== "function" || typeof api.getView !== "function" ||
+        typeof api.setTheme !== "function") {
+      api = fallbackApi;
+      enhanced = false;
+      useTextareaFallback();
+    }
   } else {
-    textarea.hidden = false;
-    if (mountEl) mountEl.hidden = true;
-    api = {
-      getValue: function () { return textarea.value; },
-      getView: function () { return null; },
-      setTheme: function () {},
-    };
-    textarea.addEventListener("input", function () { count(textarea.value); });
+    api = fallbackApi;
+    useTextareaFallback();
   }
+  // Kept on the textarea even while hidden so a later inactive-view fallback
+  // becomes fully editable without needing to rewire page behavior.
+  textarea.addEventListener("input", function () { count(textarea.value); });
   if (mountEl) mountEl.wikiEditorApi = api;
   count(textarea.value);
 
@@ -107,12 +128,15 @@
   // (Cancel link or browser navigation) warns instead of silently discarding them.
   var initialValue = textarea.value;
   var saving = false;
-  function isDirty() { return !saving && api.getValue() !== initialValue; }
+  function isDirty() {
+    var value = textareaAuthoritative ? textarea.value : api.getValue();
+    return !saving && value !== initialValue;
+  }
 
   // Make sure the latest value reaches the form even if submit is triggered elsewhere.
   form.addEventListener("submit", function () {
     saving = true;                       // a real save is not an accidental navigation
-    textarea.value = api.getValue();
+    if (!textareaAuthoritative) textarea.value = api.getValue();
   });
 
   window.addEventListener("beforeunload", function (e) {
@@ -141,6 +165,8 @@
       var view = api.getView();
       if (view) {
         view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: text } });
+      } else {
+        useTextareaFallback();
       }
       textarea.value = text;
       count(text);

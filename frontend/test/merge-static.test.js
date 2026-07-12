@@ -102,6 +102,33 @@ describe("merge.js", () => {
     }
   });
 
+  test("inactive editor view makes the resolved textarea authoritative through submit", async () => {
+    const data = payload({ conflicts: [{ ...payload().conflicts[0], merged_start: 5 }], merged: "head\nrepeat\ntail\n" });
+    page(data);
+    window.WIKI = { canWrite: false };
+    const staleApi = {
+      getValue: vi.fn(() => data.mine),
+      getView: vi.fn(() => null),
+      setTheme: vi.fn(),
+    };
+    window.WikiMdEditor = { mount: vi.fn(() => staleApi) };
+    vi.stubGlobal("requestAnimationFrame", (callback) => callback());
+
+    await loadStatic("editor");
+    await loadStatic("merge");
+    document.querySelector('[data-resolution="current"]').click();
+    const textarea = document.querySelector("#editor");
+    const mount = document.querySelector("#md-editor-mount");
+    expect(textarea.value).toBe("head\ncurrent one\ntail\n");
+    expect(textarea.hidden).toBe(false);
+    expect(mount.hidden).toBe(true);
+
+    document.querySelector("form").addEventListener("submit", (event) => event.preventDefault());
+    document.querySelector("[data-merge-save]").click();
+    expect(textarea.value).toBe("head\ncurrent one\ntail\n");
+    expect(staleApi.getValue).not.toHaveBeenCalled();
+  });
+
   test("serializes empty insertion conflicts at bounded line offsets", async () => {
     const data = payload({
       base: "one\n",
@@ -132,6 +159,28 @@ describe("merge.js", () => {
     await loadStatic("merge");
     document.querySelector('[data-resolution="current"]').click();
     expect(document.querySelector("#editor").value).toBe("repeat\nanchor\nCURRENT\ntail\n");
+  });
+
+  test("uses UTF-16 offsets for repeated emoji placeholders", async () => {
+    const prefix = "😀\nrepeat🔥\nanchor\n";
+    const data = payload({
+      base: `${prefix}repeat🔥\ntail\n`,
+      mine: `${prefix}MINE🧠\ntail\n`,
+      current: `${prefix}CURRENT🚀\ntail\n`,
+      merged: `${prefix}repeat🔥\ntail\n`,
+      conflicts: [{
+        start_line: 4,
+        base: "repeat🔥\n",
+        mine: "MINE🧠\n",
+        current: "CURRENT🚀\n",
+        resolved: null,
+        merged_start: prefix.length,
+      }],
+    });
+    page(data);
+    await loadStatic("merge");
+    document.querySelector('[data-resolution="current"]').click();
+    expect(document.querySelector("#editor").value).toBe(`${prefix}CURRENT🚀\ntail\n`);
   });
 
   test("places an empty insertion after an earlier automatic edit", async () => {

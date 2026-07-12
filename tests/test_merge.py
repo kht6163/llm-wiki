@@ -191,6 +191,19 @@ def test_conflict_reports_exact_later_repeated_placeholder_offset() -> None:
     assert result.text[merged_start:].startswith("repeat\n")
 
 
+def test_conflict_engine_offset_is_code_point_based_with_non_bmp_text() -> None:
+    prefix = "😀\nrepeat🔥\nanchor\n"
+    base = prefix + "repeat🔥\ntail\n"
+    mine = prefix + "MINE🧠\ntail\n"
+    current = prefix + "CURRENT🚀\ntail\n"
+
+    result = three_way_merge(base, mine, current)
+
+    assert result.text == base
+    assert result.conflicts[0].base == "repeat🔥\n"
+    assert result.conflicts[0].merged_start == len(prefix)
+
+
 def test_empty_insertion_conflict_offset_follows_earlier_auto_edit() -> None:
     base = "head\nanchor\n"
     mine = "HEAD\nanchor\nmine\n"
