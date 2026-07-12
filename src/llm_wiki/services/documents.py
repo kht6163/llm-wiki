@@ -16,7 +16,6 @@ import os
 import re
 import sqlite3
 import threading
-import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -379,23 +378,6 @@ class DocumentService:
             current_content=body, updated_by=self._username(conn, d["updated_by"]),
             updated_at=d["updated_at"], current_via=lv["via"] if lv else None,
         )
-
-    def _write_file(self, rel: str, body: str) -> float:
-        target = safe_join(self.vault, rel)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmpdir = self.vault / ".tmp"
-        tmpdir.mkdir(parents=True, exist_ok=True)
-        tmp = tmpdir / (uuid.uuid4().hex + ".tmp")
-        tmp.write_text(body, encoding="utf-8")
-        os.replace(tmp, target)
-        return target.stat().st_mtime
-
-    def _trash_file(self, rel: str) -> None:
-        src = safe_join(self.vault, rel)
-        if src.exists():
-            dest = self.vault / ".trash" / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(src, dest)
 
     def _projection_snapshot(
         self, conn: sqlite3.Connection, doc_id: int
@@ -1033,12 +1015,24 @@ class DocumentService:
             # Publish the canonical current target before removing any historical
             # paths. If cleanup spans transactions, this leaves a usable latest file
             # while the DB remains explicitly pending.
-            staged: fp.StagedText | None = None
             retry_snapshot = False
             cleanup_required = False
             immediate_result: fp.ProjectionResult | None = None
             try:
                 staged = fp.stage_text(self.vault, target, canonical_body)
+            except (OSError, fp.FileProjectionError) as exc:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "io_error",
+                    attempt,
+                    snapshot.is_deleted,
+                    f"{type(exc).__name__}: {exc}",
+                    current_installed,
+                )
+            try:
                 with self.db.writer() as conn:
                     token_state = self._projection_token_state(
                         conn, snapshot, allow_cleanup=True
@@ -1105,15 +1099,14 @@ class DocumentService:
                     current_installed,
                 )
             finally:
-                if staged is not None:
-                    try:
-                        fp.cleanup_staged(staged)
-                    except (OSError, fp.FileProjectionError) as exc:
-                        log.warning(
-                            "Could not clean staged projection for document %d: %s",
-                            snapshot.doc_id,
-                            exc,
-                        )
+                try:
+                    fp.cleanup_staged(staged)
+                except (OSError, fp.FileProjectionError) as exc:
+                    log.warning(
+                        "Could not clean staged projection for document %d: %s",
+                        snapshot.doc_id,
+                        exc,
+                    )
 
             if retry_snapshot:
                 continue
@@ -1225,10 +1218,22 @@ class DocumentService:
             # Cleanup crossed at least one writer boundary. Re-stage and publish the
             # canonical target in the same final writer transaction as exact clean,
             # fencing external edits made while historical paths were processed.
-            final_staged: fp.StagedText | None = None
             final_result: fp.ProjectionResult | None = None
             try:
                 final_staged = fp.stage_text(self.vault, target, canonical_body)
+            except (OSError, fp.FileProjectionError) as exc:
+                return fp.ProjectionResult(
+                    snapshot.doc_id,
+                    snapshot.path,
+                    False,
+                    False,
+                    "io_error",
+                    attempt,
+                    snapshot.is_deleted,
+                    f"{type(exc).__name__}: {exc}",
+                    current_installed,
+                )
+            try:
                 with self.db.writer() as conn:
                     token_state = self._projection_token_state(conn, snapshot)
                     if token_state == "changed":
@@ -1293,15 +1298,14 @@ class DocumentService:
                     current_installed,
                 )
             finally:
-                if final_staged is not None:
-                    try:
-                        fp.cleanup_staged(final_staged)
-                    except (OSError, fp.FileProjectionError) as exc:
-                        log.warning(
-                            "Could not clean final staged projection for document %d: %s",
-                            snapshot.doc_id,
-                            exc,
-                        )
+                try:
+                    fp.cleanup_staged(final_staged)
+                except (OSError, fp.FileProjectionError) as exc:
+                    log.warning(
+                        "Could not clean final staged projection for document %d: %s",
+                        snapshot.doc_id,
+                        exc,
+                    )
 
             if retry_snapshot:
                 continue

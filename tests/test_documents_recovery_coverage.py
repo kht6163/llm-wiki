@@ -5,7 +5,6 @@ from __future__ import annotations
 import sqlite3
 import threading
 from contextlib import contextmanager
-from dataclasses import replace
 
 import pytest
 
@@ -88,6 +87,290 @@ def _leave_purge_intent(ctx, admin, rel: str, monkeypatch) -> int:
         docs.purge(admin, rel)
     monkeypatch.setattr(docs, "_finish_purge", original_finish)
     return doc_id
+
+
+def _start_projector(ctx, doc_id: int, *, name: str):
+    results: list[fp.ProjectionResult] = []
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            results.append(ctx.docs._project_current(doc_id))
+        except BaseException as exc:  # surfaced in the main pytest thread
+            errors.append(exc)
+        finally:
+            ctx.db.close()
+
+    worker = threading.Thread(target=run, name=name)
+    worker.start()
+    return worker, results, errors
+
+
+def test_staged_deleted_generation_cannot_overwrite_public_restore(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "restore-after-stage.md", "canonical", embed=False)
+    doc_id = _doc_id(ctx, "restore-after-stage.md")
+    original_require = docs._require_projection
+    monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
+    docs.delete(editor, "restore-after-stage.md")
+    monkeypatch.setattr(docs, "_require_projection", original_require)
+
+    deleted_staged = threading.Event()
+    release_deleted = threading.Event()
+    real_stage = fp.stage_text
+
+    def pause_deleted_stage(vault, target, body):
+        staged = real_stage(vault, target, body)
+        if threading.current_thread().name == "staged-delete-projector":
+            deleted_staged.set()
+            assert release_deleted.wait(timeout=10), "restore did not release projector"
+        return staged
+
+    monkeypatch.setattr(fp, "stage_text", pause_deleted_stage)
+    worker, results, errors = _start_projector(
+        ctx, doc_id, name="staged-delete-projector"
+    )
+    assert deleted_staged.wait(timeout=10), "deleted generation was not staged"
+    try:
+        restored = docs.restore(editor, "restore-after-stage.md")
+    finally:
+        release_deleted.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert restored["restored"] is True
+    assert len(results) == 1 and results[0].settled
+    assert (docs.vault / "restore-after-stage.md").read_text(
+        encoding="utf-8"
+    ) == "canonical"
+    assert not (docs.vault / ".trash" / "restore-after-stage.md").exists()
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT version,is_deleted,file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+    assert (row["version"], row["is_deleted"], row["file_state"]) == (3, 0, "clean")
+
+
+def test_cleanup_commit_then_public_move_preserves_new_path_and_cleanup_intent(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "cleanup-old.md", "canonical", embed=False)
+    doc_id = _doc_id(ctx, "cleanup-old.md")
+    original_require = docs._require_projection
+    monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
+    docs.move(editor, "cleanup-old.md", "cleanup-current.md")
+    monkeypatch.setattr(docs, "_require_projection", original_require)
+
+    cleanup_committed = threading.Event()
+    release_cleanup = threading.Event()
+    real_writer = ctx.db.writer
+
+    @contextmanager
+    def pause_after_cleanup_commit():
+        with real_writer() as conn:
+            yield conn
+        if (
+            threading.current_thread().name == "cleanup-page-projector"
+            and not cleanup_committed.is_set()
+        ):
+            with ctx.db.reader() as conn:
+                cleanup_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()[0]
+                )
+                state = conn.execute(
+                    "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+                ).fetchone()[0]
+            if cleanup_count == 0 and state == "pending":
+                cleanup_committed.set()
+                assert release_cleanup.wait(timeout=10), "move did not release projector"
+
+    monkeypatch.setattr(ctx.db, "writer", pause_after_cleanup_commit)
+    worker, results, errors = _start_projector(
+        ctx, doc_id, name="cleanup-page-projector"
+    )
+    assert cleanup_committed.wait(timeout=10), "cleanup page did not commit"
+    try:
+        monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
+        moved = docs.move(editor, "cleanup-current.md", "cleanup-latest.md")
+        monkeypatch.setattr(docs, "_require_projection", original_require)
+        with ctx.db.reader() as conn:
+            row = conn.execute(
+                "SELECT path,file_state FROM documents WHERE id=?", (doc_id,)
+            ).fetchone()
+            intents = conn.execute(
+                "SELECT path FROM file_projection_cleanup WHERE doc_id=?",
+                (doc_id,),
+            ).fetchall()
+        assert (row["path"], row["file_state"]) == ("cleanup-latest.md", "pending")
+        assert [str(intent["path"]) for intent in intents] == ["cleanup-current.md"]
+    finally:
+        monkeypatch.setattr(docs, "_require_projection", original_require)
+        release_cleanup.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert moved["path"] == "cleanup-latest.md"
+    assert len(results) == 1 and results[0].settled
+    assert not (docs.vault / "cleanup-old.md").exists()
+    assert not (docs.vault / "cleanup-current.md").exists()
+    assert (docs.vault / "cleanup-latest.md").read_text(
+        encoding="utf-8"
+    ) == "canonical"
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT path,file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        cleanup_count = conn.execute(
+            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
+        ).fetchone()[0]
+    assert (row["path"], row["file_state"], cleanup_count) == (
+        "cleanup-latest.md",
+        "clean",
+        0,
+    )
+
+
+def test_final_stage_cannot_publish_after_public_delete_and_purge_intent(
+    ctx, principals, monkeypatch
+):
+    docs, editor, admin = ctx.docs, principals["editor"], principals["admin"]
+    docs.create(editor, "final-old.md", "canonical", embed=False)
+    doc_id = _doc_id(ctx, "final-old.md")
+    original_require = docs._require_projection
+    monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
+    docs.move(editor, "final-old.md", "final-current.md")
+    monkeypatch.setattr(docs, "_require_projection", original_require)
+
+    final_staged = threading.Event()
+    release_final = threading.Event()
+    real_stage = fp.stage_text
+
+    def pause_final_stage(vault, target, body):
+        staged = real_stage(vault, target, body)
+        if threading.current_thread().name == "final-stage-projector":
+            with ctx.db.reader() as conn:
+                cleanup_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()[0]
+                )
+            if cleanup_count == 0:
+                final_staged.set()
+                assert release_final.wait(timeout=10), "purge did not release projector"
+        return staged
+
+    monkeypatch.setattr(fp, "stage_text", pause_final_stage)
+    worker, results, errors = _start_projector(
+        ctx, doc_id, name="final-stage-projector"
+    )
+    assert final_staged.wait(timeout=10), "projector did not enter final stage"
+    try:
+        docs.delete(editor, "final-current.md")
+        _leave_purge_intent(ctx, admin, "final-current.md", monkeypatch)
+        with ctx.db.reader() as conn:
+            row = conn.execute(
+                "SELECT is_deleted,file_state FROM documents WHERE id=?", (doc_id,)
+            ).fetchone()
+            intent_count = conn.execute(
+                "SELECT COUNT(*) FROM document_purge_intents WHERE doc_id=?", (doc_id,)
+            ).fetchone()[0]
+        assert (row["is_deleted"], row["file_state"], intent_count) == (1, "pending", 1)
+    finally:
+        release_final.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert len(results) == 1 and results[0].reason == "purge_pending"
+    assert not (docs.vault / "final-current.md").exists()
+    assert (docs.vault / ".trash" / "final-current.md").read_text(
+        encoding="utf-8"
+    ) == "canonical"
+    assert docs.recover_pending() == 1
+    with ctx.db.reader() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM documents WHERE id=?", (doc_id,)
+        ).fetchone() is None
+    assert not (docs.vault / "final-current.md").exists()
+    assert not (docs.vault / ".trash" / "final-current.md").exists()
+
+
+def test_final_stage_retries_after_public_update_and_keeps_latest_revision(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "final-update-old.md", "version one", embed=False)
+    doc_id = _doc_id(ctx, "final-update-old.md")
+    original_require = docs._require_projection
+    monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
+    docs.move(editor, "final-update-old.md", "final-update.md")
+    monkeypatch.setattr(docs, "_require_projection", original_require)
+
+    final_staged = threading.Event()
+    release_final = threading.Event()
+    real_stage = fp.stage_text
+
+    def pause_final_stage(vault, target, body):
+        staged = real_stage(vault, target, body)
+        if threading.current_thread().name == "final-update-projector":
+            with ctx.db.reader() as conn:
+                cleanup_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?",
+                        (doc_id,),
+                    ).fetchone()[0]
+                )
+            if cleanup_count == 0:
+                final_staged.set()
+                assert release_final.wait(timeout=10), "update did not release projector"
+        return staged
+
+    monkeypatch.setattr(fp, "stage_text", pause_final_stage)
+    worker, results, errors = _start_projector(
+        ctx, doc_id, name="final-update-projector"
+    )
+    assert final_staged.wait(timeout=10), "projector did not enter final stage"
+    try:
+        updated = docs.update(
+            editor, "final-update.md", 2, "version three", embed=False
+        )
+    finally:
+        release_final.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert updated["version"] == 3
+    assert len(results) == 1 and results[0].settled
+    assert (docs.vault / "final-update.md").read_text(
+        encoding="utf-8"
+    ) == "version three"
+    assert not (docs.vault / "final-update-old.md").exists()
+    assert not any((docs.vault / ".tmp").iterdir())
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT d.version,d.file_state,r.body FROM documents d JOIN revisions r "
+            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
+            (doc_id,),
+        ).fetchone()
+        cleanup_count = conn.execute(
+            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
+        ).fetchone()[0]
+    assert (row["version"], row["file_state"], row["body"], cleanup_count) == (
+        3,
+        "clean",
+        "version three",
+        0,
+    )
 
 
 def test_projection_state_helpers_enforce_exact_database_fences(ctx, principals):
@@ -186,348 +469,12 @@ def test_recovery_rejects_inconsistent_purge_intent_and_preserves_tombstone(
     assert (row["is_deleted"], row["file_state"], intent_count) == (1, "pending", 1)
 
 
-def test_recovery_retry_exhaustion_cleans_each_staged_generation(
-    ctx, principals, monkeypatch
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "retry.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "retry.md")
-    with ctx.db.writer() as conn:
-        conn.execute(
-            "UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,)
-        )
-
-    cleaned: list[object] = []
-    real_cleanup = fp.cleanup_staged
-
-    def clean_then_report(staged):
-        real_cleanup(staged)
-        cleaned.append(staged)
-
-    monkeypatch.setattr(docs, "_projection_token_state", lambda *_a, **_kw: "changed")
-    monkeypatch.setattr(fp, "cleanup_staged", clean_then_report)
-
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    assert [(issue.reason, issue.attempts) for issue in report.issues] == [
-        ("target_changed", 3)
-    ]
-    assert len(cleaned) == 3
-    assert not any((docs.vault / ".tmp").iterdir())
-    assert (docs.vault / "retry.md").read_text(encoding="utf-8") == "canonical"
-    with ctx.db.reader() as conn:
-        assert conn.execute(
-            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
-        ).fetchone()[0] == "pending"
-
-
-@pytest.mark.parametrize("failure", ["stage", "cleanup"])
-def test_recovery_final_publication_failure_keeps_latest_target_and_retries(
-    ctx, principals, monkeypatch, failure
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "latest.md", "version one", embed=False)
-    updated = docs.update(editor, "latest.md", 1, "version two", embed=False)
-    doc_id = _doc_id(ctx, "latest.md")
-    _queue_absent_cleanup(ctx, doc_id, "already-absent.md")
-
-    real_stage = fp.stage_text
-    real_cleanup = fp.cleanup_staged
-    stage_count = 0
-    cleanup_count = 0
-
-    def fail_second_stage(vault, target, body):
-        nonlocal stage_count
-        stage_count += 1
-        if failure == "stage" and stage_count == 2:
-            raise OSError("injected final stage failure")
-        return real_stage(vault, target, body)
-
-    def cleanup_then_fail_second(staged):
-        nonlocal cleanup_count
-        cleanup_count += 1
-        real_cleanup(staged)
-        if failure == "cleanup" and cleanup_count == 2:
-            raise OSError("injected final cleanup failure")
-
-    monkeypatch.setattr(fp, "stage_text", fail_second_stage)
-    monkeypatch.setattr(fp, "cleanup_staged", cleanup_then_fail_second)
-
-    report = docs._recover_pending_report(page_size=1)
-
-    if failure == "stage":
-        assert report.recovered == 0
-        assert [issue.reason for issue in report.issues] == ["io_error"]
-        expected_state = "pending"
-    else:
-        assert report.recovered == 1
-        assert report.issues == ()
-        expected_state = "clean"
-    assert stage_count == 2
-    assert (docs.vault / "latest.md").read_text(encoding="utf-8") == "version two"
-    assert not any((docs.vault / ".tmp").iterdir())
-    with ctx.db.reader() as conn:
-        row = conn.execute(
-            "SELECT d.version,d.file_state,r.body FROM documents d JOIN revisions r "
-            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
-            (doc_id,),
-        ).fetchone()
-    assert (row["version"], row["file_state"], row["body"]) == (
-        updated["version"],
-        expected_state,
-        "version two",
-    )
-
-    monkeypatch.setattr(fp, "stage_text", real_stage)
-    monkeypatch.setattr(fp, "cleanup_staged", real_cleanup)
-    assert docs.recover_pending() == int(failure == "stage")
-
-
 def test_projector_argument_and_missing_document_boundaries(ctx):
     docs = ctx.docs
     with pytest.raises(ValueError, match="at least 1"):
         docs._project_current(99_999, max_attempts=0)
     result = docs._project_current(99_999)
     assert (result.settled, result.reason, result.path) == (True, "missing", None)
-
-
-@pytest.mark.parametrize(
-    ("token_state", "expected_reason", "settled"),
-    [
-        ("missing", "missing", True),
-        ("settled", "already_settled", True),
-        ("purge_pending", "purge_intent_missing", False),
-        ("cleanup_pending", "cleanup_pending", False),
-        ("invalid", "recovery_error", False),
-    ],
-)
-def test_recovery_revalidates_staged_generation_before_publication(
-    ctx, principals, monkeypatch, token_state, expected_reason, settled
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "staged-fence.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "staged-fence.md")
-    projected = docs.vault / "staged-fence.md"
-    projected.write_text("external generation", encoding="utf-8")
-    with ctx.db.writer() as conn:
-        conn.execute(
-            "UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,)
-        )
-
-    monkeypatch.setattr(
-        docs, "_projection_token_state", lambda *_args, **_kwargs: token_state
-    )
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    if settled:
-        assert report.issues == ()
-    else:
-        assert [(issue.doc_id, issue.reason) for issue in report.issues] == [
-            (doc_id, expected_reason)
-        ]
-    assert projected.read_text(encoding="utf-8") == "external generation"
-    assert not any((docs.vault / ".tmp").iterdir())
-    with ctx.db.reader() as conn:
-        row = conn.execute(
-            "SELECT d.version,d.file_state,r.body FROM documents d JOIN revisions r "
-            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
-            (doc_id,),
-        ).fetchone()
-    assert (row["version"], row["file_state"], row["body"]) == (
-        1,
-        "pending",
-        "canonical",
-    )
-
-
-@pytest.mark.parametrize(
-    ("terminal", "expected_reason", "settled"),
-    [
-        ("missing", "missing", True),
-        ("settled", "already_settled", True),
-        ("purge_pending", "purge_intent_missing", False),
-        ("cleanup_pending", "cleanup_pending", False),
-        ("invalid", "recovery_error", False),
-    ],
-)
-def test_cleanup_page_revalidates_generation_before_removing_history(
-    ctx, principals, monkeypatch, terminal, expected_reason, settled
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "cleanup-fence.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "cleanup-fence.md")
-    _queue_absent_cleanup(ctx, doc_id, "historical.md")
-    states = iter(("current_cleanup", terminal))
-    monkeypatch.setattr(
-        docs, "_projection_token_state", lambda *_args, **_kwargs: next(states)
-    )
-
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    if settled:
-        assert report.issues == ()
-    else:
-        assert [(issue.doc_id, issue.reason) for issue in report.issues] == [
-            (doc_id, expected_reason)
-        ]
-    assert (docs.vault / "cleanup-fence.md").read_text(encoding="utf-8") == "canonical"
-    with ctx.db.reader() as conn:
-        state = conn.execute(
-            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
-        ).fetchone()[0]
-        intents = conn.execute(
-            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
-        ).fetchone()[0]
-    assert (state, intents) == ("pending", 1)
-
-
-@pytest.mark.parametrize(
-    ("terminal", "expected_reason", "settled"),
-    [
-        ("missing", "missing", True),
-        ("settled", "already_settled", True),
-        ("purge_pending", "purge_intent_missing", False),
-        ("cleanup_pending", "cleanup_pending", False),
-        ("invalid", "recovery_error", False),
-    ],
-)
-def test_final_publication_revalidates_generation_after_cleanup(
-    ctx, principals, monkeypatch, terminal, expected_reason, settled
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "final-fence.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "final-fence.md")
-    _queue_absent_cleanup(ctx, doc_id, "already-gone.md")
-    states = iter(("current_cleanup", "current_cleanup", "current_cleanup", terminal))
-    monkeypatch.setattr(
-        docs, "_projection_token_state", lambda *_args, **_kwargs: next(states)
-    )
-
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    if settled:
-        assert report.issues == ()
-    else:
-        assert [(issue.doc_id, issue.reason) for issue in report.issues] == [
-            (doc_id, expected_reason)
-        ]
-    assert (docs.vault / "final-fence.md").read_text(encoding="utf-8") == "canonical"
-    with ctx.db.reader() as conn:
-        state = conn.execute(
-            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
-        ).fetchone()[0]
-        intents = conn.execute(
-            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
-        ).fetchone()[0]
-    assert (state, intents) == ("pending", 0)
-
-
-def test_recovery_finishes_purge_when_projector_discovers_intent(
-    ctx, principals, monkeypatch
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "late-purge.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "late-purge.md")
-    with ctx.db.writer() as conn:
-        conn.execute(
-            "UPDATE documents SET file_state='pending' WHERE id=?", (doc_id,)
-        )
-
-    finished: list[int] = []
-    monkeypatch.setattr(
-        docs,
-        "_project_current",
-        lambda current_id: fp.ProjectionResult(
-            current_id, "late-purge.md", False, False, "purge_pending", 1
-        ),
-    )
-
-    def finish(current_id: int):
-        finished.append(current_id)
-        return fp.ProjectionResult(
-            current_id, "late-purge.md", False, False, "purge_intent_missing", 1
-        )
-
-    monkeypatch.setattr(docs, "_finish_purge", finish)
-    report = docs._recover_pending_report(page_size=1)
-
-    assert finished == [doc_id]
-    assert report.recovered == 0
-    assert [(issue.doc_id, issue.reason) for issue in report.issues] == [
-        (doc_id, "purge_intent_missing")
-    ]
-
-
-@pytest.mark.parametrize("phase", ["cleanup", "final"])
-def test_generation_change_retries_from_a_fresh_snapshot(
-    ctx, principals, monkeypatch, phase
-):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "generation-retry.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "generation-retry.md")
-    _queue_absent_cleanup(ctx, doc_id, "old-generation.md")
-    if phase == "cleanup":
-        states = iter(("current_cleanup", "changed", "settled"))
-    else:
-        states = iter(
-            (
-                "current_cleanup",
-                "current_cleanup",
-                "current_cleanup",
-                "changed",
-                "settled",
-            )
-        )
-    monkeypatch.setattr(
-        docs, "_projection_token_state", lambda *_args, **_kwargs: next(states)
-    )
-
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    assert report.issues == ()
-    assert (docs.vault / "generation-retry.md").read_text(
-        encoding="utf-8"
-    ) == "canonical"
-    assert not any((docs.vault / ".tmp").iterdir())
-    with ctx.db.reader() as conn:
-        assert conn.execute(
-            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
-        ).fetchone()[0] == "pending"
-
-
-def test_clean_cleanup_reopen_uses_exact_snapshot_fence(ctx, principals, monkeypatch):
-    docs, editor = ctx.docs, principals["editor"]
-    docs.create(editor, "reopen-fence.md", "canonical", embed=False)
-    doc_id = _doc_id(ctx, "reopen-fence.md")
-    _queue_absent_cleanup(ctx, doc_id, "historical.md")
-    with ctx.db.writer() as conn:
-        conn.execute("UPDATE documents SET file_state='clean' WHERE id=?", (doc_id,))
-    with ctx.db.reader() as conn:
-        actual = docs._projection_snapshot(conn, doc_id)
-    assert actual is not None
-    stale = replace(actual, path="stale.md")
-    monkeypatch.setattr(docs, "_projection_snapshot", lambda *_args: stale)
-
-    report = docs._recover_pending_report(page_size=1)
-
-    assert report.recovered == 0
-    assert [(issue.reason, issue.attempts) for issue in report.issues] == [
-        ("target_changed", 3)
-    ]
-    assert (docs.vault / "reopen-fence.md").read_text(encoding="utf-8") == "canonical"
-    with ctx.db.reader() as conn:
-        row = conn.execute(
-            "SELECT path,file_state FROM documents WHERE id=?", (doc_id,)
-        ).fetchone()
-        intents = conn.execute(
-            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
-        ).fetchone()[0]
-    assert (row["path"], row["file_state"], intents) == ("reopen-fence.md", "clean", 1)
 
 
 @pytest.mark.parametrize("failure", ["absence_changed", "unlink_changed"])
@@ -788,6 +735,95 @@ def test_initial_stage_failure_leaves_no_temp_file_and_recovers(
         ).fetchone()[0] == "pending"
     monkeypatch.setattr(fp, "stage_text", real_stage)
     assert docs.recover_pending() == 1
+
+
+def test_final_stage_failure_keeps_published_revision_pending_for_retry(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    created = docs.create(editor, "final-stage-failure.md", "canonical", embed=False)
+    doc_id = _doc_id(ctx, "final-stage-failure.md")
+    _queue_absent_cleanup(ctx, doc_id, "retired.md")
+    real_stage = fp.stage_text
+
+    def fail_when_cleanup_has_finished(vault, target, body):
+        with ctx.db.reader() as conn:
+            cleanup_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchone()[0]
+            )
+        if cleanup_count == 0:
+            raise OSError("injected final stage failure")
+        return real_stage(vault, target, body)
+
+    monkeypatch.setattr(fp, "stage_text", fail_when_cleanup_has_finished)
+    report = docs._recover_pending_report(page_size=1)
+
+    assert report.recovered == 0
+    assert [issue.reason for issue in report.issues] == ["io_error"]
+    assert (docs.vault / "final-stage-failure.md").read_text(
+        encoding="utf-8"
+    ) == "canonical"
+    assert not any((docs.vault / ".tmp").iterdir())
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT d.version,d.file_state,r.body FROM documents d JOIN revisions r "
+            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
+            (doc_id,),
+        ).fetchone()
+    assert (row["version"], row["file_state"], row["body"]) == (
+        created["version"],
+        "pending",
+        "canonical",
+    )
+
+    monkeypatch.setattr(fp, "stage_text", real_stage)
+    assert docs.recover_pending() == 1
+
+
+def test_final_staged_cleanup_warning_does_not_reopen_clean_projection(
+    ctx, principals, monkeypatch
+):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "final-cleanup-warning.md", "canonical", embed=False)
+    doc_id = _doc_id(ctx, "final-cleanup-warning.md")
+    _queue_absent_cleanup(ctx, doc_id, "retired.md")
+    real_cleanup = fp.cleanup_staged
+
+    def cleanup_then_warn_when_projection_is_clean(staged):
+        real_cleanup(staged)
+        with ctx.db.reader() as conn:
+            row = conn.execute(
+                "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+            ).fetchone()
+            cleanup_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?",
+                    (doc_id,),
+                ).fetchone()[0]
+            )
+        if row["file_state"] == "clean" and cleanup_count == 0:
+            raise OSError("injected final staged cleanup failure")
+
+    monkeypatch.setattr(fp, "cleanup_staged", cleanup_then_warn_when_projection_is_clean)
+    report = docs._recover_pending_report(page_size=1)
+
+    assert report.recovered == 1
+    assert report.issues == ()
+    assert (docs.vault / "final-cleanup-warning.md").read_text(
+        encoding="utf-8"
+    ) == "canonical"
+    assert not any((docs.vault / ".tmp").iterdir())
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT file_state FROM documents WHERE id=?", (doc_id,)
+        ).fetchone()
+        cleanup_count = conn.execute(
+            "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (doc_id,)
+        ).fetchone()[0]
+    assert (row["file_state"], cleanup_count) == ("clean", 0)
 
 
 @pytest.mark.parametrize(

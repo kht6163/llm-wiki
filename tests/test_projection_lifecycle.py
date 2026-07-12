@@ -29,7 +29,7 @@ def _doc_id(ctx, rel: str) -> int:
 
 
 def _defer_lifecycle_projection(docs, monkeypatch):
-    """Queue common-projector completions while neutralizing legacy file hooks."""
+    """Queue common-projector completions after their durable DB commits."""
     original_require = docs._require_projection
     delayed: list[int] = []
 
@@ -38,8 +38,6 @@ def _defer_lifecycle_projection(docs, monkeypatch):
         return None
 
     monkeypatch.setattr(docs, "_require_projection", defer)
-    monkeypatch.setattr(docs, "_trash_file", lambda _rel: None)
-    monkeypatch.setattr(docs, "_write_file", lambda _rel, _body: 0.0)
     return original_require, delayed
 
 
@@ -172,7 +170,6 @@ def test_recovery_finishes_delete_together_with_pending_move_cleanup(
     docs.create(editor, "old.md", "canonical body", embed=False)
     doc_id = _doc_id(ctx, "old.md")
     original_require = docs._require_projection
-    original_trash = docs._trash_file
     monkeypatch.setattr(docs, "_require_projection", lambda _doc_id: None)
     docs.move(editor, "old.md", "new.md")
 
@@ -180,12 +177,10 @@ def test_recovery_finishes_delete_together_with_pending_move_cleanup(
         raise _PostCommitInterruption
 
     monkeypatch.setattr(docs, "_require_projection", interrupt)
-    monkeypatch.setattr(docs, "_trash_file", interrupt)
     with pytest.raises(_PostCommitInterruption):
         docs.delete(editor, "new.md")
 
     monkeypatch.setattr(docs, "_require_projection", original_require)
-    monkeypatch.setattr(docs, "_trash_file", original_trash)
     with ctx.db.reader() as conn:
         row = conn.execute(
             "SELECT is_deleted,file_state FROM documents WHERE id=?", (doc_id,)

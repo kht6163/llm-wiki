@@ -24,7 +24,7 @@ def _doc_id(ctx, rel: str) -> int:
 
 
 def _defer_move_projection(docs, monkeypatch):
-    """Commit moves without running either the new or legacy file post-processing."""
+    """Commit moves without running the common projector."""
     original_require = docs._require_projection
     delayed: list[int] = []
 
@@ -33,12 +33,6 @@ def _defer_move_projection(docs, monkeypatch):
         return None
 
     monkeypatch.setattr(docs, "_require_projection", defer)
-    # These two hooks keep this RED test focused on the durable DB intent while the
-    # pre-intent move implementation still performs its own best-effort file writes.
-    if hasattr(docs, "_trash_file"):
-        monkeypatch.setattr(docs, "_trash_file", lambda _rel: None)
-    if hasattr(docs, "_write_file"):
-        monkeypatch.setattr(docs, "_write_file", lambda _rel, _body: 0.0)
     return original_require, delayed
 
 
@@ -61,21 +55,14 @@ def test_move_commit_interruption_recovers_new_path_and_removes_old_path(
     docs.create(editor, "old.md", "canonical body", embed=False)
     doc_id = _doc_id(ctx, "old.md")
     original_require = docs._require_projection
-    original_trash = getattr(docs, "_trash_file", None)
 
     def interrupt(*_args, **_kwargs):
         raise _PostCommitInterruption
 
-    # The current implementation reaches the legacy trash hook after commit; the
-    # intent-based implementation reaches the common projector at the same boundary.
-    if original_trash is not None:
-        monkeypatch.setattr(docs, "_trash_file", interrupt)
     monkeypatch.setattr(docs, "_require_projection", interrupt)
     with pytest.raises(_PostCommitInterruption):
         docs.move(editor, "old.md", "new.md")
 
-    if original_trash is not None:
-        monkeypatch.setattr(docs, "_trash_file", original_trash)
     monkeypatch.setattr(docs, "_require_projection", original_require)
     with ctx.db.reader() as conn:
         row = conn.execute(

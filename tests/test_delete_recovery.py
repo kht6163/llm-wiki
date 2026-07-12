@@ -28,7 +28,7 @@ def test_recover_pending_trashes_orphan_from_crashed_delete(ctx, principals):
     docs, p = ctx.docs, principals["editor"]
     docs.create(p, "d.md", "# D\n\nbody")
     # Simulate a crash AFTER the delete commit (is_deleted=1, file_state='pending')
-    # but BEFORE _trash_file ran: the file is still sitting in the vault.
+    # but BEFORE the common projector ran: the file is still sitting in the vault.
     with ctx.db.writer() as conn:
         conn.execute("UPDATE documents SET is_deleted=1, file_state='pending' WHERE path_norm=?",
                      (path_norm("d.md"),))
