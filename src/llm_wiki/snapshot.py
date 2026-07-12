@@ -696,64 +696,94 @@ def _validate_tar_headers(source: IO[bytes]) -> None:
         source.seek(0)
 
 
+def _copy_snapshot_archive(source: IO[bytes], target: IO[bytes]) -> int:
+    """Copy an archive without ever reading or writing past its byte budget."""
+    size = 0
+    while chunk := source.read(
+        min(_COPY_CHUNK_SIZE, MAX_SNAPSHOT_ARCHIVE_BYTES - size + 1)
+    ):
+        size += len(chunk)
+        if size > MAX_SNAPSHOT_ARCHIVE_BYTES:
+            raise ValueError("snapshot archive size limit exceeded")
+        target.write(chunk)
+    return size
+
+
 @contextmanager
 def _open_stable_snapshot_archive(path: Path) -> Iterator[IO[bytes]]:
     fd = -1
     source: IO[bytes] | None = None
+    private: IO[bytes] | None = None
     primary_error: BaseException | None = None
     try:
-        visible = os.lstat(path)
-        if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
-            raise ValueError("snapshot archive must be a regular file")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_BINARY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-        )
-        fd = os.open(path, flags)
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or _stat_identity(visible) != _stat_identity(
-            before
-        ):
-            raise ValueError("snapshot archive must be a stable regular file")
-        if before.st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
-            raise ValueError("snapshot archive size limit exceeded")
+        try:
+            visible = os.lstat(path)
+            if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
+                raise ValueError("snapshot archive must be a regular file")
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            fd = os.open(path, flags)
+            before = os.fstat(fd)
+            if not stat.S_ISREG(
+                before.st_mode
+            ) or _stat_identity(visible) != _stat_identity(before):
+                raise ValueError("snapshot archive must be a stable regular file")
+            if before.st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
+                raise ValueError("snapshot archive size limit exceeded")
+        except OSError as exc:
+            raise ValueError("snapshot archive must be a stable regular file") from exc
+
         source = os.fdopen(fd, "rb")
         fd = -1
-        try:
-            yield source
-        except BaseException as exc:
-            primary_error = exc
-        cleanup_errors: list[BaseException] = []
+        private = tempfile.TemporaryFile(mode="w+b")
+        os.fchmod(private.fileno(), 0o600)
+        private_stat = os.fstat(private.fileno())
+        if not stat.S_ISREG(private_stat.st_mode):
+            raise RuntimeError("private snapshot archive must be a regular file")
+        copied = _copy_snapshot_archive(source, private)
         try:
             after = os.fstat(source.fileno())
-            if _stat_identity(before) != _stat_identity(after):
-                cleanup_errors.append(
-                    ValueError("snapshot archive changed while reading")
-                )
-        except BaseException as exc:
-            cleanup_errors.append(exc)
-        current_source, source = source, None
+        except OSError as exc:
+            raise ValueError("snapshot archive must be a stable regular file") from exc
+        if _stat_identity(before) != _stat_identity(after) or copied != before.st_size:
+            raise ValueError("snapshot archive changed while copying")
+        current_source = source
+        current_source.close()
+        source = None
+        private.flush()
+        private.seek(0)
         try:
-            current_source.close()
+            yield private
+        except BaseException as exc:
+            primary_error = exc
+    except BaseException as exc:
+        primary_error = exc
+
+    cleanup_errors: list[BaseException] = []
+    for current in (source, private):
+        if current is None:
+            continue
+        try:
+            current.close()
         except BaseException as exc:
             cleanup_errors.append(exc)
-        if primary_error is not None:
-            if cleanup_errors:
-                raise SnapshotArchiveReadError(
-                    primary_error, cleanup_errors
-                ) from primary_error
-            raise primary_error
-        if cleanup_errors:
-            raise cleanup_errors[0]
-    except OSError as exc:
-        if primary_error is not None:
-            raise
-        raise ValueError("snapshot archive must be a stable regular file") from exc
-    finally:
-        if fd >= 0:
+    if fd >= 0:
+        try:
             os.close(fd)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+    if primary_error is not None:
+        if cleanup_errors:
+            raise SnapshotArchiveReadError(
+                primary_error, cleanup_errors
+            ) from primary_error
+        raise primary_error
+    if cleanup_errors:
+        raise cleanup_errors[0]
 
 
 def _read_restore_manifest(

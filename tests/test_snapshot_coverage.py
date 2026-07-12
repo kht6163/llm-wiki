@@ -819,52 +819,238 @@ def test_restore_passes_stable_archive_descriptor_to_tarfile(
     assert observed[0].closed
 
 
-def test_restore_rejects_archive_changed_during_read(snapshot_source, tmp_path, monkeypatch):
+def test_restore_uses_private_copy_when_source_changes_after_copy(
+    snapshot_source, tmp_path, monkeypatch
+):
     _, archive = snapshot_source
-    real_open = snapshot.tarfile.open
+    real_validate = snapshot._validate_tar_headers
+    observed = []
 
-    def mutate_after_read(*args, **kwargs):
-        opened = real_open(*args, **kwargs)
-        real_close = opened.close
-
-        def close():
-            real_close()
-            with archive.open("ab") as output:
-                output.write(b"changed")
-
-        opened.close = close
-        return opened
-
-    monkeypatch.setattr(snapshot.tarfile, "open", mutate_after_read)
-    with pytest.raises(ValueError, match="changed while reading"):
-        snapshot.restore_snapshot(
-            archive, tmp_path / "changed.db", tmp_path / "changed-vault", force=False
+    def mutate_before_preflight(source):
+        private_stat = os.fstat(source.fileno())
+        observed.append(
+            (
+                private_stat.st_ino,
+                stat.S_IMODE(private_stat.st_mode),
+                os.stat(archive).st_ino,
+            )
         )
+        archive.write_bytes(b"attacker replaced archive bytes")
+        return real_validate(source)
+
+    monkeypatch.setattr(snapshot, "_validate_tar_headers", mutate_before_preflight)
+    pending = snapshot.restore_snapshot(
+        archive, tmp_path / "private.db", tmp_path / "private-vault", force=False
+    )
+    pending.finalize()
+
+    assert observed
+    private_ino, private_mode, source_ino = observed[0]
+    assert private_ino != source_ino
+    assert private_mode == 0o600
 
 
-def test_archive_primary_error_is_preserved_when_final_stat_also_fails(
+def test_archive_copy_rejects_actual_bytes_before_writing_past_limit(monkeypatch):
+    class GrowingSource:
+        def __init__(self):
+            self.requests = []
+
+        def read(self, size):
+            self.requests.append(size)
+            return b"ab"
+
+    source = GrowingSource()
+    target = io.BytesIO()
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_ARCHIVE_BYTES", 1)
+
+    with pytest.raises(ValueError, match="archive size limit"):
+        snapshot._copy_snapshot_archive(source, target)
+
+    assert source.requests == [2]
+    assert target.getvalue() == b""
+
+
+def test_archive_copy_rejects_source_growth_during_stream(tmp_path, monkeypatch):
+    archive = tmp_path / "growing.tar"
+    archive.write_bytes(b"original")
+    real_fdopen = snapshot.os.fdopen
+
+    class GrowingReader:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+            self.grew = False
+
+        def fileno(self):
+            return self.wrapped.fileno()
+
+        def read(self, size=-1):
+            chunk = self.wrapped.read(size)
+            if not self.grew:
+                self.grew = True
+                with archive.open("ab") as output:
+                    output.write(b"-changed")
+            return chunk
+
+        def close(self):
+            self.wrapped.close()
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fdopen",
+        lambda *args, **kwargs: GrowingReader(real_fdopen(*args, **kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="changed while copying"):
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise AssertionError("changed source must not reach parser")
+
+
+def test_archive_copy_preserves_disk_error_when_private_cleanup_also_fails(
     tmp_path, monkeypatch
 ):
+    archive = tmp_path / "disk-error.tar"
+    archive.write_bytes(b"archive")
+    real_temporary_file = snapshot.tempfile.TemporaryFile
+
+    class DiskAndCloseFailure:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def write(self, _data):
+            raise OSError("private archive disk full")
+
+        def close(self):
+            self.wrapped.close()
+            raise OSError("private archive cleanup failed")
+
+    monkeypatch.setattr(
+        snapshot.tempfile,
+        "TemporaryFile",
+        lambda *args, **kwargs: DiskAndCloseFailure(
+            real_temporary_file(*args, **kwargs)
+        ),
+    )
+
+    with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise AssertionError("disk failure must prevent parsing")
+
+    assert str(caught.value.primary_error) == "private archive disk full"
+    assert [str(error) for error in caught.value.cleanup_errors] == [
+        "private archive cleanup failed"
+    ]
+
+
+def test_archive_copy_rejects_nonregular_private_file(tmp_path, monkeypatch):
     archive = tmp_path / "archive.tar"
     archive.write_bytes(b"archive")
     real_fstat = snapshot.os.fstat
     calls = 0
 
-    def fail_final_stat(fd):
+    def private_is_fifo(fd):
         nonlocal calls
         calls += 1
+        value = real_fstat(fd)
         if calls == 2:
-            raise OSError("archive final stat failed")
-        return real_fstat(fd)
+            return SimpleNamespace(st_mode=stat.S_IFIFO)
+        return value
 
-    monkeypatch.setattr(snapshot.os, "fstat", fail_final_stat)
+    monkeypatch.setattr(snapshot.os, "fstat", private_is_fifo)
+
+    with pytest.raises(RuntimeError, match="private snapshot archive"):
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise AssertionError("nonregular private file must not be yielded")
+
+
+def test_archive_copy_preserves_fd_cleanup_error(tmp_path, monkeypatch):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_close = snapshot.os.close
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fdopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("fdopen failed")),
+    )
+
+    def fail_source_fd_close(fd):
+        real_close(fd)
+        raise OSError("source fd cleanup failed")
+
+    monkeypatch.setattr(snapshot.os, "close", fail_source_fd_close)
+
+    with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise AssertionError("fdopen failure must prevent parsing")
+
+    assert str(caught.value.primary_error) == "fdopen failed"
+    assert [str(error) for error in caught.value.cleanup_errors] == [
+        "source fd cleanup failed"
+    ]
+
+
+def test_archive_copy_reports_private_close_failure_after_success(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_temporary_file = snapshot.tempfile.TemporaryFile
+
+    class CloseFailure:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def close(self):
+            self.wrapped.close()
+            raise OSError("private close failed")
+
+    monkeypatch.setattr(
+        snapshot.tempfile,
+        "TemporaryFile",
+        lambda *args, **kwargs: CloseFailure(real_temporary_file(*args, **kwargs)),
+    )
+
+    with pytest.raises(OSError, match="private close failed"):
+        with snapshot._open_stable_snapshot_archive(archive) as private:
+            assert private.read() == b"archive"
+
+
+def test_archive_primary_error_is_preserved_when_private_close_also_fails(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_temporary_file = snapshot.tempfile.TemporaryFile
+
+    class CloseFailure:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def close(self):
+            self.wrapped.close()
+            raise OSError("private archive close failed")
+
+    monkeypatch.setattr(
+        snapshot.tempfile,
+        "TemporaryFile",
+        lambda *args, **kwargs: CloseFailure(real_temporary_file(*args, **kwargs)),
+    )
     with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
         with snapshot._open_stable_snapshot_archive(archive):
             raise OSError("payload extraction failed")
 
     assert str(caught.value.primary_error) == "payload extraction failed"
     assert [str(error) for error in caught.value.cleanup_errors] == [
-        "archive final stat failed"
+        "private archive close failed"
     ]
 
 
@@ -882,6 +1068,9 @@ def test_archive_primary_error_is_preserved_when_close_also_fails(
         def fileno(self):
             return self.wrapped.fileno()
 
+        def read(self, size=-1):
+            return self.wrapped.read(size)
+
         def close(self):
             self.wrapped.close()
             raise OSError("archive close failed")
@@ -891,9 +1080,9 @@ def test_archive_primary_error_is_preserved_when_close_also_fails(
     )
     with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
         with snapshot._open_stable_snapshot_archive(archive):
-            raise OSError("primary failed")
+            raise AssertionError("source close failure must prevent parsing")
 
-    assert str(caught.value.primary_error) == "primary failed"
+    assert str(caught.value.primary_error) == "archive close failed"
     assert [str(error) for error in caught.value.cleanup_errors] == [
         "archive close failed"
     ]
@@ -1378,7 +1567,7 @@ def test_stable_archive_closes_source_when_final_fstat_fails(tmp_path, monkeypat
     def fail_final_fstat(fd):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == 3:
             raise OSError("final stat failed")
         return real_fstat(fd)
 
