@@ -3,30 +3,25 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { stop, waitForAnnouncement, waitForExit, waitUntilReady } from "./run-support.mjs";
+import {
+  createCleanupCoordinator,
+  stop,
+  waitForAnnouncement,
+  waitForExit,
+  waitUntilReady,
+} from "./run-support.mjs";
 
 const frontend = new URL("..", import.meta.url);
 const root = await mkdtemp(join(tmpdir(), "llm-wiki-playwright-"));
 let server = null;
 let runner = null;
-let cleanupPromise = null;
-
-function cleanup() {
-  if (!cleanupPromise) {
-    cleanupPromise = Promise.all([stop(runner), stop(server)])
-      .then(() => rm(root, { recursive: true, force: true }));
-  }
-  return cleanupPromise;
-}
-
-const signalHandlers = new Map();
-for (const [signal, exitCode] of [["SIGINT", 130], ["SIGTERM", 143]]) {
-  const handler = () => {
-    void cleanup().finally(() => process.exit(exitCode));
-  };
-  signalHandlers.set(signal, handler);
-  process.once(signal, handler);
-}
+const cleanupCoordinator = createCleanupCoordinator({
+  signalTarget: process,
+  stopChildren: () => Promise.all([stop(runner), stop(server)]),
+  removeRoot: () => rm(root, { recursive: true, force: true }),
+  exitProcess: (code) => process.exit(code),
+});
+cleanupCoordinator.install();
 
 let exitCode = 1;
 try {
@@ -46,7 +41,6 @@ try {
   await waitForExit(runner, { rejectOnError: true });
   exitCode = runner.exitCode ?? (runner.signalCode === null ? 0 : 1);
 } finally {
-  for (const [signal, handler] of signalHandlers) process.removeListener(signal, handler);
-  await cleanup();
+  await cleanupCoordinator.finish();
 }
 process.exitCode = exitCode;
