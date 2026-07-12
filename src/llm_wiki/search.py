@@ -73,36 +73,45 @@ class QueryFilters:
     """In-query operators parsed out of a search string by ``parse_query_filters``.
     ``title_contains`` each must be a (case-insensitive) substring of the title;
     ``path_specs`` each is ``(pattern, is_glob)`` matched against the path (glob when it
-    holds ``*``/``?``, else a substring); ``has`` are structural predicates
-    (link/backlink/tag). Empty everywhere = no refinement (the default)."""
+    holds ``*``/``?``, else a substring); ``tags`` are exact tag predicates; ``has``
+    are structural predicates (link/backlink/tag). Empty everywhere = no refinement."""
     title_contains: tuple[str, ...] = ()
     path_specs: tuple[tuple[str, bool], ...] = ()
     has: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    normalized: tuple[tuple[str, str], ...] = ()
 
     @property
     def active(self) -> bool:
-        return bool(self.title_contains or self.path_specs or self.has)
+        return bool(self.title_contains or self.path_specs or self.tags or self.has)
+
+
+@dataclass(frozen=True)
+class ParsedQuery:
+    text: str
+    filters: QueryFilters
 
 
 _NO_FILTERS = QueryFilters()
 _HAS_VALUES = ("link", "backlink", "tag")
-# title:/path:/has: operator + its value (a "quoted phrase" or a single bareword).
-_OP_RE = re.compile(r'\b(title|path|has):("(?:[^"\\]|\\.)*"|\S+)')
+# title:/path:/tag:/has: operator + its value (a quoted phrase or a bareword).
+_OP_RE = re.compile(r'\b(title|path|tag|has):("(?:[^"\\]|\\.)*"|\S+)')
 
 
-def parse_query_filters(query: str) -> tuple[str, QueryFilters]:
-    """Split a raw search string into ``(free_text, QueryFilters)`` by lifting out the
-    ``title:`` / ``path:`` / ``has:`` operators so an agent can express a precise query
-    in ONE call instead of post-filtering a broad result set. ``title:`` and ``path:``
-    take a value (quote it for spaces: ``title:"design system"``); a ``path:`` value with
-    ``*``/``?`` is a glob, otherwise a substring. ``has:`` takes one of link|backlink|tag.
-    Raises ``ValidationError`` on an unknown ``has:`` value so the vocabulary is learnable.
-    The returned free text is what feeds FTS/vector retrieval (operators removed)."""
+def parse_query(query: str) -> ParsedQuery:
+    """Lift recognized operators into one reusable parsed query.
+
+    ``title:`` and ``path:`` accept quoted phrases, ``path:`` supports ``*``/``?``
+    globs, ``tag:`` is an exact tag predicate, and ``has:`` accepts
+    link|backlink|tag. The remaining text feeds both FTS and vector retrieval.
+    """
     from .services.errors import ValidationError  # local import: avoid services<->search cycle
 
     titles: list[str] = []
     paths: list[tuple[str, bool]] = []
+    tags: list[str] = []
     has: list[str] = []
+    normalized: list[tuple[str, str]] = []
 
     def _take(m: re.Match) -> str:
         key, raw = m.group(1), m.group(2)
@@ -113,16 +122,29 @@ def parse_query_filters(query: str) -> tuple[str, QueryFilters]:
             titles.append(val)
         elif key == "path":
             paths.append((val, any(c in val for c in "*?")))
+        elif key == "tag":
+            tags.append(val)
         else:  # has:
             v = val.lower()
             if v not in _HAS_VALUES:
                 raise ValidationError(
                     f"has: must be one of {list(_HAS_VALUES)} (got {val!r}).")
             has.append(v)
+            val = v
+        normalized.append((key, val))
         return " "
 
     cleaned = " ".join(_OP_RE.sub(_take, query or "").split())
-    return cleaned, QueryFilters(tuple(titles), tuple(paths), tuple(has))
+    return ParsedQuery(
+        cleaned,
+        QueryFilters(tuple(titles), tuple(paths), tuple(has), tuple(tags), tuple(normalized)),
+    )
+
+
+def parse_query_filters(query: str) -> tuple[str, QueryFilters]:
+    """Backward-compatible tuple view of :func:`parse_query`."""
+    parsed = parse_query(query)
+    return parsed.text, parsed.filters
 
 
 def _like_escape(s: str) -> str:
@@ -151,6 +173,9 @@ def _filter_sql(f: QueryFilters) -> tuple[str, list]:
         sql.append(" AND LOWER(d.path) LIKE ? ESCAPE '\\'")
         params.append(_glob_to_like(pat.lower()) if is_glob
                       else "%" + _like_escape(pat.lower()) + "%")
+    for tag in f.tags:
+        sql.append(" AND d.id IN (SELECT doc_id FROM tags WHERE tag=?)")
+        params.append(tag)
     for h in f.has:
         if h == "link":
             sql.append(" AND d.id IN (SELECT src_doc_id FROM links)")
@@ -490,13 +515,16 @@ def search_page(
     folder: str | None = None, tags: list[str] | None = None,
     since: str | None = None, until: str | None = None,
     params: FusionParams = DEFAULT_FUSION,
+    offset: int = 0,
+    parsed_query: ParsedQuery | None = None,
+    candidate_k: int | None = None,
 ) -> tuple[list[SearchResult], bool]:
     """Run a search and report truncation. Returns ``(results, truncated)`` where
     ``truncated`` is True only when at least one more qualifying document existed
     beyond ``top_k`` — so a corpus of exactly ``top_k`` matches reports False (no
     misleading 'raise top_k' signal). ``results`` is capped at ``top_k``.
     ``since``/``until`` (ISO-8601) bound the hits by ``updated_at`` (recency filter).
-    The query may carry ``title:``/``path:``/``has:`` operators (see ``parse_query_filters``)
+    The query may carry ``title:``/``path:``/``tag:``/``has:`` operators (see ``parse_query``)
     which refine the text search in one call; an operator-only query (no search terms left)
     is rejected with ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
@@ -504,13 +532,16 @@ def search_page(
     SEARCH_QUERIES.labels(mode).inc()
     t0 = time.perf_counter()
     top_k = clamp_int(top_k, 1, 50)
+    offset = max(0, int(offset))
     want = top_k + 1  # over-collect by one survivor so truncation is exact, not len>=cap
-    k = max(top_k * params.candidate_factor, params.candidate_min)
-    text, filters = parse_query_filters(query)
+    k = (max(top_k * params.candidate_factor, params.candidate_min)
+         if candidate_k is None else max(1, int(candidate_k)))
+    parsed = parsed_query or parse_query(query)
+    text, filters = parsed.text, parsed.filters
     if not text:
         from .services.errors import ValidationError  # local: avoid services<->search cycle
         raise ValidationError(
-            "Provide search terms; operators (title:/path:/has:) only refine a text query.")
+            "Provide search terms; operators (title:/path:/tag:/has:) only refine a text query.")
     q_tokens = [t.lower() for t in _TOKEN_RE.findall(text)]
 
     expected: EmbeddingBinding | None = None
@@ -539,6 +570,7 @@ def search_page(
 
         results: list[SearchResult] = []
         result_ids: list[int] = []
+        skipped = 0
         for did, score in scored:
             d = doc_meta.get(did)
             if not d or d["is_deleted"]:
@@ -551,6 +583,9 @@ def search_page(
             if since and (d["updated_at"] or "") < since:
                 continue
             if until and (d["updated_at"] or "") > until:
+                continue
+            if skipped < offset:
+                skipped += 1
                 continue
 
             heading = None

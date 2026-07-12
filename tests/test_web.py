@@ -92,6 +92,29 @@ def test_search_operator_only_query_renders_inline_error(client):
     assert "<form" in r.text  # still the search page, not the bare error template
 
 
+def test_search_accepts_repeated_tags_and_stable_page_two(client):
+    login(client, "alice")
+    for index in range(5):
+        create_doc(client, f"workbench-{index}.md",
+                   f"---\ntags: [release, todo]\n---\n\nstable route needle {index}")
+    create_doc(client, "excluded.md",
+               "---\ntags: [release]\n---\n\nstable route needle excluded")
+
+    params = [("q", "stable route needle"), ("mode", "bm25"),
+              ("tag", "release"), ("tag", "todo"), ("page", "2"), ("per_page", "2")]
+    page_two = client.get("/search", params=params)
+    full = client.get("/search", params=[
+        ("q", "stable route needle"), ("mode", "bm25"),
+        ("tag", "release"), ("tag", "todo"), ("page", "1"), ("per_page", "50")])
+
+    assert page_two.status_code == 200
+    page_results = page_two.text.split('<ul class="results">')[1].split("</ul>")[0]
+    all_results = full.text.split('<ul class="results">')[1].split("</ul>")[0]
+    ranked_paths = re.findall(r'<span class="path">([^<]+)</span>', all_results)
+    assert re.findall(r'<span class="path">([^<]+)</span>', page_results) == ranked_paths[2:4]
+    assert "excluded.md" not in page_results
+
+
 def test_view_renders_frontmatter_as_properties_panel(client):
     # Frontmatter must not leak as a setext heading; extra keys (not title/tags)
     # surface as the monospace Properties panel instead.

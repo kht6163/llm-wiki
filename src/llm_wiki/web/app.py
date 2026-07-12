@@ -20,6 +20,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Query,
     Request,
     UploadFile,
     WebSocket,
@@ -607,35 +608,43 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.get("/search", response_class=HTMLResponse)
     def search_page(request: Request, q: str = "", mode: str = "hybrid", top_k: int = 20,
-                    folder: str | None = None, tag: str | None = None,
+                    folder: str | None = None, tag: list[str] = Query(default=[]),
+                    page: int = 1, per_page: int | None = None,
                     _p: Principal = Depends(require_user)):
         top_k = clamp_int(top_k, 1, 50)
-        tags = [tag] if tag and tag.strip() else None
+        requested_per_page = top_k if per_page is None else clamp_int(per_page, 1, 50)
+        page = max(1, page)
+        tags = [value for value in tag if value.strip()]
         results = []
         truncated = False
+        workbench_page = None
         if q.strip():
             rkey = f"read:{_p.user_id}"
             if not read_limiter.allowed(rkey):
                 return render("search.html", request, status=429, q=q, mode=mode, top_k=top_k,
-                              folder=folder or "", tag=tag or "", results=[], truncated=False,
+                              folder=folder or "", tag=tags[0] if tags else "", results=[], truncated=False,
                               folders=docs.folders(),
                               error="검색 요청이 너무 잦습니다. 잠시 후 다시 시도하세요.")
             if read_limiter.record_failure(rkey):
                 audit.record_tx(db, actor=_p.username, via="web", action="read_rate_limited",
                                 outcome="blocked", detail="search")
             try:
-                hits, truncated = docs.search_page(
-                    q, mode=mode, top_k=top_k, folder=folder or None, tags=tags)
-                results = [r.to_dict() for r in hits]
+                workbench_page = docs.search_workbench_page(
+                    q, mode=mode, page=page, per_page=requested_per_page,
+                    folder=folder or None, tags=tags)
+                top_k = workbench_page.per_page
+                mode = workbench_page.filters.mode
+                results = [r.to_dict() for r in workbench_page.items]
+                truncated = workbench_page.has_next
             except ValidationError as e:
                 # A malformed query (e.g. operator-only, or has:<unknown>) is a client
                 # error — re-render the form inline with the message, not the error page.
                 return render("search.html", request, status=400, q=q, mode=mode, top_k=top_k,
-                              folder=folder or "", tag=tag or "", results=[], truncated=False,
+                              folder=folder or "", tag=tags[0] if tags else "", results=[], truncated=False,
                               folders=docs.folders(), error=e.message)
         return render("search.html", request, q=q, mode=mode, top_k=top_k,
-                      folder=folder or "", tag=tag or "", results=results,
-                      truncated=truncated, folders=docs.folders())
+                      folder=folder or "", tag=tags[0] if tags else "", results=results,
+                      truncated=truncated, search_page=workbench_page, folders=docs.folders())
 
     @web.get("/graph", response_class=HTMLResponse)
     def graph_page(request: Request, root: str | None = None,

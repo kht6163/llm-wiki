@@ -25,7 +25,7 @@ from enum import StrEnum
 from itertools import groupby, islice
 from pathlib import Path
 from typing import cast
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import regex as regex_lib
 
@@ -89,6 +89,7 @@ _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
 _TASK_LINE_RE = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+\[)([ xX])(\].*)$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _CORPUS_DESCRIPTION_PREFIX_CHARS = 16 * 1024
+SEARCH_WORKBENCH_MAX_RESULTS = 600
 
 # Uploaded images/files live under this vault subdir (excluded from the .md scan).
 ATTACH_DIR = "_attachments"
@@ -189,6 +190,53 @@ class ReindexTargetSnapshot:
     file_state: str
     has_purge_intent: bool
     has_cleanup_intent: bool
+
+
+@dataclass(frozen=True)
+class NormalizedSearchFilter:
+    operator: str
+    value: str
+
+
+@dataclass(frozen=True)
+class SearchFilters:
+    query: str
+    mode: str
+    folder: str
+    tags: tuple[str, ...]
+    normalized: tuple[NormalizedSearchFilter, ...]
+
+    def url_for_page(self, page: int, per_page: int) -> str:
+        pairs = [("q", self.query), ("mode", self.mode)]
+        if self.folder:
+            pairs.append(("folder", self.folder))
+        pairs.extend(("tag", tag) for tag in self.tags)
+        pairs.extend((("page", str(page)), ("per_page", str(per_page))))
+        return "/search?" + urlencode(pairs)
+
+
+@dataclass(frozen=True)
+class SearchPage:
+    items: tuple[search.SearchResult, ...]
+    total_or_more: int | None
+    page: int
+    per_page: int
+    has_prev: bool
+    has_next: bool
+    bounded: bool
+    filters: SearchFilters
+
+    @property
+    def prev_url(self) -> str | None:
+        if not self.has_prev:
+            return None
+        return self.filters.url_for_page(self.page - 1, self.per_page)
+
+    @property
+    def next_url(self) -> str | None:
+        if not self.has_next:
+            return None
+        return self.filters.url_for_page(self.page + 1, self.per_page)
 
 
 class ProjectionPendingError(RuntimeError):
@@ -2024,6 +2072,9 @@ class DocumentService:
         tags: list[str] | None = None,
         since: str | None = None,
         until: str | None = None,
+        offset: int = 0,
+        parsed_query: search.ParsedQuery | None = None,
+        candidate_k: int | None = None,
     ) -> tuple[list[search.SearchResult], bool]:
         """Hybrid search returning ``(results, truncated)``, applying this service's
         configured fusion tuning (``search_params``). The single entry point both the
@@ -2041,9 +2092,75 @@ class DocumentService:
                 since=since,
                 until=until,
                 params=self.search_params,
+                offset=offset,
+                parsed_query=parsed_query,
+                candidate_k=candidate_k,
             )
         except EmbeddingBindingChanged as exc:
             raise EmbeddingUnavailableError(_EMBEDDING_UNAVAILABLE_MESSAGE) from exc
+
+    def search_workbench_page(
+        self,
+        query: str,
+        *,
+        mode: str = "hybrid",
+        page: int = 1,
+        per_page: int = 20,
+        folder: str | None = None,
+        tags: list[str] | None = None,
+    ) -> SearchPage:
+        """Return stable web pagination while preserving the legacy search API."""
+        page = max(1, int(page))
+        per_page = clamp_int(per_page, 1, 50)
+        mode = mode if mode in ("hybrid", "bm25", "vector") else "hybrid"
+        normalized_folder = folder or ""
+        normalized_tags = tuple(tag.strip() for tag in tags or () if tag.strip())
+        parsed = search.parse_query(query)
+        offset = (page - 1) * per_page
+        available = max(0, SEARCH_WORKBENCH_MAX_RESULTS - offset)
+        if available:
+            items, has_next = self.search_page(
+                query,
+                mode=mode,
+                top_k=min(per_page, available),
+                folder=normalized_folder or None,
+                tags=list(normalized_tags) or None,
+                offset=offset,
+                parsed_query=parsed,
+                candidate_k=SEARCH_WORKBENCH_MAX_RESULTS,
+            )
+        else:
+            items, has_next = [], False
+        frozen_items = tuple(items)
+        bounded = offset >= SEARCH_WORKBENCH_MAX_RESULTS or (
+            len(frozen_items) == available and available <= per_page
+        )
+        if bounded:
+            has_next = False
+        if has_next or bounded or mode != "bm25" or (page > 1 and not frozen_items):
+            total_or_more = None
+        else:
+            total_or_more = offset + len(frozen_items)
+        filters = SearchFilters(
+            query=query,
+            mode=mode,
+            folder=normalized_folder,
+            tags=normalized_tags,
+            normalized=tuple(
+                NormalizedSearchFilter(operator, value)
+                for operator, value in parsed.filters.normalized
+            ),
+        )
+        return SearchPage(
+            items=frozen_items,
+            total_or_more=total_or_more,
+            page=page,
+            per_page=per_page,
+            has_prev=page > 1,
+            has_next=has_next,
+            bounded=bounded,
+            filters=filters,
+        )
 
     def related(self, path: str, limit: int = 8) -> dict:
         """Documents semantically similar to this one (via the shared chunk-vector
