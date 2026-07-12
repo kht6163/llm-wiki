@@ -1190,7 +1190,13 @@ def create_web_app(app: AppContext) -> FastAPI:
     # ---- settings (per-user API keys) -----------------------------------
     @web.get("/settings", response_class=HTMLResponse)
     def settings_get(request: Request, p: Principal = Depends(require_user)):
-        return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=None)
+        return render(
+            "settings.html",
+            request,
+            keys=list_api_keys(db, p.user_id),
+            new_key=None,
+            embedding_status=docs.embedding_status() if p.can_admin else None,
+        )
 
     @web.post("/settings/keys", response_class=HTMLResponse)
     def settings_create_key(request: Request, name: str = Form("key"),
