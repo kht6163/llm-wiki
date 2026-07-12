@@ -32,26 +32,30 @@ def build_context(settings: Settings | None = None, *, full: bool = True,
     settings = settings or get_settings()
     settings.ensure_dirs()
     db = Database(settings.db_path)
-    embedder = get_embedder(settings.embedding_model)  # model loads lazily on first use
-    if full:
-        db.initialize(settings.embedding_model, embedder.dim, embedder.pipeline)
-    else:
-        db.ensure_schema()
-    events = EventHub()
-    fusion = FusionParams(
-        rrf_k=settings.rrf_k,
-        candidate_factor=settings.search_candidate_factor,
-        candidate_min=settings.search_candidate_min,
-        vector_factor=settings.search_vector_factor,
-        vector_cap=settings.search_vector_cap,
-        title_exact_boost=settings.search_title_exact_boost,
-        title_prefix_boost=settings.search_title_prefix_boost,
-        proximity_weight=settings.search_proximity_weight,
-    )
-    # The worker is constructed here but started by the caller (after the startup
-    # embed sweep) so writes during boot don't race an unstarted thread.
-    embed_worker = EmbeddingWorker(db, embedder) if start_embed_worker else None
-    docs = DocumentService(db, embedder, settings.vault_path, events=events,
-                           search_params=fusion, embed_worker=embed_worker)
-    return AppContext(settings=settings, db=db, embedder=embedder, docs=docs,
-                      events=events, embed_worker=embed_worker)
+    try:
+        embedder = get_embedder(settings.embedding_model)  # model loads lazily on first use
+        if full:
+            db.initialize(settings.embedding_model, embedder.dim, embedder.pipeline)
+        else:
+            db.ensure_schema()
+        events = EventHub()
+        fusion = FusionParams(
+            rrf_k=settings.rrf_k,
+            candidate_factor=settings.search_candidate_factor,
+            candidate_min=settings.search_candidate_min,
+            vector_factor=settings.search_vector_factor,
+            vector_cap=settings.search_vector_cap,
+            title_exact_boost=settings.search_title_exact_boost,
+            title_prefix_boost=settings.search_title_prefix_boost,
+            proximity_weight=settings.search_proximity_weight,
+        )
+        # The worker is constructed here but started by the caller (after the startup
+        # embed sweep) so writes during boot don't race an unstarted thread.
+        embed_worker = EmbeddingWorker(db, embedder) if start_embed_worker else None
+        docs = DocumentService(db, embedder, settings.vault_path, events=events,
+                               search_params=fusion, embed_worker=embed_worker)
+        return AppContext(settings=settings, db=db, embedder=embedder, docs=docs,
+                          events=events, embed_worker=embed_worker)
+    except BaseException:
+        db.close()
+        raise

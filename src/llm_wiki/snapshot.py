@@ -12,6 +12,8 @@ import tarfile
 import tempfile
 import unicodedata
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO
@@ -30,6 +32,8 @@ MAX_SNAPSHOT_MEMBERS = 100_000
 MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SNAPSHOT_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 MAX_SNAPSHOT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
+_RESTORE_JOURNAL_FORMAT = "llm-wiki-restore-journal"
+_RESTORE_JOURNAL_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -48,7 +52,7 @@ class RestoreReport:
     backup_cleanup_warnings: tuple[Path, ...] = ()
     _journal: _RestoreJournal | None = None
 
-    def finalize(self) -> tuple[Path, ...]:
+    def finalize(self, *, release_lock: bool = True) -> tuple[Path, ...]:
         """Commit a pending restore by removing the retained original targets."""
         if self._journal is not None:
             self.backup_cleanup_warnings = self._journal.finalize()
@@ -80,6 +84,24 @@ class RestoreRollbackError(ValueError):
         super().__init__(
             "restore publication failed and rollback could not complete; "
             f"backups preserved at {locations}"
+        )
+
+
+class RestorePreparationError(ValueError):
+    """Restore validation failed and one or more staging paths could not be removed."""
+
+    def __init__(
+        self,
+        primary_error: BaseException,
+        cleanup_errors: list[OSError],
+        staging_paths: tuple[Path, ...],
+    ) -> None:
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        self.staging_paths = staging_paths
+        locations = ", ".join(str(path) for path in staging_paths) or "unknown locations"
+        super().__init__(
+            f"{primary_error}; staging cleanup also failed; remnants preserved at {locations}"
         )
 
 
@@ -405,6 +427,52 @@ def _copy_archive_file(source: IO[bytes], target: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+@contextmanager
+def _open_stable_snapshot_archive(path: Path) -> Iterator[IO[bytes]]:
+    fd = -1
+    source: IO[bytes] | None = None
+    primary_error = False
+    try:
+        visible = os.lstat(path)
+        if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
+            raise ValueError("snapshot archive must be a regular file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or _stat_identity(visible) != _stat_identity(
+            before
+        ):
+            raise ValueError("snapshot archive must be a stable regular file")
+        if before.st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
+            raise ValueError("snapshot archive size limit exceeded")
+        source = os.fdopen(fd, "rb")
+        fd = -1
+        try:
+            yield source
+        except BaseException:
+            primary_error = True
+            raise
+        finally:
+            after = os.fstat(source.fileno())
+            source.close()
+            if not primary_error and _stat_identity(before) != _stat_identity(after):
+                raise ValueError("snapshot archive changed while reading")
+    except OSError as exc:
+        if primary_error:
+            raise
+        raise ValueError("snapshot archive must be a stable regular file") from exc
+    finally:
+        if source is not None and not source.closed:
+            source.close()
+        if fd >= 0:
+            os.close(fd)
+
+
 def _read_restore_manifest(
     archive: tarfile.TarFile,
 ) -> tuple[dict[str, object], dict[str, tarfile.TarInfo]]:
@@ -589,47 +657,259 @@ def _backup_name(path: Path) -> Path:
     return path.with_name(f".{path.name}.restore-backup-{uuid.uuid4().hex}")
 
 
+def restore_journal_path(db_path: Path) -> Path:
+    db_path = Path(db_path)
+    return db_path.with_name(f".{db_path.name}.restore-journal.json")
+
+
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_file(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_staging(staged_db: Path, staged_vault: Path) -> None:
+    _fsync_file(staged_db)
+    directories = [staged_vault]
+    for path in staged_vault.rglob("*"):
+        if path.is_dir():
+            directories.append(path)
+        else:
+            _fsync_file(path)
+    for directory in reversed(directories):
+        _fsync_directory(directory)
+
+
+@dataclass(frozen=True)
+class _RestoreTarget:
+    target: Path
+    backup: Path
+    had_original: bool
+
+    @property
+    def serialized(self) -> dict[str, str | bool]:
+        return {
+            "target": str(self.target),
+            "backup": str(self.backup),
+            "had_original": self.had_original,
+        }
+
+
 @dataclass
 class _RestoreJournal:
-    original_targets: list[tuple[Path, Path]]
-    published_targets: list[Path]
+    targets: tuple[_RestoreTarget, ...]
+    replacement_targets: tuple[Path, ...]
     process_lock: ProjectLock
+    path: Path
+    state: str = "prepared"
+
+    @property
+    def original_targets(self) -> list[tuple[Path, Path]]:
+        return [
+            (item.target, item.backup) for item in self.targets if item.had_original
+        ]
+
+    def persist(self, state: str) -> None:
+        self.state = state
+        data = json.dumps(
+            {
+                "format": _RESTORE_JOURNAL_FORMAT,
+                "version": _RESTORE_JOURNAL_VERSION,
+                "state": state,
+                "replacement_targets": [str(path) for path in self.replacement_targets],
+                "targets": [item.serialized for item in self.targets],
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        fd, temporary_raw = tempfile.mkstemp(
+            prefix=f".{self.path.name}.tmp-", dir=self.path.parent
+        )
+        temporary = Path(temporary_raw)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            _fsync_directory(self.path.parent)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _finish_journal(self) -> None:
+        self.path.unlink(missing_ok=True)
+        _fsync_directory(self.path.parent)
+
+    def _rollback_files(self) -> list[OSError]:
+        rollback_errors: list[OSError] = []
+        prior_state = self.state
+        if prior_state in {"publishing", "pending"}:
+            missing = [
+                item.backup
+                for item in self.targets
+                if item.had_original and not item.backup.exists()
+            ]
+            if missing:
+                return [OSError(f"restore backup is missing: {missing[0]}")]
+        try:
+            self.persist("rolling_back")
+        except OSError as exc:
+            return [exc]
+
+        for item in reversed(self.targets):
+            should_remove = (
+                prior_state != "prepared" and not item.had_original
+            ) or item.backup.exists()
+            if should_remove:
+                try:
+                    _remove_path(item.target)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+        for item in reversed(self.targets):
+            if item.had_original and item.backup.exists():
+                try:
+                    os.replace(item.backup, item.target)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+        try:
+            for parent in {item.target.parent for item in self.targets}:
+                _fsync_directory(parent)
+        except OSError as exc:
+            rollback_errors.append(exc)
+        if not rollback_errors:
+            try:
+                self._finish_journal()
+            except OSError as exc:
+                rollback_errors.append(exc)
+        return rollback_errors
 
     def rollback(self, cause: BaseException) -> None:
-        rollback_errors: list[OSError] = []
         try:
-            for target in reversed(self.published_targets):
-                try:
-                    _remove_path(target)
-                except OSError as exc:
-                    rollback_errors.append(exc)
-            for target, backup in reversed(self.original_targets):
-                try:
-                    os.replace(backup, target)
-                except OSError as exc:
-                    rollback_errors.append(exc)
+            rollback_errors = self._rollback_files()
             if rollback_errors:
                 preserved = tuple(
-                    backup
-                    for _, backup in self.original_targets
-                    if backup.exists() or backup.is_symlink()
+                    item.backup
+                    for item in self.targets
+                    if item.backup.exists() or item.backup.is_symlink()
                 )
                 raise RestoreRollbackError(cause, rollback_errors, preserved) from cause
             raise cause
         finally:
             self.process_lock.release()
 
-    def finalize(self) -> tuple[Path, ...]:
+    def finalize(self, *, release_lock: bool = True) -> tuple[Path, ...]:
         cleanup_warnings: list[Path] = []
         try:
+            self.persist("finalizing")
             for _, backup in self.original_targets:
                 try:
                     _remove_path(backup)
                 except OSError:
                     cleanup_warnings.append(backup)
+            if not cleanup_warnings:
+                self._finish_journal()
         finally:
-            self.process_lock.release()
+            if release_lock:
+                self.process_lock.release()
         return tuple(cleanup_warnings)
+
+
+def _load_restore_journal(
+    db_path: Path, vault: Path, process_lock: ProjectLock
+) -> _RestoreJournal | None:
+    path = restore_journal_path(db_path)
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_bytes()
+        if len(raw) > MAX_SNAPSHOT_MANIFEST_BYTES:
+            raise ValueError("restore journal is too large")
+        data = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError(f"invalid restore journal: {path}") from exc
+    expected_targets = (
+        db_path.absolute(),
+        Path(f"{db_path.absolute()}-wal"),
+        Path(f"{db_path.absolute()}-shm"),
+        vault.absolute(),
+    )
+    if (
+        not isinstance(data, dict)
+        or data.get("format") != _RESTORE_JOURNAL_FORMAT
+        or data.get("version") != _RESTORE_JOURNAL_VERSION
+        or data.get("state")
+        not in {"prepared", "publishing", "pending", "rolling_back", "finalizing"}
+        or data.get("replacement_targets") != [str(item) for item in expected_targets]
+        or not isinstance(data.get("targets"), list)
+        or len(data["targets"]) != len(expected_targets)
+    ):
+        raise ValueError(f"invalid restore journal: {path}")
+    targets: list[_RestoreTarget] = []
+    for expected, raw_target in zip(expected_targets, data["targets"], strict=True):
+        if not isinstance(raw_target, dict):
+            raise ValueError(f"invalid restore journal: {path}")
+        target = Path(str(raw_target.get("target")))
+        backup = Path(str(raw_target.get("backup")))
+        had_original = raw_target.get("had_original")
+        if (
+            target != expected
+            or backup.parent != expected.parent
+            or not backup.name.startswith(f".{expected.name}.restore-backup-")
+            or not isinstance(had_original, bool)
+        ):
+            raise ValueError(f"invalid restore journal: {path}")
+        targets.append(_RestoreTarget(target, backup, had_original))
+    return _RestoreJournal(
+        tuple(targets),
+        expected_targets,
+        process_lock,
+        path,
+        str(data["state"]),
+    )
+
+
+def _recover_pending_restore(
+    db_path: Path, vault: Path, process_lock: ProjectLock
+) -> str | None:
+    journal = _load_restore_journal(db_path, vault, process_lock)
+    if journal is None:
+        return None
+    if journal.state == "finalizing":
+        warnings = journal.finalize(release_lock=False)
+        if warnings:
+            raise OSError(f"restore backup cleanup failed: {warnings[0]}")
+        return "finalized"
+    errors = journal._rollback_files()
+    if errors:
+        raise RestoreRollbackError(
+            RuntimeError("recovering interrupted restore"),
+            errors,
+            tuple(
+                item.backup
+                for item in journal.targets
+                if item.backup.exists() or item.backup.is_symlink()
+            ),
+        )
+    return "rolled_back"
+
+
+def recover_pending_restore(db_path: Path, vault: Path) -> str | None:
+    db_path, vault = Path(db_path), Path(vault)
+    process_lock = ProjectLock(db_path).acquire()
+    try:
+        return _recover_pending_restore(db_path, vault, process_lock)
+    finally:
+        process_lock.release()
 
 
 def _publish_restore(
@@ -639,22 +919,39 @@ def _publish_restore(
     vault: Path,
     process_lock: ProjectLock,
 ) -> _RestoreJournal:
-    targets = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"), vault]
-    journal: list[tuple[Path, Path]] = []
-    published: list[Path] = []
+    targets = (
+        db_path.absolute(),
+        Path(f"{db_path.absolute()}-wal"),
+        Path(f"{db_path.absolute()}-shm"),
+        vault.absolute(),
+    )
+    records = tuple(
+        _RestoreTarget(target, _backup_name(target), target.exists() or target.is_symlink())
+        for target in targets
+    )
+    restore_journal = _RestoreJournal(
+        records,
+        targets,
+        process_lock,
+        restore_journal_path(db_path),
+    )
     try:
-        for target in targets:
-            if target.exists() or target.is_symlink():
-                backup = _backup_name(target)
-                os.replace(target, backup)
-                journal.append((target, backup))
+        _fsync_staging(staged_db, staged_vault)
+        restore_journal.persist("prepared")
+        for item in records:
+            if item.had_original:
+                os.replace(item.target, item.backup)
+        for parent in {item.target.parent for item in records}:
+            _fsync_directory(parent)
+        restore_journal.persist("publishing")
         os.replace(staged_db, db_path)
-        published.append(db_path)
         os.replace(staged_vault, vault)
-        published.append(vault)
+        for parent in {item.target.parent for item in records}:
+            _fsync_directory(parent)
+        restore_journal.persist("pending")
     except BaseException as publish_error:
-        _RestoreJournal(journal, published, process_lock).rollback(publish_error)
-    return _RestoreJournal(journal, published, process_lock)
+        restore_journal.rollback(publish_error)
+    return restore_journal
 
 
 def restore_snapshot(
@@ -666,11 +963,10 @@ def restore_snapshot(
 ) -> RestoreReport:
     """Validate a snapshot in sibling staging paths, then replace live targets."""
     src, db_path, vault = Path(src), Path(db_path), Path(vault)
-    if src.stat().st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
-        raise ValueError("snapshot archive size limit exceeded")
     process_lock = ProjectLock(db_path).acquire()
     staged_db: Path | None = None
     try:
+        _recover_pending_restore(db_path, vault, process_lock)
         db_nonempty = db_path.exists() and db_path.stat().st_size > 0
         vault_nonempty = vault.exists() and any(vault.iterdir())
         if (db_nonempty or vault_nonempty) and not force:
@@ -695,39 +991,40 @@ def restore_snapshot(
     published = False
     try:
         try:
-            with tarfile.open(src, "r") as archive:
-                manifest, members = _read_restore_manifest(archive)
-                files = _manifest_files(manifest)
-                expected_members = {"manifest.json", "wiki.db", *files}
-                actual_members = set(members)
-                if actual_members != expected_members:
-                    missing = expected_members - actual_members
-                    if missing:
-                        raise ValueError("manifest payload is missing from archive")
-                    raise ValueError("archive contains undeclared payload")
+            with _open_stable_snapshot_archive(src) as archive_source:
+                with tarfile.open(fileobj=archive_source, mode="r:") as archive:
+                    manifest, members = _read_restore_manifest(archive)
+                    files = _manifest_files(manifest)
+                    expected_members = {"manifest.json", "wiki.db", *files}
+                    actual_members = set(members)
+                    if actual_members != expected_members:
+                        missing = expected_members - actual_members
+                        if missing:
+                            raise ValueError("manifest payload is missing from archive")
+                        raise ValueError("archive contains undeclared payload")
 
-                for path in ["wiki.db", *files]:
-                    extracted = archive.extractfile(members[path])
-                    if extracted is None:
-                        raise ValueError("archive payload is missing")
-                    target = (
-                        staged_db
-                        if path == "wiki.db"
-                        else staged_vault / path.removeprefix("vault/")
-                    )
-                    size, digest = _copy_archive_file(extracted, target)
-                    if path == "wiki.db" and manifest.get("format_version") == 2:
-                        database = manifest["database"]
-                        assert isinstance(database, dict)
-                        if size != database["size"] or digest != database["sha256"]:
-                            raise ValueError(
-                                "snapshot database verification failed: hash mismatch; "
-                                "invalid snapshot database"
-                            )
-                    elif path != "wiki.db":
-                        entry = files[path]
-                        if size != entry["size"] or digest != entry["sha256"]:
-                            raise ValueError("manifest payload verification failed")
+                    for path in ["wiki.db", *files]:
+                        extracted = archive.extractfile(members[path])
+                        if extracted is None:
+                            raise ValueError("archive payload is missing")
+                        target = (
+                            staged_db
+                            if path == "wiki.db"
+                            else staged_vault / path.removeprefix("vault/")
+                        )
+                        size, digest = _copy_archive_file(extracted, target)
+                        if path == "wiki.db" and manifest.get("format_version") == 2:
+                            database = manifest["database"]
+                            assert isinstance(database, dict)
+                            if size != database["size"] or digest != database["sha256"]:
+                                raise ValueError(
+                                    "snapshot database verification failed: hash mismatch; "
+                                    "invalid snapshot database"
+                                )
+                        elif path != "wiki.db":
+                            entry = files[path]
+                            if size != entry["size"] or digest != entry["sha256"]:
+                                raise ValueError("manifest payload verification failed")
         except tarfile.TarError as exc:
             raise ValueError("invalid snapshot archive") from exc
 
@@ -752,6 +1049,16 @@ def restore_snapshot(
             primary_error.staging_cleanup_errors = tuple(staging_cleanup_errors)
         elif primary_error is None and staging_cleanup_errors:
             journal.rollback(staging_cleanup_errors[0])
+        elif primary_error is not None and staging_cleanup_errors:
+            process_lock.release()
+            remnants = tuple(
+                path
+                for path in (staged_db, staged_vault)
+                if path.exists() or path.is_symlink()
+            )
+            raise RestorePreparationError(
+                primary_error, staging_cleanup_errors, remnants
+            ) from primary_error
         if primary_error is not None and not published:
             process_lock.release()
 

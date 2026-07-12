@@ -53,7 +53,9 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
         relative = "." if path == root else path.relative_to(root).as_posix()
         if path.is_symlink():
             entries[relative] = ("symlink", os.readlink(path))
-        elif path.name == ".llm-wiki.lock":
+        elif path.name == ".llm-wiki.lock" or path.name.endswith(
+            ".restore-journal.json"
+        ):
             continue
         elif path.is_dir():
             entries[relative] = ("directory", None)
@@ -68,6 +70,7 @@ def _restore_artifacts(db_path: Path, vault: Path) -> set[Path]:
         f".{db_path.name}.restore-backup-*",
         f".{vault.name}.restore-stage-*",
         f".{vault.name}.restore-backup-*",
+        f".{db_path.name}.restore-journal.json",
     )
     return {
         path
@@ -76,6 +79,7 @@ def _restore_artifacts(db_path: Path, vault: Path) -> set[Path]:
             (db_path.parent, patterns[1]),
             (vault.parent, patterns[2]),
             (vault.parent, patterns[3]),
+            (db_path.parent, patterns[4]),
         )
         for path in parent.glob(pattern)
     }
@@ -432,6 +436,82 @@ def test_restore_rejects_corrupt_tar_stream(tmp_path):
     _restore_rejects_without_live_changes(archive, tmp_path / "target", "invalid snapshot archive")
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+def test_restore_rejects_fifo_archive_without_blocking(tmp_path, monkeypatch):
+    archive = tmp_path / "snapshot.fifo"
+    os.mkfifo(archive)
+    monkeypatch.setattr(
+        snapshot.tarfile,
+        "open",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("FIFO reached tarfile.open")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot.restore_snapshot(
+            archive, tmp_path / "fifo.db", tmp_path / "fifo-vault", force=False
+        )
+
+
+def test_restore_rejects_symlink_archive(tmp_path):
+    target = tmp_path / "target.tar"
+    target.write_bytes(b"not important")
+    archive = tmp_path / "snapshot.tar"
+    archive.symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot.restore_snapshot(
+            archive, tmp_path / "link.db", tmp_path / "link-vault", force=False
+        )
+
+
+def test_restore_passes_stable_archive_descriptor_to_tarfile(
+    snapshot_source, tmp_path, monkeypatch
+):
+    _, archive = snapshot_source
+    real_open = snapshot.tarfile.open
+    observed = []
+
+    def inspect_open(*args, **kwargs):
+        if kwargs.get("mode") == "r:":
+            observed.append(kwargs.get("fileobj"))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(snapshot.tarfile, "open", inspect_open)
+    pending = snapshot.restore_snapshot(
+        archive, tmp_path / "descriptor.db", tmp_path / "descriptor-vault", force=False
+    )
+    pending.finalize()
+
+    assert len(observed) == 1
+    assert observed[0] is not None
+    assert observed[0].closed
+
+
+def test_restore_rejects_archive_changed_during_read(snapshot_source, tmp_path, monkeypatch):
+    _, archive = snapshot_source
+    real_open = snapshot.tarfile.open
+
+    def mutate_after_read(*args, **kwargs):
+        opened = real_open(*args, **kwargs)
+        real_close = opened.close
+
+        def close():
+            real_close()
+            with archive.open("ab") as output:
+                output.write(b"changed")
+
+        opened.close = close
+        return opened
+
+    monkeypatch.setattr(snapshot.tarfile, "open", mutate_after_read)
+    with pytest.raises(ValueError, match="changed while reading"):
+        snapshot.restore_snapshot(
+            archive, tmp_path / "changed.db", tmp_path / "changed-vault", force=False
+        )
+
+
 def test_snapshot_v2_manifest_authenticates_database(snapshot_source):
     _, archive = snapshot_source
     with tarfile.open(archive, "r") as source:
@@ -602,6 +682,10 @@ def test_snapshot_walk_skips_real_directories(snapshot_source, tmp_path):
 
     with tarfile.open(out) as archive:
         assert "vault/assets/nested.bin" in archive.getnames()
+    pending = snapshot.restore_snapshot(
+        out, tmp_path / "nested.db", tmp_path / "nested-vault", force=False
+    )
+    pending.finalize()
 
 
 def test_copy_archive_file_enforces_streaming_limit(tmp_path, monkeypatch):
@@ -696,6 +780,229 @@ def test_restore_staging_setup_failure_cleans_database_and_releases_lock(
         pass
 
 
+def test_stable_archive_descriptor_setup_and_close_failures(tmp_path, monkeypatch):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    visible = os.lstat(archive)
+    real_fstat = snapshot.os.fstat
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fstat",
+        lambda fd: SimpleNamespace(
+            st_mode=visible.st_mode,
+            st_dev=visible.st_dev,
+            st_ino=visible.st_ino + 1,
+            st_size=visible.st_size,
+            st_mtime_ns=visible.st_mtime_ns,
+            st_ctime_ns=visible.st_ctime_ns,
+        ),
+    )
+    with pytest.raises(ValueError, match="stable regular file"):
+        with snapshot._open_stable_snapshot_archive(archive):
+            pass
+
+    monkeypatch.setattr(snapshot.os, "fstat", real_fstat)
+    monkeypatch.setattr(
+        snapshot.os,
+        "open",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open failed")),
+    )
+    with pytest.raises(ValueError, match="stable regular file"):
+        with snapshot._open_stable_snapshot_archive(archive):
+            pass
+
+
+def test_stable_archive_closes_source_when_final_fstat_fails(tmp_path, monkeypatch):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_fstat = snapshot.os.fstat
+    calls = 0
+
+    def fail_final_fstat(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("final stat failed")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(snapshot.os, "fstat", fail_final_fstat)
+    with pytest.raises(ValueError, match="stable regular file"):
+        with snapshot._open_stable_snapshot_archive(archive):
+            pass
+
+
+def _coverage_restore_journal(tmp_path, state="prepared"):
+    db_path = tmp_path / "data" / "wiki.db"
+    vault = tmp_path / "vault"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    vault.parent.mkdir(parents=True, exist_ok=True)
+    targets = (
+        db_path,
+        Path(f"{db_path}-wal"),
+        Path(f"{db_path}-shm"),
+        vault,
+    )
+    records = tuple(
+        snapshot._RestoreTarget(
+            target,
+            target.with_name(f".{target.name}.restore-backup-coverage"),
+            False,
+        )
+        for target in targets
+    )
+    lock = snapshot.ProjectLock(db_path).acquire()
+    return snapshot._RestoreJournal(
+        records,
+        targets,
+        lock,
+        snapshot.restore_journal_path(db_path),
+        state,
+    )
+
+
+def test_restore_journal_persist_and_rollback_fsync_failures(tmp_path, monkeypatch):
+    original_fsync = snapshot._fsync_directory
+    journal = _coverage_restore_journal(tmp_path / "persist")
+    monkeypatch.setattr(
+        snapshot,
+        "_fsync_directory",
+        lambda path: (_ for _ in ()).throw(OSError("journal fsync failed")),
+    )
+    with pytest.raises(OSError, match="journal fsync failed"):
+        journal.persist("pending")
+    journal.process_lock.release()
+    monkeypatch.setattr(snapshot, "_fsync_directory", original_fsync)
+
+    for failure_call, message in [(2, "rollback fsync failed"), (4, "finish failed")]:
+        journal = _coverage_restore_journal(tmp_path / message.replace(" ", "-"))
+        calls = 0
+
+        def fail_selected(path, selected=failure_call, error_message=message):
+            nonlocal calls
+            calls += 1
+            if calls == selected:
+                raise OSError(error_message)
+            return original_fsync(path)
+
+        monkeypatch.setattr(snapshot, "_fsync_directory", fail_selected)
+        errors = journal._rollback_files()
+        assert [str(error) for error in errors] == [message]
+        journal.process_lock.release()
+        monkeypatch.setattr(snapshot, "_fsync_directory", original_fsync)
+
+
+def test_restore_journal_rollback_reports_persist_failure(tmp_path, monkeypatch):
+    journal = _coverage_restore_journal(tmp_path)
+    monkeypatch.setattr(
+        journal,
+        "persist",
+        lambda state: (_ for _ in ()).throw(OSError("persist failed")),
+    )
+
+    assert [str(error) for error in journal._rollback_files()] == ["persist failed"]
+    journal.process_lock.release()
+
+
+@pytest.mark.parametrize("case", ["large", "json", "top", "target-type", "target-value"])
+def test_recovery_rejects_invalid_durable_journals(tmp_path, case, monkeypatch):
+    db_path = tmp_path / case / "wiki.db"
+    vault = tmp_path / f"{case}-vault"
+    db_path.parent.mkdir(parents=True)
+    targets = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"), vault]
+    data = {
+        "format": snapshot._RESTORE_JOURNAL_FORMAT,
+        "version": snapshot._RESTORE_JOURNAL_VERSION,
+        "state": "prepared",
+        "replacement_targets": [str(path) for path in targets],
+        "targets": [
+            {
+                "target": str(path),
+                "backup": str(
+                    path.with_name(f".{path.name}.restore-backup-coverage")
+                ),
+                "had_original": False,
+            }
+            for path in targets
+        ],
+    }
+    journal_path = snapshot.restore_journal_path(db_path)
+    if case == "large":
+        journal_path.write_bytes(b"x" * 20)
+        monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MANIFEST_BYTES", 10)
+    elif case == "json":
+        journal_path.write_bytes(b"{")
+    else:
+        if case == "top":
+            data["format"] = "wrong"
+        elif case == "target-type":
+            data["targets"][0] = "wrong"
+        else:
+            data["targets"][0]["backup"] = str(tmp_path / "outside")
+        journal_path.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="restore journal"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
+def test_recovery_completes_interrupted_finalize(snapshot_source, tmp_path):
+    _, archive = snapshot_source
+    db_path = tmp_path / "finalizing" / "wiki.db"
+    vault = tmp_path / "finalizing-vault"
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=False)
+    assert pending._journal is not None
+    pending._journal.persist("finalizing")
+    pending._journal.process_lock.release()
+
+    assert snapshot.recover_pending_restore(db_path, vault) == "finalized"
+    assert not snapshot.restore_journal_path(db_path).exists()
+
+
+def test_recovery_reports_interrupted_finalize_cleanup_failure(
+    snapshot_source, tmp_path, monkeypatch
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "finalize-warning" / "wiki.db"
+    vault = tmp_path / "finalize-warning-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    backup = next(
+        item.backup for item in pending._journal.targets if item.had_original
+    )
+    pending._journal.persist("finalizing")
+    pending._journal.process_lock.release()
+    real_remove = snapshot._remove_path
+
+    def fail_backup_cleanup(path):
+        if path == backup:
+            raise OSError("backup cleanup failed")
+        return real_remove(path)
+
+    monkeypatch.setattr(snapshot, "_remove_path", fail_backup_cleanup)
+    with pytest.raises(OSError, match="backup cleanup failed"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
+def test_recovery_reports_missing_backup(snapshot_source, tmp_path):
+    _, archive = snapshot_source
+    db_path = tmp_path / "missing-backup" / "wiki.db"
+    vault = tmp_path / "missing-backup-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    backup = next(
+        item.backup for item in pending._journal.targets if item.had_original
+    )
+    backup.unlink()
+    pending._journal.process_lock.release()
+
+    with pytest.raises(snapshot.RestoreRollbackError, match="rollback could not complete"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
 def test_restore_reports_published_target_removal_failure_and_preserves_originals(
     snapshot_source, tmp_path, monkeypatch
 ):
@@ -731,7 +1038,9 @@ def test_restore_reports_published_target_removal_failure_and_preserves_original
     ]
     assert caught.value.backup_paths == ()
     assert _tree_snapshot(tmp_path) == before
-    assert _restore_artifacts(db_path, vault) == set()
+    assert _restore_artifacts(db_path, vault) == {
+        snapshot.restore_journal_path(db_path)
+    }
 
 
 def test_restore_surfaces_cleanup_failure_after_successful_publication(
@@ -752,7 +1061,8 @@ def test_restore_surfaces_cleanup_failure_after_successful_publication(
 
     def capture_staged_database(*args, **kwargs):
         fd, raw_path = real_mkstemp(*args, **kwargs)
-        staged_databases.append(Path(raw_path))
+        if ".restore-stage-" in Path(raw_path).name:
+            staged_databases.append(Path(raw_path))
         return fd, raw_path
 
     def fail_stage_cleanup(path, *args, **kwargs):
@@ -810,12 +1120,18 @@ def test_restore_preserves_primary_error_when_exact_staging_tree_cleanup_fails(
 
     monkeypatch.setattr(snapshot.tempfile, "mkdtemp", capture_staged_vault)
     monkeypatch.setattr(snapshot.shutil, "rmtree", fail_exact_staged_vault)
-    with pytest.raises(ValueError, match="invalid snapshot database") as caught:
+    with pytest.raises(
+        snapshot.RestorePreparationError, match="invalid snapshot database"
+    ) as caught:
         snapshot.restore_snapshot(damaged, db_path, vault, force=True)
 
-    assert str(caught.value).endswith("invalid snapshot database")
+    assert str(caught.value.primary_error).endswith("invalid snapshot database")
+    assert [str(error) for error in caught.value.cleanup_errors] == [
+        "staged vault cleanup failed"
+    ]
     assert len(staged_vaults) == 1
     leftover = staged_vaults[0]
+    assert caught.value.staging_paths == (leftover,)
     assert leftover.exists()
     assert _tree_snapshot(leftover) == {".": ("directory", None)}
     assert _tree_snapshot(db_path.parent) == before_db

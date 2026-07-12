@@ -23,7 +23,7 @@ from .services import audit
 from .services import users as users_svc
 from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
-from .snapshot import restore_snapshot, write_snapshot
+from .snapshot import _recover_pending_restore, restore_snapshot, write_snapshot
 from .web import create_web_app
 from .web.security import RequestBodyLimitMiddleware
 
@@ -492,6 +492,9 @@ def _restore(args) -> int:
         print(f"restore failed: {exc}")
         return 1
 
+    ctx = None
+    recovered = 0
+    post_error: BaseException | None = None
     try:
         if report.embedding_model and report.embedding_model != settings.embedding_model:
             print(f"WARNING: snapshot embedding_model '{report.embedding_model}' differs from "
@@ -499,12 +502,21 @@ def _restore(args) -> int:
         ctx = build_context(full=False)  # opens the restored DB and applies any migrations
         recovered = ctx.docs.recover_pending()
     except BaseException as exc:
+        post_error = exc
+    finally:
+        if ctx is not None:
+            try:
+                ctx.db.close()
+            except BaseException as exc:
+                if post_error is None:
+                    post_error = exc
+    if post_error is not None:
         try:
-            report.rollback(exc)
+            report.rollback(post_error)
         except (OSError, ValueError, RuntimeError) as rollback_exc:
             print(f"restore failed: {rollback_exc}")
             return 1
-        raise AssertionError("restore rollback unexpectedly returned") from exc
+        raise AssertionError("restore rollback unexpectedly returned") from post_error
 
     report.finalize()
     for backup in report.backup_cleanup_warnings:
@@ -570,7 +582,12 @@ def _create_mcp_http_app(ctx):
 def _serve(args) -> int:
     settings = _apply_serve_overrides(get_settings(), args)
     try:
-        with ProjectLock(settings.db_path):
+        with ProjectLock(settings.db_path) as process_lock:
+            recovery = _recover_pending_restore(
+                Path(settings.db_path), Path(settings.vault_path), process_lock
+            )
+            if recovery:
+                print(f"Recovered interrupted restore ({recovery}).")
             return _serve_locked(args, settings)
     except ProjectLockError as exc:
         print(f"serve failed: {exc}")

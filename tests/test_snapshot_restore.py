@@ -5,6 +5,8 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
+import sys
 import tarfile
 import threading
 from pathlib import Path
@@ -782,6 +784,75 @@ def test_restore_handle_rolls_back_and_reports_cleanup_failures(
     assert (vault / "original.txt").read_text() == "original"
 
 
+def test_post_publication_rollback_removes_replacement_sidecars_before_original_db(
+    tmp_path,
+):
+    archive = _snapshot_for_restore(tmp_path, "sidecar-rollback-source")
+    original = _seed(_settings(tmp_path, "sidecar-rollback-target"))
+    db_path = original.settings.db_path
+    vault = original.settings.vault_path
+    original_body = original.docs.get("note.md")["content"]
+    original.db.close()
+    pending = snapshot_writer.restore_snapshot(archive, db_path, vault, force=True)
+
+    Path(f"{db_path}-wal").write_bytes(b"replacement wal must not survive")
+    Path(f"{db_path}-shm").write_bytes(b"replacement shm must not survive")
+    with pytest.raises(RuntimeError, match="post-check failed"):
+        pending.rollback(RuntimeError("post-check failed"))
+
+    assert not Path(f"{db_path}-wal").exists()
+    assert not Path(f"{db_path}-shm").exists()
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    restored = build_context(original.settings, full=False)
+    assert restored.docs.get("note.md")["content"] == original_body
+    restored.db.close()
+
+
+def test_restore_cli_closes_postcheck_database_before_rollback(
+    tmp_path, monkeypatch
+):
+    archive = _snapshot_for_restore(tmp_path, "close-before-rollback-source")
+    settings = _settings(tmp_path, "close-before-rollback-target")
+    settings.db_path.parent.mkdir()
+    settings.db_path.write_bytes(b"original")
+    settings.vault_path.mkdir()
+    events: list[str] = []
+    real_restore = _cli_impl.restore_snapshot
+
+    class ReportProxy:
+        def __init__(self, report):
+            self._report = report
+            self.embedding_model = report.embedding_model
+
+        def rollback(self, cause):
+            events.append("rollback")
+            return self._report.rollback(cause)
+
+    class FailingDocs:
+        def recover_pending(self):
+            raise RuntimeError("recover failed")
+
+    class DatabaseProxy:
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        _cli_impl,
+        "restore_snapshot",
+        lambda *args, **kwargs: ReportProxy(real_restore(*args, **kwargs)),
+    )
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: SimpleNamespace(db=DatabaseProxy(), docs=FailingDocs()),
+    )
+
+    assert _cli_impl._restore(SimpleNamespace(in_=str(archive), force=True)) == 1
+    assert events == ["close", "rollback"]
+
+
 def test_restore_refuses_while_application_lock_is_held(tmp_path):
     archive = _snapshot_for_restore(tmp_path, "locked-restore-source")
     db_path = tmp_path / "locked-target" / "wiki.db"
@@ -804,6 +875,159 @@ def test_pending_restore_holds_application_lock_until_finalize(tmp_path):
     pending.finalize()
     with ProjectLock(db_path):
         pass
+
+
+def test_pending_restore_is_durable_and_sigkill_recovery_restores_originals(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "crash-source")
+    original = _seed(_settings(tmp_path, "crash-target"))
+    db_path = original.settings.db_path
+    vault = original.settings.vault_path
+    original.db.close()
+    original_db = db_path.read_bytes()
+    original_vault = {
+        path.relative_to(vault).as_posix(): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file()
+    }
+    script = """
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from llm_wiki.snapshot import restore_snapshot
+
+restore_snapshot(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), force=True)
+connection = sqlite3.connect(sys.argv[2])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("CREATE TABLE postcheck_crash(value TEXT)")
+connection.execute("INSERT INTO postcheck_crash VALUES ('replacement WAL')")
+connection.commit()
+os._exit(91)
+"""
+
+    crashed = subprocess.run(
+        [sys.executable, "-c", script, str(archive), str(db_path), str(vault)],
+        check=False,
+    )
+
+    assert crashed.returncode == 91
+    assert Path(f"{db_path}-wal").exists()
+    assert Path(f"{db_path}-shm").exists()
+    journal = snapshot_writer.restore_journal_path(db_path)
+    assert journal.exists()
+    assert snapshot_writer.recover_pending_restore(db_path, vault) == "rolled_back"
+    assert not journal.exists()
+    assert db_path.read_bytes() == original_db
+    assert {
+        path.relative_to(vault).as_posix(): path.read_bytes()
+        for path in vault.rglob("*")
+        if path.is_file()
+    } == original_vault
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_finalize_marks_durable_commit_and_removes_journal(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "durable-finalize-source")
+    db_path = tmp_path / "durable-finalize" / "wiki.db"
+    vault = tmp_path / "durable-finalize-vault"
+    pending = snapshot_writer.restore_snapshot(archive, db_path, vault, force=False)
+    journal = snapshot_writer.restore_journal_path(db_path)
+
+    assert journal.exists()
+    pending.finalize()
+
+    assert not journal.exists()
+
+
+def test_serve_startup_recovers_pending_restore_before_building_context(
+    tmp_path, monkeypatch
+):
+    archive = _snapshot_for_restore(tmp_path, "serve-recovery-source")
+    original = _seed(_settings(tmp_path, "serve-recovery-target"))
+    original_body = original.docs.get("note.md")["content"]
+    original.db.close()
+    pending = snapshot_writer.restore_snapshot(
+        archive,
+        original.settings.db_path,
+        original.settings.vault_path,
+        force=True,
+    )
+    assert pending._journal is not None
+    pending._journal.process_lock.release()
+    observed = []
+
+    def serve_locked(args, settings):
+        ctx = build_context(settings, full=False)
+        observed.append(ctx.docs.get("note.md")["content"])
+        ctx.db.close()
+        return 0
+
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: original.settings)
+    monkeypatch.setattr(_cli_impl, "_serve_locked", serve_locked)
+
+    assert _cli_impl._serve(
+        SimpleNamespace(host=None, gui_port=None, mcp_port=None)
+    ) == 0
+    assert observed == [original_body]
+
+
+def test_restore_startup_recovers_previous_pending_journal(tmp_path):
+    first_archive = _snapshot_for_restore(tmp_path, "first-interrupted-source")
+    second_archive = _snapshot_for_restore(tmp_path, "second-after-recovery-source")
+    original = _seed(_settings(tmp_path, "restore-recovery-target"))
+    original.db.close()
+    pending = snapshot_writer.restore_snapshot(
+        first_archive,
+        original.settings.db_path,
+        original.settings.vault_path,
+        force=True,
+    )
+    assert pending._journal is not None
+    pending._journal.process_lock.release()
+
+    replacement = snapshot_writer.restore_snapshot(
+        second_archive,
+        original.settings.db_path,
+        original.settings.vault_path,
+        force=True,
+    )
+    replacement.finalize()
+
+    assert not snapshot_writer.restore_journal_path(original.settings.db_path).exists()
+    assert not list(
+        original.settings.db_path.parent.glob(".*.restore-backup-*")
+    )
+    assert not list(original.settings.vault_path.parent.glob(".*.restore-backup-*"))
+
+
+def test_restore_refuses_lock_held_by_another_process(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "process-lock-source")
+    db_path = tmp_path / "process-lock-target" / "wiki.db"
+    vault = tmp_path / "process-lock-vault"
+    script = """
+import sys
+import time
+from pathlib import Path
+from llm_wiki.process_lock import ProjectLock
+
+with ProjectLock(Path(sys.argv[1])):
+    print("locked", flush=True)
+    time.sleep(30)
+"""
+    holder = subprocess.Popen(
+        [sys.executable, "-c", script, str(db_path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "locked"
+        with pytest.raises(ProjectLockError, match="already active"):
+            snapshot_writer.restore_snapshot(archive, db_path, vault, force=False)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
 
 
 def test_restore_cli_reports_preserved_backup_when_rollback_fails(

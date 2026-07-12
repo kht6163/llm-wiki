@@ -509,7 +509,13 @@ def test_restore_warns_recovers_and_reports_success(monkeypatch, tmp_path, capsy
     calls = []
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or report)
-    monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(docs=NS(recover_pending=lambda: 3)))
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: NS(
+            db=NS(close=lambda: None), docs=NS(recover_pending=lambda: 3)
+        ),
+    )
     assert _cli_impl._restore(NS(in_=str(src), force=True)) == 0
     assert calls == [((src, Path(settings.db_path), Path(settings.vault_path)), {"force": True})]
     out = capsys.readouterr().out
@@ -525,14 +531,22 @@ def test_restore_clean_success_has_no_optional_warnings(monkeypatch, tmp_path, c
                 doc_count=0, finalize=lambda: None)
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
-    monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(docs=NS(recover_pending=lambda: 0)))
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: NS(
+            db=NS(close=lambda: None), docs=NS(recover_pending=lambda: 0)
+        ),
+    )
     assert _cli_impl._restore(NS(in_=str(src), force=False)) == 0
     out = capsys.readouterr().out
     assert "WARNING" not in out and "re-projected" not in out
 
 
 def test_serve_holds_the_same_project_lock_used_by_restore(monkeypatch, tmp_path):
-    settings = NS(db_path=tmp_path / "data" / "wiki.db")
+    settings = NS(
+        db_path=tmp_path / "data" / "wiki.db", vault_path=tmp_path / "vault"
+    )
     observed = []
 
     def serve_locked(args, locked_settings):
@@ -582,6 +596,79 @@ def test_restore_defensively_rejects_a_rollback_that_returns(monkeypatch, tmp_pa
 
     with pytest.raises(AssertionError, match="unexpectedly returned"):
         _cli_impl._restore(NS(in_=str(src), force=True))
+
+
+def test_restore_rolls_back_when_postcheck_database_close_fails(
+    monkeypatch, tmp_path, capsys
+):
+    src = tmp_path / "wiki.tar"
+    src.touch()
+    settings = NS(
+        db_path=tmp_path / "wiki.db",
+        vault_path=tmp_path / "vault",
+        embedding_model="same",
+    )
+    observed = []
+    report = NS(
+        embedding_model="same",
+        rollback=lambda error: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: NS(
+            docs=NS(recover_pending=lambda: 0),
+            db=NS(
+                close=lambda: (
+                    observed.append("close"),
+                    (_ for _ in ()).throw(OSError("close failed")),
+                )[-1]
+            ),
+        ),
+    )
+
+    assert _cli_impl._restore(NS(in_=str(src), force=True)) == 1
+    assert observed == ["close"]
+    assert "close failed" in capsys.readouterr().out
+
+
+def test_restore_preserves_postcheck_error_when_database_close_also_fails(
+    monkeypatch, tmp_path, capsys
+):
+    src = tmp_path / "wiki.tar"
+    src.touch()
+    settings = NS(
+        db_path=tmp_path / "wiki.db",
+        vault_path=tmp_path / "vault",
+        embedding_model="same",
+    )
+    report = NS(
+        embedding_model="same",
+        rollback=lambda error: (_ for _ in ()).throw(error),
+    )
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: NS(
+            docs=NS(
+                recover_pending=lambda: (_ for _ in ()).throw(
+                    RuntimeError("recovery failed")
+                )
+            ),
+            db=NS(
+                close=lambda: (_ for _ in ()).throw(OSError("secondary close failed"))
+            ),
+        ),
+    )
+
+    assert _cli_impl._restore(NS(in_=str(src), force=True)) == 1
+    output = capsys.readouterr().out
+    assert "recovery failed" in output
+    assert "secondary close failed" not in output
 
 
 def _settings(**overrides):

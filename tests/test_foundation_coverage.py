@@ -16,7 +16,7 @@ from starlette.datastructures import FormData
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
-from llm_wiki import events, metrics, ratelimit
+from llm_wiki import events, metrics, ratelimit, runtime
 from llm_wiki.config import ConfigError, Settings
 from llm_wiki.events import EventHub
 from llm_wiki.logconf import configure_logging, get_logger, get_request_id
@@ -89,6 +89,31 @@ def test_config_search_bounds_and_directory_creation(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "mkdir", deny_mkdir)
     with pytest.raises(ConfigError, match="Cannot create data directories: read-only storage"):
         settings.ensure_dirs()
+
+
+def test_build_context_closes_database_when_schema_setup_fails(tmp_path, monkeypatch):
+    closed = []
+
+    class BrokenDatabase:
+        def __init__(self, path):
+            pass
+
+        def ensure_schema(self):
+            raise RuntimeError("schema setup failed")
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setattr(runtime, "Database", BrokenDatabase)
+    monkeypatch.setattr(runtime, "get_embedder", lambda model: SimpleNamespace())
+    settings = Settings(
+        db_path=tmp_path / "data" / "wiki.db", vault_path=tmp_path / "vault"
+    )
+
+    with pytest.raises(RuntimeError, match="schema setup failed"):
+        runtime.build_context(settings, full=False)
+
+    assert closed == [True]
 
 
 def test_time_hash_count_and_clamping_helpers():
