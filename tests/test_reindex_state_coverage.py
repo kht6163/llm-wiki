@@ -57,6 +57,42 @@ def _finish_worker(thread: threading.Thread, errors: list[BaseException]) -> Non
         raise errors[0]
 
 
+def _assert_database_connections_released(ctx) -> None:
+    """A leaked worker connection would retain the writer lock and fail this probe."""
+    with ctx.db.writer() as conn:
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def _latest_revision(ctx, doc_id: int):
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT version,body,op FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1",
+            (doc_id,),
+        ).fetchone()
+    assert row is not None
+    return (int(row["version"]), str(row["body"]), str(row["op"]))
+
+
+def test_empty_vault_reindex_finishes_without_entering_a_path_attempt(ctx):
+    report = ctx.docs.reindex_all()
+
+    assert report == {
+        "created": 0,
+        "updated": 0,
+        "renamed": 0,
+        "unchanged": 0,
+        "renames": [],
+        "retried": 0,
+        "recovered_pending": 0,
+        "missing_files": [],
+        "skipped_deleted": [],
+        "skipped_conflicts": [],
+        "embedded": 0,
+    }
+    with ctx.db.reader() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 0
+
+
 def test_postcommit_same_hash_peer_creation_preserves_rename_and_reports_identity_change(
     ctx, principals, monkeypatch: pytest.MonkeyPatch
 ):
@@ -105,9 +141,12 @@ def test_postcommit_same_hash_peer_creation_preserves_rename_and_reports_identit
     monkeypatch.setattr(ctx.db, "writer", tracked_writer)
     monkeypatch.setattr(fp, "stable_markdown_is_current", create_peer_after_rename_commit)
 
-    report = docs.reindex_all()
-
-    _finish_worker(thread, errors)
+    try:
+        report = docs.reindex_all()
+    finally:
+        start.set()
+        _finish_worker(thread, errors)
+    _assert_database_connections_released(ctx)
     assert synchronized
     assert report["renamed"] == 1
     assert report["renames"] == ["a-source.md -> z-target.md"]
@@ -118,7 +157,25 @@ def test_postcommit_same_hash_peer_creation_preserves_rename_and_reports_identit
             "attempts": 1,
         }
     ]
-    assert int(_doc(ctx, "z-target.md")["id"]) == source_id
+    renamed = _doc(ctx, "z-target.md")
+    peer = _doc(ctx, "m-new-peer.md")
+    assert (
+        int(renamed["id"]),
+        renamed["version"],
+        renamed["file_state"],
+        renamed["is_deleted"],
+    ) == (source_id, 2, "clean", 0)
+    assert (peer["version"], peer["file_state"], peer["is_deleted"]) == (1, "clean", 0)
+    assert _latest_revision(ctx, source_id) == (2, body, "rename")
+    assert _latest_revision(ctx, int(peer["id"])) == (1, body, "create")
+    with ctx.db.reader() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM documents WHERE path_norm=?", (path_norm("a-source.md"),)
+            ).fetchone()
+            is None
+        )
+    assert not (docs.vault / "a-source.md").exists()
     assert docs.get("m-new-peer.md")["content"] == body
     assert (docs.vault / "m-new-peer.md").read_text(encoding="utf-8") == body
 
@@ -171,10 +228,14 @@ def test_pending_same_hash_source_identity_change_retries_before_target_adoption
     monkeypatch.setattr(fp, "read_stable_markdown", inject_pending_after_target_read)
     monkeypatch.setattr(fp, "confirm_confined_absence", recreate_after_first_absence)
 
-    report = docs.reindex_all()
-
-    _finish_worker(pending_thread, pending_errors)
-    _finish_worker(recreate_thread, recreate_errors)
+    try:
+        report = docs.reindex_all()
+    finally:
+        pending_start.set()
+        recreate_start.set()
+        _finish_worker(pending_thread, pending_errors)
+        _finish_worker(recreate_thread, recreate_errors)
+    _assert_database_connections_released(ctx)
     assert pending_injected and source_recreated
     assert report["retried"] == 1
     assert report["created"] == 1
@@ -227,9 +288,12 @@ def test_reconcile_adopts_replacement_but_reports_failed_cleanup_owner_recovery(
 
     monkeypatch.setattr(fp, "confined_file_signature", mutate_owner_during_scan)
 
-    report = docs.reindex_all()
-
-    _finish_worker(thread, errors)
+    try:
+        report = docs.reindex_all()
+    finally:
+        start.set()
+        _finish_worker(thread, errors)
+    _assert_database_connections_released(ctx)
     assert synchronized
     assert report["created"] == 1
     assert report["skipped_conflicts"] == [
@@ -241,9 +305,30 @@ def test_reconcile_adopts_replacement_but_reports_failed_cleanup_owner_recovery(
     ]
     adopted = _doc(ctx, "a-replacement.md")
     owner = _doc(ctx, "z-owner.md")
-    assert adopted["version"] == 1
-    assert adopted["file_state"] == "clean"
-    assert owner["file_state"] == "pending"
+    assert (adopted["version"], adopted["file_state"], adopted["is_deleted"]) == (
+        1,
+        "clean",
+        0,
+    )
+    assert (owner["version"], owner["file_state"], owner["is_deleted"]) == (
+        1,
+        "pending",
+        0,
+    )
+    assert _latest_revision(ctx, int(adopted["id"])) == (
+        1,
+        "external replacement",
+        "external-reconcile",
+    )
+    assert _latest_revision(ctx, owner_id) == (1, "canonical owner", "create")
+    assert docs.get("z-owner.md")["content"] == "canonical owner"
+    with ctx.db.reader() as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (owner_id,)
+            ).fetchone()[0]
+            == 0
+        )
     assert (docs.vault / "a-replacement.md").read_text(encoding="utf-8") == ("external replacement")
     assert (docs.vault / "z-owner.md").is_dir()
 
@@ -310,12 +395,13 @@ def test_three_postcommit_generation_changes_keep_best_update_and_report_latest_
     monkeypatch.setattr(ctx.db, "writer", tracked_writer)
     monkeypatch.setattr(fp, "stable_markdown_is_current", mutate_only_after_committed_generation)
 
-    report = docs.reindex_all()
-
-    thread.join(_EVENT_TIMEOUT)
-    assert not thread.is_alive(), "external replacement worker did not terminate"
-    if errors:
-        raise errors[0]
+    try:
+        report = docs.reindex_all()
+    finally:
+        for event in triggers.values():
+            event.set()
+        _finish_worker(thread, errors)
+    _assert_database_connections_released(ctx)
     assert report["updated"] == 1
     assert report["retried"] == 2
     assert report["skipped_conflicts"] == [{"path": rel, "reason": "file_changed", "attempts": 3}]
@@ -367,9 +453,12 @@ def test_postcommit_rename_source_becoming_symlink_reports_unreadable_source(
     monkeypatch.setattr(ctx.db, "writer", tracked_writer)
     monkeypatch.setattr(fp, "stable_markdown_is_current", install_symlink_after_rename)
 
-    report = docs.reindex_all()
-
-    _finish_worker(thread, errors)
+    try:
+        report = docs.reindex_all()
+    finally:
+        start.set()
+        _finish_worker(thread, errors)
+    _assert_database_connections_released(ctx)
     assert synchronized
     assert report["renamed"] == 1
     assert report["renames"] == ["old.md -> new.md"]
@@ -377,7 +466,26 @@ def test_postcommit_rename_source_becoming_symlink_reports_unreadable_source(
         {"path": "old.md", "reason": "file_unreadable", "attempts": 3}
     ]
     current = _doc(ctx, "new.md")
-    assert (int(current["id"]), int(current["version"])) == (source_id, 2)
+    assert (
+        int(current["id"]),
+        int(current["version"]),
+        current["file_state"],
+        current["is_deleted"],
+    ) == (source_id, 2, "clean", 0)
+    assert _latest_revision(ctx, source_id) == (2, body, "rename")
+    with ctx.db.reader() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM documents WHERE path_norm=?", (path_norm("old.md"),)
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM file_projection_cleanup WHERE doc_id=?", (source_id,)
+            ).fetchone()[0]
+            == 0
+        )
     assert target.read_text(encoding="utf-8") == body
     assert old.is_symlink()
 
@@ -434,12 +542,13 @@ def test_final_missing_sweep_bounds_repeated_managed_updates_as_target_changed(
 
     monkeypatch.setattr(fp, "confined_file_signature", update_after_final_signature)
 
-    report = docs.reindex_all()
-
-    thread.join(_EVENT_TIMEOUT)
-    assert not thread.is_alive(), "managed update worker did not terminate"
-    if errors:
-        raise errors[0]
+    try:
+        report = docs.reindex_all()
+    finally:
+        for event in triggers.values():
+            event.set()
+        _finish_worker(thread, errors)
+    _assert_database_connections_released(ctx)
     assert report["missing_files"] == []
     assert report["skipped_conflicts"] == [{"path": rel, "reason": "target_changed", "attempts": 3}]
     current = _doc(ctx, rel)
