@@ -536,7 +536,16 @@ select {
 .listsort { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .listsort select { padding-block: 5px; }
 .taglist { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 10px; }
-.taglist li { display: flex; align-items: center; gap: 6px; }
+.taglist li { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.taglist .tag-row { width: 100%; }
+.tag-rename .tag-input, .tag-merge-dest .tag-input {
+  padding: 4px 8px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--bg); color: inherit; min-width: 8rem;
+}
+.tag-merge { margin-top: 1.5rem; max-width: 36rem; }
+.tag-merge-sources { list-style: none; padding: 0; margin: 0.5rem 0 1rem;
+  display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.tag-merge-dest { display: flex; flex-direction: column; gap: 4px; margin-bottom: 0.75rem; }
 
 .list-layout { display: grid; grid-template-columns: 220px 1fr; gap: 24px; }
 @media (max-width: 860px) {

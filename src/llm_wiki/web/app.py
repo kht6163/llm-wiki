@@ -73,6 +73,7 @@ from ..util import (
     clamp_int,
     content_disposition_attachment,
     normalize_client_ip,
+    normalize_rel_path,
     word_count,
 )
 from .security import (
@@ -364,8 +365,12 @@ def create_web_app(app: AppContext) -> FastAPI:
             log.exception("failed to audit rejected web write")
 
     def write_action_for_path(path: str) -> str:
-        if path == "/new":
+        if path == "/new" or path == "/broken-links/create":
             return "doc_create"
+        if path == "/tags/rename":
+            return "tag_rename"
+        if path == "/tags/merge":
+            return "tag_merge"
         if path.startswith("/trash/") and path.endswith("/restore"):
             return "doc_restore"
         if path.startswith("/trash/") and path.endswith("/purge"):
@@ -625,8 +630,43 @@ def create_web_app(app: AppContext) -> FastAPI:
                       has_prev=page > 1, has_next=offset + len(items) < total)
 
     @web.get("/tags", response_class=HTMLResponse)
-    def tags_page(request: Request, _p: Principal = Depends(require_user)):
-        return render("tags.html", request, tags=docs.tags())
+    def tags_page(request: Request, p: Principal = Depends(require_user)):
+        return render("tags.html", request, tags=docs.tags(), can_write=p.can_write)
+
+    @web.post("/tags/rename")
+    def tags_rename(request: Request, old: str = Form(...), new: str = Form(""),
+                    p: Principal = Depends(require_user)):
+        try:
+            result = docs.rename_tag(p, old, new)
+            request.session["flash"] = (
+                f"태그 이름 변경: #{result['sources'][0]} → #{result['dest']} "
+                f"({result['docs_changed']}개 문서)"
+            )
+        except WikiError as e:
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=old
+            )
+            request.session["flash"] = f"태그 이름 변경 실패: {e.message}"
+        return RedirectResponse("/tags", status_code=303)
+
+    @web.post("/tags/merge")
+    def tags_merge(request: Request, dest: str = Form(...),
+                   sources: list[str] = Form(default=[]),
+                   p: Principal = Depends(require_user)):
+        try:
+            result = docs.merge_tags(p, sources, dest)
+            src_label = ", ".join(f"#{s}" for s in result["sources"])
+            request.session["flash"] = (
+                f"태그 병합: {src_label} → #{result['dest']} "
+                f"({result['docs_changed']}개 문서)"
+            )
+        except WikiError as e:
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path),
+                target=dest,
+            )
+            request.session["flash"] = f"태그 병합 실패: {e.message}"
+        return RedirectResponse("/tags", status_code=303)
 
     @web.get("/daily")
     def daily(request: Request, p: Principal = Depends(require_user)):
@@ -687,9 +727,43 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.get("/broken-links", response_class=HTMLResponse)
     def broken_links_page(request: Request, limit: int = 500,
-                          _p: Principal = Depends(require_user)):
+                          p: Principal = Depends(require_user)):
         data = docs.broken_links(limit=clamp_int(limit, 1, 2000))
-        return render("broken_links.html", request, count=data["count"], links=data["links"])
+        return render("broken_links.html", request, count=data["count"], links=data["links"],
+                      can_write=p.can_write)
+
+    @web.post("/broken-links/create")
+    def broken_links_create(request: Request, target: str = Form(...),
+                            p: Principal = Depends(require_user)):
+        # Bare wiki names (e.g. "Ghost Note") and path-like targets both normalize
+        # to a vault-relative ``.md`` path via the shared path helper.
+        try:
+            rel = normalize_rel_path(target)
+        except PathError as e:
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=target
+            )
+            request.session["flash"] = f"문서 만들기 실패: {e}"
+            return RedirectResponse("/broken-links", status_code=303)
+        try:
+            doc = docs.create(p, rel, "", title=None)
+            request.session["flash"] = f"문서를 만들었습니다: {doc['path']}"
+            return RedirectResponse("/doc/" + quote(doc["path"]) + "/edit", status_code=303)
+        except ConflictError:
+            # Already exists (race or re-click) — open the live document instead.
+            try:
+                existing = docs.get(rel)
+                request.session["flash"] = f"이미 있는 문서입니다: {existing['path']}"
+                return RedirectResponse("/doc/" + quote(existing["path"]), status_code=303)
+            except WikiError:
+                request.session["flash"] = f"이미 있는 경로입니다: {rel}"
+                return RedirectResponse("/doc/" + quote(rel), status_code=303)
+        except WikiError as e:
+            audit_write_rejection(
+                request, p, e, action=write_action_for_path(request.url.path), target=rel
+            )
+            request.session["flash"] = f"문서 만들기 실패: {e.message}"
+            return RedirectResponse("/broken-links", status_code=303)
 
     @web.get("/trash", response_class=HTMLResponse)
     def trash_page(request: Request, p: Principal = Depends(require_user)):

@@ -12,7 +12,13 @@
   </div>
 {% else %}
 <table class="broken">
-  <thead><tr><th scope="col">출처 문서</th><th scope="col">가리키는 대상</th><th scope="col">형식</th><th scope="col">원본</th></tr></thead>
+  <thead><tr>
+    <th scope="col">출처 문서</th>
+    <th scope="col">가리키는 대상</th>
+    <th scope="col">형식</th>
+    <th scope="col">원본</th>
+    {% if can_write %}<th scope="col">작업</th>{% endif %}
+  </tr></thead>
   <tbody>
   {% for l in links %}
     <tr>
@@ -20,6 +26,15 @@
       <td data-label="대상">{{ l.target }}{% if l.anchor %}<span class="muted">#{{ l.anchor }}</span>{% endif %}</td>
       <td data-label="형식" class="muted">{{ l.link_type }}</td>
       <td data-label="원본"><code>{{ l.raw }}</code></td>
+      {% if can_write %}
+      <td data-label="작업">
+        <form method="post" action="/broken-links/create" class="inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="target" value="{{ l.target }}">
+          <button type="submit" class="ghost">{{ icon("file-plus") }} 문서 만들기</button>
+        </form>
+      </td>
+      {% endif %}
     </tr>
   {% endfor %}
   </tbody>
