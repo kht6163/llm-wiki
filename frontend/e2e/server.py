@@ -91,6 +91,23 @@ def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
     admin = Principal(user_id, "admin", "admin")
     docs.create(admin, "start.md", "# 시작 안내\n\n키보드 탐색 기준 문서")
     docs.create(admin, "conflict.md", "# 충돌 문서\n\n최초 본문")
+    for index in range(1, 6):
+        docs.create(
+            admin,
+            f"e2e-search/ranked-{index:02}.md",
+            f"# 검색 워크벤치 {index:02}\n\nworkbenchneedle deterministic result {index:02}",
+            title=f"검색 워크벤치 {index:02}",
+            tags=["release", "todo"],
+            embed=False,
+        )
+    docs.create(
+        admin,
+        "e2e-search/excluded.md",
+        "# 검색 워크벤치 제외\n\nworkbenchneedle excluded result",
+        title="검색 워크벤치 제외",
+        tags=["release"],
+        embed=False,
+    )
     web = create_web_app(
         AppContext(
             settings=settings,
