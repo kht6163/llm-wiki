@@ -885,6 +885,28 @@ def test_purge_revalidates_intent_and_cleanup_between_writer_phases(
     monkeypatch.setattr(docs, "_process_purge_cleanup_batch", original_batch)
 
 
+def test_finish_purge_without_intent_reports_live_and_missing_documents(ctx, principals):
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "purge-intent-absent.md", "canonical", embed=False)
+    with ctx.db.reader() as conn:
+        doc_id = int(
+            conn.execute(
+                "SELECT id FROM documents WHERE path_norm=?",
+                (path_norm("purge-intent-absent.md"),),
+            ).fetchone()["id"]
+        )
+
+    live = docs._finish_purge(doc_id)
+    missing = docs._finish_purge(doc_id + 1_000_000)
+
+    assert (live.path, live.settled, live.reason) == (
+        "purge-intent-absent.md",
+        False,
+        "purge_intent_missing",
+    )
+    assert (missing.path, missing.settled, missing.reason) == (None, True, "missing")
+
+
 def test_purge_ignores_obsolete_cleanup_issue_when_no_cleanup_remains(
     ctx, principals, monkeypatch
 ):
