@@ -89,6 +89,18 @@ test("반복 태그와 검색 모드가 안정적인 다음·이전 페이지와
   await page.getByRole("link", { name: "이전" }).click();
   expect(await resultTitles(page)).toEqual(firstPage);
 
+  const allTitles = [...firstPage];
+  while (await page.getByRole("link", { name: "다음" }).count()) {
+    await page.getByRole("link", { name: "다음" }).click();
+    expect(new URL(page.url()).searchParams.getAll("tag")).toEqual(["release", "todo", "release"]);
+    allTitles.push(...await resultTitles(page));
+  }
+  expect(allTitles.sort()).toEqual([
+    "검색 워크벤치 01", "검색 워크벤치 02", "검색 워크벤치 03",
+    "검색 워크벤치 04", "검색 워크벤치 05",
+  ]);
+  expect(allTitles).not.toContain("검색 워크벤치 제외");
+
   const releaseChips = page.getByRole("button", { name: "필터 제거: tag:release", exact: true });
   await expect(releaseChips).toHaveCount(4);
   await releaseChips.nth(1).click();
