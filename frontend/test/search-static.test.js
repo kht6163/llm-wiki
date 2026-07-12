@@ -84,6 +84,43 @@ describe("search.js", () => {
     expect(form.requestSubmit).toHaveBeenCalledOnce();
   });
 
+  test("skips empty quoted and malformed bare operators before a valid filter", async () => {
+    page();
+    const form = document.querySelector("form");
+    form.elements.q.value = 'needle title:"" path: has:"   " tag:release tag:todo tag:release tail';
+    form.requestSubmit = vi.fn();
+    document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "0";
+    await loadStatic("search");
+
+    document.querySelector('[data-remove-filter="query"]').click();
+
+    expect(form.elements.q.value).toBe(
+      'needle title:"" path: has:"   " tag:todo tag:release tail',
+    );
+    expect(form.requestSubmit).toHaveBeenCalledOnce();
+  });
+
+  test("removes the exact duplicate after empty operators between valid filters", async () => {
+    page();
+    const form = document.querySelector("form");
+    form.elements.q.value = 'needle tag:release title:"  " tag:todo title: tag:release tail';
+    form.requestSubmit = vi.fn();
+    document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "2";
+    await loadStatic("search");
+
+    document.querySelector('[data-remove-filter="query"]').click();
+
+    expect(form.elements.q.value).toBe(
+      'needle tag:release title:"  " tag:todo title: tail',
+    );
+    expect(form.elements.mode.value).toBe("bm25");
+    expect(form.elements.folder.value).toBe("notes");
+    expect([...form.querySelectorAll('[name="tag"]')]).toHaveLength(3);
+    expect(form.elements.page.value).toBe("1");
+    expect(form.elements.per_page.value).toBe("10");
+    expect(form.requestSubmit).toHaveBeenCalledOnce();
+  });
+
   test("removes one repeated request tag without changing query or other state", async () => {
     page();
     const form = document.querySelector("form");

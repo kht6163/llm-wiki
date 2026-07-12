@@ -15,7 +15,11 @@
     var pattern = /\b(title|path|tag|has):("(?:[^"\\]|\\.)*"|\S+)/g;
     var tokens = [];
     var match;
-    while ((match = pattern.exec(query)) !== null) tokens.push({ start: match.index, end: pattern.lastIndex });
+    while ((match = pattern.exec(query)) !== null) {
+      var raw = match[2];
+      var value = raw.startsWith('"') ? raw.slice(1, -1).replace(/\\"/g, '"').trim() : raw.trim();
+      if (value) tokens.push({ start: match.index, end: pattern.lastIndex });
+    }
     return tokens;
   }
 

@@ -268,6 +268,9 @@ def test_search_workbench_css_uses_tokens_and_860px_structural_mobile_rules():
     assert "@media (max-width: 860px)" in workbench
     assert ".searchform" in workbench and "grid-template-columns: 1fr" in workbench
     assert ".result-head .path { margin-left: auto; min-width: 0;" in workbench
+    assert ".results .title { font-weight: 650; min-width: 0;" in workbench
+    assert ".search-help { width: 100%; }" in workbench
+    assert ".search-help dl { position: static; width: 100%; max-width: 100%;" in workbench
     assert "prefers-reduced-motion" in css
 
 

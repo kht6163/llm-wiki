@@ -437,7 +437,7 @@ select {
 .results { list-style: none; padding: 0; margin-top: 4px; }
 .results > li { padding: 9px 0; border-bottom: 1px solid var(--line); }
 .result-head { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
-.results .title { font-weight: 650; line-height: 1.35; }
+.results .title { font-weight: 650; min-width: 0; line-height: 1.35; overflow-wrap: anywhere; }
 .result-head .path { margin-left: auto; min-width: 0; text-align: right; overflow-wrap: anywhere; }
 .results .snippet { color: var(--fg-muted); margin-top: 2px; font-size: 0.88em;
   line-height: 1.5; overflow-wrap: anywhere; }
@@ -527,6 +527,8 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
    from `data-label`, so meaning survives the loss of the header row. */
 @media (max-width: 860px) {
   .search-head { align-items: stretch; flex-wrap: wrap; }
+  .search-help { width: 100%; }
+  .search-help dl { position: static; width: 100%; max-width: 100%; }
   .searchform { grid-template-columns: 1fr; }
   .searchform button { justify-self: start; }
   .result-metadata-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
