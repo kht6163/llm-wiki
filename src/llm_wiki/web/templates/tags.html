@@ -9,10 +9,50 @@
     <p class="empty-title">아직 태그가 없습니다</p>
     <p class="empty-text">문서 프런트매터에 태그를 추가하면 여기 모입니다.</p>
   </div>
-{% endif %}
+{% else %}
 <ul class="taglist">
   {% for t in tags %}
-    <li><a class="tag" href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }}</a> <span class="muted count">{{ t.count }}</span></li>
+    <li class="tag-row">
+      <a class="tag" href="/?tag={{ t.tag|urlpath }}">#{{ t.tag }}</a>
+      <span class="muted count">{{ t.count }}</span>
+      {% if can_write %}
+      <form method="post" action="/tags/rename" class="inline tag-rename">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="old" value="{{ t.tag }}">
+        <input type="text" name="new" class="tag-input" placeholder="새 이름" aria-label="태그 {{ t.tag }} 새 이름" required>
+        <button type="submit" class="ghost">이름 변경</button>
+      </form>
+      {% endif %}
+    </li>
   {% endfor %}
 </ul>
+
+{% if can_write and tags|length >= 1 %}
+<section class="tag-merge" aria-label="태그 병합">
+  <h2>태그 병합</h2>
+  <p class="muted">선택한 소스 태그를 대상 태그로 합칩니다. 각 문서의 프런트매터 태그가 갱신됩니다.</p>
+  <form method="post" action="/tags/merge" class="tag-merge-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <fieldset>
+      <legend>소스 태그</legend>
+      <ul class="tag-merge-sources">
+        {% for t in tags %}
+        <li>
+          <label>
+            <input type="checkbox" name="sources" value="{{ t.tag }}">
+            #{{ t.tag }} <span class="muted count">{{ t.count }}</span>
+          </label>
+        </li>
+        {% endfor %}
+      </ul>
+    </fieldset>
+    <label class="tag-merge-dest">
+      대상 태그
+      <input type="text" name="dest" class="tag-input" placeholder="예: in-progress" required>
+    </label>
+    <button type="submit">병합</button>
+  </form>
+</section>
+{% endif %}
+{% endif %}
 {% endblock %}
