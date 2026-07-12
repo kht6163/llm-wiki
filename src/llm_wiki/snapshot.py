@@ -55,7 +55,9 @@ class RestoreReport:
     def finalize(self, *, release_lock: bool = True) -> tuple[Path, ...]:
         """Commit a pending restore by removing the retained original targets."""
         if self._journal is not None:
-            self.backup_cleanup_warnings = self._journal.finalize()
+            self.backup_cleanup_warnings = self._journal.finalize(
+                release_lock=release_lock
+            )
             self._journal = None
         return self.backup_cleanup_warnings
 
@@ -662,6 +664,29 @@ def restore_journal_path(db_path: Path) -> Path:
     return db_path.with_name(f".{db_path.name}.restore-journal.json")
 
 
+def validate_restore_layout(db_path: Path, vault: Path) -> None:
+    """Reject layouts where replacing the vault can consume database machinery."""
+    db_path, vault = Path(db_path), Path(vault)
+    resolved_vault = vault.resolve(strict=False)
+    database_paths = (
+        db_path,
+        Path(f"{db_path}-wal"),
+        Path(f"{db_path}-shm"),
+        restore_journal_path(db_path),
+        db_path.parent / ".llm-wiki.lock",
+    )
+    for candidate in database_paths:
+        resolved = candidate.resolve(strict=False)
+        if (
+            resolved == resolved_vault
+            or resolved_vault in resolved.parents
+            or resolved in resolved_vault.parents
+        ):
+            raise ValueError(
+                "database and vault paths overlap; choose separate sibling locations"
+            )
+
+
 def _fsync_directory(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -690,18 +715,26 @@ def _fsync_staging(staged_db: Path, staged_vault: Path) -> None:
         _fsync_directory(directory)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RestoreTarget:
     target: Path
     backup: Path
     had_original: bool
+    backup_identity: tuple[int, int, int] | None = None
+    target_identity: tuple[int, int, int] | None = None
 
     @property
-    def serialized(self) -> dict[str, str | bool]:
+    def serialized(self) -> dict[str, object]:
         return {
             "target": str(self.target),
             "backup": str(self.backup),
             "had_original": self.had_original,
+            "backup_identity": list(self.backup_identity)
+            if self.backup_identity is not None
+            else None,
+            "target_identity": list(self.target_identity)
+            if self.target_identity is not None
+            else None,
         }
 
 
@@ -750,9 +783,51 @@ class _RestoreJournal:
         self.path.unlink(missing_ok=True)
         _fsync_directory(self.path.parent)
 
+    @staticmethod
+    def _visible(path: Path) -> os.stat_result | None:
+        try:
+            return os.lstat(path)
+        except FileNotFoundError:
+            return None
+
+    def _validate_paths(self) -> None:
+        vault_target = self.replacement_targets[-1]
+        for item in self.targets:
+            visible_target = self._visible(item.target)
+            if visible_target is not None and stat.S_ISLNK(visible_target.st_mode):
+                raise ValueError(f"restore live target must not be a symlink: {item.target}")
+            if (
+                visible_target is not None
+                and self.state in {"publishing", "pending", "finalizing"}
+                and item.target_identity is not None
+                and (
+                    visible_target.st_dev,
+                    visible_target.st_ino,
+                    stat.S_IFMT(visible_target.st_mode),
+                )
+                != item.target_identity
+            ):
+                raise ValueError(f"restore live target identity changed: {item.target}")
+            visible_backup = self._visible(item.backup)
+            if visible_backup is None:
+                continue
+            if stat.S_ISLNK(visible_backup.st_mode):
+                raise ValueError(f"restore backup must not be a symlink: {item.backup}")
+            expected_type = stat.S_ISDIR if item.target == vault_target else stat.S_ISREG
+            if not expected_type(visible_backup.st_mode):
+                raise ValueError(f"restore backup has an invalid type: {item.backup}")
+            identity = (
+                visible_backup.st_dev,
+                visible_backup.st_ino,
+                stat.S_IFMT(visible_backup.st_mode),
+            )
+            if item.backup_identity is not None and identity != item.backup_identity:
+                raise ValueError(f"restore backup identity changed: {item.backup}")
+
     def _rollback_files(self) -> list[OSError]:
         rollback_errors: list[OSError] = []
         prior_state = self.state
+        self._validate_paths()
         if prior_state in {"publishing", "pending"}:
             missing = [
                 item.backup
@@ -761,6 +836,21 @@ class _RestoreJournal:
             ]
             if missing:
                 return [OSError(f"restore backup is missing: {missing[0]}")]
+        if prior_state == "rolling_back":
+            missing_both = [
+                item.target
+                for item in self.targets
+                if item.had_original
+                and self._visible(item.target) is None
+                and self._visible(item.backup) is None
+            ]
+            if missing_both:
+                return [
+                    OSError(
+                        "restore target and backup are both missing: "
+                        f"{missing_both[0]}"
+                    )
+                ]
         try:
             self.persist("rolling_back")
         except OSError as exc:
@@ -810,6 +900,7 @@ class _RestoreJournal:
     def finalize(self, *, release_lock: bool = True) -> tuple[Path, ...]:
         cleanup_warnings: list[Path] = []
         try:
+            self._validate_paths()
             self.persist("finalizing")
             for _, backup in self.original_targets:
                 try:
@@ -824,16 +915,55 @@ class _RestoreJournal:
         return tuple(cleanup_warnings)
 
 
+def _read_restore_journal(path: Path) -> bytes | None:
+    try:
+        visible = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
+        raise ValueError(f"restore journal must be a regular file: {path}")
+    fd = -1
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or _stat_identity(visible) != _stat_identity(
+            before
+        ):
+            raise ValueError(f"restore journal must be a stable regular file: {path}")
+        if before.st_size > MAX_SNAPSHOT_MANIFEST_BYTES:
+            raise ValueError("restore journal is too large")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(fd, min(_COPY_CHUNK_SIZE, MAX_SNAPSHOT_MANIFEST_BYTES + 1)):
+            size += len(chunk)
+            if size > MAX_SNAPSHOT_MANIFEST_BYTES:
+                raise ValueError("restore journal is too large")
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if _stat_identity(before) != _stat_identity(after):
+            raise ValueError(f"restore journal changed while reading: {path}")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ValueError(f"restore journal must be a stable regular file: {path}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def _load_restore_journal(
     db_path: Path, vault: Path, process_lock: ProjectLock
 ) -> _RestoreJournal | None:
     path = restore_journal_path(db_path)
-    if not path.exists():
+    raw = _read_restore_journal(path)
+    if raw is None:
         return None
     try:
-        raw = path.read_bytes()
-        if len(raw) > MAX_SNAPSHOT_MANIFEST_BYTES:
-            raise ValueError("restore journal is too large")
         data = json.loads(raw)
     except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as exc:
         raise ValueError(f"invalid restore journal: {path}") from exc
@@ -861,14 +991,40 @@ def _load_restore_journal(
         target = Path(str(raw_target.get("target")))
         backup = Path(str(raw_target.get("backup")))
         had_original = raw_target.get("had_original")
+        raw_identity = raw_target.get("backup_identity")
+        backup_identity = (
+            tuple(raw_identity)
+            if isinstance(raw_identity, list)
+            and len(raw_identity) == 3
+            and all(isinstance(value, int) for value in raw_identity)
+            else None
+        )
+        raw_target_identity = raw_target.get("target_identity")
+        target_identity = (
+            tuple(raw_target_identity)
+            if isinstance(raw_target_identity, list)
+            and len(raw_target_identity) == 3
+            and all(isinstance(value, int) for value in raw_target_identity)
+            else None
+        )
         if (
             target != expected
             or backup.parent != expected.parent
             or not backup.name.startswith(f".{expected.name}.restore-backup-")
             or not isinstance(had_original, bool)
+            or (raw_identity is not None and backup_identity is None)
+            or (raw_target_identity is not None and target_identity is None)
         ):
             raise ValueError(f"invalid restore journal: {path}")
-        targets.append(_RestoreTarget(target, backup, had_original))
+        targets.append(
+            _RestoreTarget(
+                target,
+                backup,
+                had_original,
+                backup_identity,
+                target_identity,
+            )
+        )
     return _RestoreJournal(
         tuple(targets),
         expected_targets,
@@ -929,6 +1085,13 @@ def _publish_restore(
         _RestoreTarget(target, _backup_name(target), target.exists() or target.is_symlink())
         for target in targets
     )
+    for record, staged in ((records[0], staged_db), (records[3], staged_vault)):
+        visible = os.lstat(staged)
+        record.target_identity = (
+            visible.st_dev,
+            visible.st_ino,
+            stat.S_IFMT(visible.st_mode),
+        )
     restore_journal = _RestoreJournal(
         records,
         targets,
@@ -941,6 +1104,12 @@ def _publish_restore(
         for item in records:
             if item.had_original:
                 os.replace(item.target, item.backup)
+                visible = os.lstat(item.backup)
+                item.backup_identity = (
+                    visible.st_dev,
+                    visible.st_ino,
+                    stat.S_IFMT(visible.st_mode),
+                )
         for parent in {item.target.parent for item in records}:
             _fsync_directory(parent)
         restore_journal.persist("publishing")
@@ -963,6 +1132,7 @@ def restore_snapshot(
 ) -> RestoreReport:
     """Validate a snapshot in sibling staging paths, then replace live targets."""
     src, db_path, vault = Path(src), Path(db_path), Path(vault)
+    validate_restore_layout(db_path, vault)
     process_lock = ProjectLock(db_path).acquire()
     staged_db: Path | None = None
     try:

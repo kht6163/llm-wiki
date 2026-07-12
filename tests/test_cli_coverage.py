@@ -13,6 +13,7 @@ import pytest
 from starlette.applications import Starlette
 
 from llm_wiki import _cli_impl
+from llm_wiki import snapshot as snapshot_writer
 from llm_wiki.config import ConfigError, Settings
 from llm_wiki.process_lock import ProjectLock, ProjectLockError
 from llm_wiki.services.errors import WikiError
@@ -562,6 +563,44 @@ def test_serve_holds_the_same_project_lock_used_by_restore(monkeypatch, tmp_path
 
     assert _cli_impl._serve(NS()) == 0
     assert observed == [True]
+
+
+def test_serve_rejects_database_inside_vault_before_lock_creation(
+    monkeypatch, tmp_path, capsys
+):
+    vault = tmp_path / "vault"
+    settings = NS(db_path=vault / "data" / "wiki.db", vault_path=vault)
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "_apply_serve_overrides", lambda value, args: value)
+
+    assert _cli_impl._serve(NS()) == 1
+    assert "overlap" in capsys.readouterr().out
+    assert not (settings.db_path.parent / ".llm-wiki.lock").exists()
+
+
+def test_serve_reports_startup_recovery_io_failure(monkeypatch, tmp_path, capsys):
+    settings = NS(
+        db_path=tmp_path / "data" / "wiki.db", vault_path=tmp_path / "vault"
+    )
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "_apply_serve_overrides", lambda value, args: value)
+    monkeypatch.setattr(
+        _cli_impl,
+        "_recover_pending_restore",
+        lambda *args: (_ for _ in ()).throw(OSError("journal fsync failed")),
+    )
+
+    assert _cli_impl._serve(NS()) == 1
+    assert "serve failed: journal fsync failed" in capsys.readouterr().out
+
+
+def test_restore_report_finalize_forwards_lock_release_choice():
+    observed = []
+    journal = NS(finalize=lambda **kwargs: observed.append(kwargs) or ())
+    report = snapshot_writer.RestoreReport(1, 0, _journal=journal)
+
+    assert report.finalize(release_lock=False) == ()
+    assert observed == [{"release_lock": False}]
 
 
 def test_restore_and_serve_report_project_lock_contention(monkeypatch, tmp_path, capsys):

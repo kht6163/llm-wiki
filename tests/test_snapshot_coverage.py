@@ -7,6 +7,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -464,6 +465,48 @@ def test_restore_rejects_symlink_archive(tmp_path):
         snapshot.restore_snapshot(
             archive, tmp_path / "link.db", tmp_path / "link-vault", force=False
         )
+
+
+@pytest.mark.parametrize("layout", ["db-in-vault", "vault-in-db", "symlink-db-in-vault"])
+def test_restore_rejects_overlapping_targets_before_creating_artifacts(
+    snapshot_source, tmp_path, layout
+):
+    _, archive = snapshot_source
+    root = tmp_path / layout
+    root.mkdir()
+    if layout == "db-in-vault":
+        vault = root / "vault"
+        db_path = vault / "data" / "wiki.db"
+    elif layout == "vault-in-db":
+        db_path = root / "database-root"
+        vault = db_path / "vault"
+    else:
+        vault = root / "vault"
+        (vault / "data").mkdir(parents=True)
+        db_parent = root / "db-link"
+        db_parent.symlink_to(vault / "data", target_is_directory=True)
+        db_path = db_parent / "wiki.db"
+    if layout == "vault-in-db":
+        vault.mkdir(parents=True, exist_ok=True)
+    else:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db_path.write_bytes(b"original database")
+        vault.mkdir(parents=True, exist_ok=True)
+    (vault / "original.txt").write_text("original vault")
+    before = _tree_snapshot(root)
+
+    with pytest.raises(ValueError, match="overlap"):
+        snapshot.restore_snapshot(archive, db_path, vault, force=True)
+
+    assert _tree_snapshot(root) == before
+    assert not snapshot.restore_journal_path(db_path).exists()
+    assert not (db_path.parent / ".llm-wiki.lock").exists()
+    assert _restore_artifacts(db_path, vault) == set()
+
+
+def test_restore_layout_allows_adjacent_database_and_vault(tmp_path):
+    root = tmp_path / "adjacent"
+    snapshot.validate_restore_layout(root / "wiki.db", root / "vault")
 
 
 def test_restore_passes_stable_archive_descriptor_to_tarfile(
@@ -1001,6 +1044,225 @@ def test_recovery_reports_missing_backup(snapshot_source, tmp_path):
 
     with pytest.raises(snapshot.RestoreRollbackError, match="rollback could not complete"):
         snapshot.recover_pending_restore(db_path, vault)
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+def test_recovery_rejects_fifo_journal_before_read(tmp_path, monkeypatch):
+    db_path = tmp_path / "fifo-journal" / "wiki.db"
+    vault = tmp_path / "fifo-journal-vault"
+    db_path.parent.mkdir(parents=True)
+    journal = snapshot.restore_journal_path(db_path)
+    os.mkfifo(journal)
+    real_read_bytes = Path.read_bytes
+
+    def reject_fifo_read(path):
+        if path == journal:
+            raise AssertionError("FIFO journal reached Path.read_bytes")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_fifo_read)
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
+def test_recovery_rejects_symlink_journal(tmp_path):
+    db_path = tmp_path / "link-journal" / "wiki.db"
+    vault = tmp_path / "link-journal-vault"
+    db_path.parent.mkdir(parents=True)
+    external = tmp_path / "external-journal.json"
+    external.write_text("{}")
+    snapshot.restore_journal_path(db_path).symlink_to(external)
+
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
+def test_recovery_rejects_backup_replaced_by_symlink_without_touching_live_target(
+    snapshot_source, tmp_path
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "backup-link" / "wiki.db"
+    vault = tmp_path / "backup-link-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original database")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    backup = next(
+        item.backup for item in pending._journal.targets if item.target == db_path
+    )
+    backup.unlink()
+    external = tmp_path / "external-database"
+    external.write_bytes(b"external must remain untouched")
+    backup.symlink_to(external)
+    replacement = db_path.read_bytes()
+    pending._journal.process_lock.release()
+
+    with pytest.raises(ValueError, match="backup.*symlink|identity"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+    assert not db_path.is_symlink()
+    assert db_path.read_bytes() == replacement
+    assert external.read_bytes() == b"external must remain untouched"
+    assert snapshot.restore_journal_path(db_path).exists()
+
+
+def test_recovery_rejects_live_target_identity_change_without_deleting_it(
+    snapshot_source, tmp_path
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "live-identity" / "wiki.db"
+    vault = tmp_path / "live-identity-vault"
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=False)
+    assert pending._journal is not None
+    replacement = b"operator replacement must remain"
+    swapped = db_path.with_name("swapped.db")
+    swapped.write_bytes(replacement)
+    os.replace(swapped, db_path)
+    pending._journal.process_lock.release()
+
+    with pytest.raises(ValueError, match="live target identity changed"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+    assert db_path.read_bytes() == replacement
+    assert snapshot.restore_journal_path(db_path).exists()
+
+
+def test_recovery_preserves_journal_when_rolling_back_target_and_backup_are_missing(
+    snapshot_source, tmp_path
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "missing-both" / "wiki.db"
+    vault = tmp_path / "missing-both-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original database")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    record = next(
+        item for item in pending._journal.targets if item.target == db_path
+    )
+    pending._journal.persist("rolling_back")
+    db_path.unlink()
+    record.backup.unlink()
+    pending._journal.process_lock.release()
+
+    with pytest.raises(snapshot.RestoreRollbackError, match="rollback could not complete"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+    assert snapshot.restore_journal_path(db_path).exists()
+
+
+def test_restore_journal_rejects_live_symlink_invalid_backup_type_and_identity(
+    tmp_path,
+):
+    external = tmp_path / "external"
+    external.write_bytes(b"external")
+
+    live_link = _coverage_restore_journal(tmp_path / "live-link")
+    live_link.targets[0].target.symlink_to(external)
+    with pytest.raises(ValueError, match="live target.*symlink"):
+        live_link._validate_paths()
+    live_link.process_lock.release()
+
+    bad_type = _coverage_restore_journal(tmp_path / "bad-type")
+    bad_type.targets[0].backup.mkdir()
+    with pytest.raises(ValueError, match="invalid type"):
+        bad_type._validate_paths()
+    bad_type.process_lock.release()
+
+    changed = _coverage_restore_journal(tmp_path / "changed")
+    changed.targets[0].backup.write_bytes(b"replacement backup")
+    changed.targets[0].backup_identity = (0, 0, stat.S_IFREG)
+    with pytest.raises(ValueError, match="identity changed"):
+        changed._validate_paths()
+    changed.process_lock.release()
+
+
+def test_rolling_back_with_restored_target_and_missing_backup_can_finish(tmp_path):
+    journal = _coverage_restore_journal(tmp_path, state="rolling_back")
+    record = journal.targets[0]
+    record.had_original = True
+    record.target.parent.mkdir(parents=True, exist_ok=True)
+    record.target.write_bytes(b"already restored")
+
+    assert journal._rollback_files() == []
+    assert not journal.path.exists()
+    journal.process_lock.release()
+
+
+def test_stable_journal_descriptor_identity_size_mutation_and_open_failures(
+    tmp_path, monkeypatch
+):
+    journal = tmp_path / "journal.json"
+    journal.write_bytes(b"{}")
+    visible = os.lstat(journal)
+    real_fstat = snapshot.os.fstat
+    real_open = snapshot.os.open
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fstat",
+        lambda fd: SimpleNamespace(
+            st_mode=visible.st_mode,
+            st_dev=visible.st_dev,
+            st_ino=visible.st_ino + 1,
+            st_size=visible.st_size,
+            st_mtime_ns=visible.st_mtime_ns,
+            st_ctime_ns=visible.st_ctime_ns,
+        ),
+    )
+    with pytest.raises(ValueError, match="stable regular file"):
+        snapshot._read_restore_journal(journal)
+
+    calls = 0
+
+    def changed_after_read(fd):
+        nonlocal calls
+        calls += 1
+        result = real_fstat(fd)
+        if calls == 2:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_size=result.st_size + 1,
+                st_mtime_ns=result.st_mtime_ns,
+                st_ctime_ns=result.st_ctime_ns,
+            )
+        return result
+
+    monkeypatch.setattr(snapshot.os, "fstat", changed_after_read)
+    with pytest.raises(ValueError, match="changed while reading"):
+        snapshot._read_restore_journal(journal)
+
+    monkeypatch.setattr(snapshot.os, "fstat", real_fstat)
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MANIFEST_BYTES", 1)
+    real_read = snapshot.os.read
+    bounded_visible = SimpleNamespace(
+        st_mode=visible.st_mode,
+        st_dev=visible.st_dev,
+        st_ino=visible.st_ino,
+        st_size=1,
+        st_mtime_ns=visible.st_mtime_ns,
+        st_ctime_ns=visible.st_ctime_ns,
+    )
+    monkeypatch.setattr(snapshot.os, "lstat", lambda path: bounded_visible)
+    monkeypatch.setattr(snapshot.os, "fstat", lambda fd: bounded_visible)
+    monkeypatch.setattr(
+        snapshot.os,
+        "read",
+        lambda fd, size: real_read(fd, 2),
+    )
+    with pytest.raises(ValueError, match="too large"):
+        snapshot._read_restore_journal(journal)
+
+    monkeypatch.setattr(snapshot.os, "open", real_open)
+    monkeypatch.setattr(
+        snapshot.os,
+        "open",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open failed")),
+    )
+    with pytest.raises(ValueError, match="stable regular file"):
+        snapshot._read_restore_journal(journal)
 
 
 def test_restore_reports_published_target_removal_failure_and_preserves_originals(

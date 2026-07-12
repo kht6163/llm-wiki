@@ -23,7 +23,12 @@ from .services import audit
 from .services import users as users_svc
 from .services.auth import Principal, create_api_key, create_user
 from .services.errors import WikiError
-from .snapshot import _recover_pending_restore, restore_snapshot, write_snapshot
+from .snapshot import (
+    _recover_pending_restore,
+    restore_snapshot,
+    validate_restore_layout,
+    write_snapshot,
+)
 from .web import create_web_app
 from .web.security import RequestBodyLimitMiddleware
 
@@ -582,6 +587,7 @@ def _create_mcp_http_app(ctx):
 def _serve(args) -> int:
     settings = _apply_serve_overrides(get_settings(), args)
     try:
+        validate_restore_layout(Path(settings.db_path), Path(settings.vault_path))
         with ProjectLock(settings.db_path) as process_lock:
             recovery = _recover_pending_restore(
                 Path(settings.db_path), Path(settings.vault_path), process_lock
@@ -589,7 +595,7 @@ def _serve(args) -> int:
             if recovery:
                 print(f"Recovered interrupted restore ({recovery}).")
             return _serve_locked(args, settings)
-    except ProjectLockError as exc:
+    except (ProjectLockError, OSError, ValueError) as exc:
         print(f"serve failed: {exc}")
         return 1
 
