@@ -11,6 +11,7 @@
   <strong>{{ icon("alert-triangle") }} 충돌로 거부됨.</strong>
   다른 변경(현재 <b>v{{ conflict.current_version }}</b>{% if conflict.updated_by %}, {{ conflict.updated_by }}{% endif %})이 먼저 적용되었습니다.
   아래 차이를 확인해 병합한 뒤 다시 저장하세요. (base_version은 v{{ conflict.current_version }}로 갱신됨)
+  <p id="merge-error" role="alert" hidden></p>
   {% if merge_preview.manual_only %}
   <p><strong>자동 병합할 수 없어 수동 복구가 필요합니다.</strong>
     병합에 필요한 문서 상태를 확인할 수 없습니다. 내 편집과 마지막으로 확인한 서버 내용을 직접 비교하세요.</p>
@@ -108,7 +109,7 @@
   <div id="md-editor-mount"></div>
   <div class="form-actions">
     <button type="submit" class="primary" data-merge-save
-            {% if conflict and not merge_preview.manual_only %}aria-describedby="merge-save-help" disabled{% elif not can_write %}disabled{% endif %}>저장</button>
+            {% if conflict and not merge_preview.manual_only %}aria-describedby="merge-save-help merge-error" disabled{% elif not can_write %}disabled{% endif %}>저장</button>
     {% if not is_new %}<a href="/doc/{{ path|urlpath }}" id="cancel-edit">취소</a>{% endif %}
   </div>
   {% if conflict and not merge_preview.manual_only %}

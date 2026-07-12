@@ -10,7 +10,7 @@ import socket
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 
 from llm_wiki.config import Settings
 from llm_wiki.db import Database
@@ -100,7 +100,7 @@ def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
         "merge-overlap.md",
         "top\r\nalpha\r\nkeep-a\r\nbeta\r\nkeep-b\r\ngamma\r\nbottom\r\n",
     )
-    docs.create(admin, "merge-repeat.md", "top\r\nshared\r\nbottom\r\n")
+    docs.create(admin, "merge-repeat.md", "top\r\nshared")
     for index in range(1, 6):
         docs.create(
             admin,
@@ -127,6 +127,19 @@ def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
             events=events,
         )
     )
+
+    @web.get("/__e2e__/vault/{path:path}")
+    def exact_vault_bytes(path: str) -> Response:
+        vault = settings.vault_path.resolve()
+        target = (vault / path).resolve()
+        try:
+            target.relative_to(vault)
+        except ValueError:
+            return Response(status_code=404)
+        if not target.is_file():
+            return Response(status_code=404)
+        return Response(target.read_bytes(), media_type="application/octet-stream")
+
     web.state.e2e_db = db
     return web
 

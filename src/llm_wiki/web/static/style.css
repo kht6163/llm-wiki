@@ -124,6 +124,8 @@ h1 { font-size: 1.6em; text-wrap: balance; }
    controls resolve a hunk. */
 #merge-progress { margin: 10px 0 6px; color: var(--fg-muted); font-family: var(--font-mono);
   font-size: 0.82em; font-variant-numeric: tabular-nums; }
+#merge-error:not([hidden]) { padding: 8px 10px; color: var(--fg); background: var(--danger-soft);
+  border: 1px solid color-mix(in srgb, var(--danger) 38%, transparent); border-radius: var(--r-sm); }
 .merge-conflicts { display: grid; gap: 10px; margin-top: 8px; }
 .merge-conflict { min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line-strong);
   border-radius: var(--r-md); background: var(--bg); transition: border-color var(--t-fast) var(--ease); }
@@ -300,6 +302,8 @@ mark { background: color-mix(in srgb, var(--warn) 32%, transparent); color: var(
 .editform { display: flex; flex-direction: column; gap: 10px; }
 .editform label { display: flex; flex-direction: column; gap: 4px; font-size: 0.9em; }
 .editform input[type=text], .editform input { padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.editform > #editor:not([hidden]) { width: 100%; min-height: 50vh; resize: vertical;
+  font-family: var(--font-mono); line-height: 1.55; }
 
 /* New-document location: a folder field + a name field with a static `.md` unit, plus
    a monospace preview of the resulting path. The user names the doc; the location is

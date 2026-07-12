@@ -26,10 +26,14 @@ async function session(browser) {
   return { context, page };
 }
 
-async function raw(page, path) {
-  const response = await page.request.get(`/doc/${path}/raw`);
-  expect(response.ok()).toBeTruthy();
-  return (await response.text()).replaceAll("\r\n", "\n");
+async function expectExactPersisted(page, path, expected) {
+  const raw = await page.request.get(`/doc/${path}/raw`);
+  const vault = await page.request.get(`/__e2e__/vault/${path}`);
+  expect(raw.ok()).toBeTruthy();
+  expect(vault.ok()).toBeTruthy();
+  const bytes = Buffer.from(expected, "utf8");
+  expect((await raw.body()).equals(bytes)).toBeTruthy();
+  expect((await vault.body()).equals(bytes)).toBeTruthy();
 }
 
 test("분리 편집은 제안을 명시 적용한 뒤 CAS로 저장한다", async ({ browser }) => {
@@ -61,7 +65,7 @@ test("분리 편집은 제안을 명시 적용한 뒤 CAS로 저장한다", asyn
   await expect(save).toBeEnabled();
   await save.click();
   await expect(stale.page).toHaveURL(/\/doc\/merge-disjoint\.md$/);
-  expect(await raw(stale.page, "merge-disjoint.md")).toBe("ONE\ntwo\nTHREE\n");
+  await expectExactPersisted(stale.page, "merge-disjoint.md", "ONE\r\ntwo\r\nTHREE\r\n");
 
   await first.context.close();
   await stale.context.close();
@@ -99,15 +103,17 @@ test("겹친 세 hunk를 키보드와 mine/current/manual 선택으로 해결한
   await stale.page.getByRole("button", { name: "서버 현재 선택" }).nth(1).click();
   await expect(progress).toHaveText("해결 2 / 3");
   await expect(mineButtons.nth(2)).toBeFocused();
-  await stale.page.getByLabel("직접 편집").nth(2).fill("manual gamma\n");
+  await stale.page.getByLabel("직접 편집").nth(2).fill("manual gamma\n\n");
   await stale.page.getByRole("button", { name: "직접 편집 적용" }).nth(2).click();
   await expect(progress).toHaveText("해결 3 / 3");
   await expect(save).toBeFocused();
   await expect(save).toBeEnabled();
   await save.click();
 
-  expect(await raw(stale.page, "merge-overlap.md")).toBe(
-    "top\nmine alpha\nkeep-a\nserver beta\nkeep-b\nmanual gamma\nbottom\n"
+  await expectExactPersisted(
+    stale.page,
+    "merge-overlap.md",
+    "top\r\nmine alpha\r\nkeep-a\r\nserver beta\r\nkeep-b\r\nmanual gamma\r\n\r\nbottom\r\n"
   );
   await first.context.close();
   await stale.context.close();
@@ -120,15 +126,15 @@ test("해결 뒤 제3자 갱신은 두 번째 409와 새 resolver를 만든다",
   await first.page.goto("/doc/merge-repeat.md/edit");
   await stale.page.goto("/doc/merge-repeat.md/edit");
 
-  await replaceEditor(first.page, "top\nserver two\nbottom\n");
+  await replaceEditor(first.page, "top\nserver two");
   await first.page.getByRole("button", { name: "저장" }).click();
   await third.page.goto("/doc/merge-repeat.md/edit");
-  await replaceEditor(stale.page, "top\nmine two\nbottom\n");
+  await replaceEditor(stale.page, "top\nmine two");
   await stale.page.getByRole("button", { name: "저장" }).click();
   await stale.page.getByRole("button", { name: "내 편집 선택" }).click();
   await expect(stale.page.getByRole("button", { name: "저장" })).toBeEnabled();
 
-  await replaceEditor(third.page, "top\nserver three\nbottom\n");
+  await replaceEditor(third.page, "top\nserver three");
   await third.page.getByRole("button", { name: "저장" }).click();
   const rejectedAgain = stale.page.waitForResponse((response) =>
     response.url().endsWith("/doc/merge-repeat.md/edit") && response.request().method() === "POST"
@@ -136,13 +142,13 @@ test("해결 뒤 제3자 갱신은 두 번째 409와 새 resolver를 만든다",
   await stale.page.getByRole("button", { name: "저장" }).click();
   expect((await rejectedAgain).status()).toBe(409);
   await expect(stale.page.locator('input[name="base_version"]')).toHaveValue("3");
-  await expect(stale.page.locator("#editor")).toHaveValue("top\nmine two\nbottom\n");
+  await expect(stale.page.locator("#editor")).toHaveValue("top\nmine two");
   await expect(stale.page.locator("#merge-progress")).toHaveText("해결 0 / 1");
 
-  await stale.page.getByLabel("직접 편집").fill("final manual\n");
+  await stale.page.getByLabel("직접 편집").fill("final manual");
   await stale.page.getByRole("button", { name: "직접 편집 적용" }).click();
   await stale.page.getByRole("button", { name: "저장" }).click();
-  expect(await raw(stale.page, "merge-repeat.md")).toBe("top\nfinal manual\nbottom\n");
+  await expectExactPersisted(stale.page, "merge-repeat.md", "top\r\nfinal manual");
 
   await first.context.close();
   await stale.context.close();

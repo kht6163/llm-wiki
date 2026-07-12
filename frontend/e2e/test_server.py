@@ -29,9 +29,8 @@ def test_app_uses_requested_root_and_seeds_documents(tmp_path):
         assert (tmp_path / "vault" / "merge-disjoint.md").read_bytes() == (
             b"one\r\ntwo\r\nthree\r\n"
         )
-        assert (tmp_path / "vault" / "merge-repeat.md").read_bytes() == (
-            b"top\r\nshared\r\nbottom\r\n"
-        )
+        assert (tmp_path / "vault" / "merge-repeat.md").read_bytes() == b"top\r\nshared"
+        assert "/__e2e__/vault/{path:path}" in {route.path for route in app.routes}
         assert "/login" in {route.path for route in app.routes}
     finally:
         app.state.e2e_db.close()

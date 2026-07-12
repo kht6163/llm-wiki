@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import Literal, NamedTuple
 
@@ -16,6 +16,7 @@ class MergeHunk:
     mine: str
     current: str
     resolved: str | None
+    merged_start: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,11 +142,16 @@ def three_way_merge(base: str, mine: str, current: str) -> MergeResult:
     output: list[str] = []
     conflicts: list[MergeHunk] = []
     cursor = 0
+    output_length = 0
     for region in regions:
-        output.extend(base_lines[cursor : region.start])
+        unchanged = base_lines[cursor : region.start]
+        output.extend(unchanged)
+        output_length += sum(len(line) for line in unchanged)
+        merged_start = output_length
         output.extend(region.replacement)
+        output_length += sum(len(line) for line in region.replacement)
         cursor = region.end
         if region.conflict is not None:
-            conflicts.append(region.conflict)
+            conflicts.append(replace(region.conflict, merged_start=merged_start))
     output.extend(base_lines[cursor:])
     return MergeResult("".join(output), tuple(conflicts))

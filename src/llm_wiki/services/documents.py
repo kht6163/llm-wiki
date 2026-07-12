@@ -1571,6 +1571,7 @@ class DocumentService:
                 "mine": hunk.mine,
                 "current": hunk.current,
                 "resolved": hunk.resolved,
+                "merged_start": hunk.merged_start,
             }
             for hunk in result.conflicts
         ]

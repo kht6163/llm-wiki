@@ -10,6 +10,7 @@ def test_result_models_are_frozen_and_minimal() -> None:
     result = MergeResult("base", (hunk,))
 
     assert result == MergeResult(text="base", conflicts=(hunk,))
+    assert hunk.merged_start is None
     with pytest.raises(FrozenInstanceError):
         hunk.resolved = "mine"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
@@ -51,7 +52,7 @@ def test_ambiguous_overlap_keeps_base_text_and_reports_unresolved_hunk() -> None
     result = three_way_merge("one\ntwo\nthree\n", "one\nMINE\nthree\n", "one\nTHEIRS\nthree\n")
 
     assert result.text == "one\ntwo\nthree\n"
-    assert result.conflicts == (MergeHunk(2, "two\n", "MINE\n", "THEIRS\n", None),)
+    assert result.conflicts == (MergeHunk(2, "two\n", "MINE\n", "THEIRS\n", None, 4),)
     assert "<<<<<<<" not in result.text
 
 
@@ -60,7 +61,7 @@ def test_delete_versus_edit_is_a_conflict() -> None:
 
     assert result == MergeResult(
         "one\ntwo\nthree\n",
-        (MergeHunk(2, "two\n", "", "TWO\n", None),),
+        (MergeHunk(2, "two\n", "", "TWO\n", None, 4),),
     )
 
 
@@ -69,7 +70,7 @@ def test_different_insertions_at_the_same_point_conflict() -> None:
 
     assert result == MergeResult(
         "one\ntwo\n",
-        (MergeHunk(2, "", "mine\n", "current\n", None),),
+        (MergeHunk(2, "", "mine\n", "current\n", None, 4),),
     )
 
 
@@ -92,7 +93,7 @@ def test_insert_inside_replacement_is_an_ambiguous_overlap() -> None:
 
     assert result == MergeResult(
         base,
-        (MergeHunk(1, "one\ntwo\n", "ONE\nTWO\n", "one\ninserted\ntwo\n", None),),
+        (MergeHunk(1, "one\ntwo\n", "ONE\nTWO\n", "one\ninserted\ntwo\n", None, 0),),
     )
 
 
@@ -115,7 +116,7 @@ def test_overlapping_changed_intervals_form_one_conflict() -> None:
 
     assert result == MergeResult(
         base,
-        (MergeHunk(2, "b\nc\nd\n", "B\nC\nd\n", "b\nSEE\nDEE\n", None),),
+        (MergeHunk(2, "b\nc\nd\n", "B\nC\nd\n", "b\nSEE\nDEE\n", None, 2),),
     )
 
 
@@ -127,8 +128,8 @@ def test_disjoint_conflicts_stay_separate_and_ordered() -> None:
     result = three_way_merge(base, mine, current)
 
     assert result.conflicts == (
-        MergeHunk(2, "b\n", "B1\n", "B2\n", None),
-        MergeHunk(5, "e\n", "E1\n", "E2\n", None),
+        MergeHunk(2, "b\n", "B1\n", "B2\n", None, 2),
+        MergeHunk(5, "e\n", "E1\n", "E2\n", None, 8),
     )
     assert result.text == base
 
@@ -172,6 +173,34 @@ def test_repeated_lines_merge_deterministically() -> None:
 
     assert first == MergeResult("top\nMINE\nCURRENT\nbottom\n", ())
     assert three_way_merge(base, mine, current) == first
+
+
+def test_conflict_reports_exact_later_repeated_placeholder_offset() -> None:
+    base = "repeat\nanchor\nrepeat\ntail\n"
+    mine = "repeat\nanchor\nMINE\ntail\n"
+    current = "repeat\nanchor\nCURRENT\ntail\n"
+
+    result = three_way_merge(base, mine, current)
+
+    assert result.text == base
+    assert len(result.conflicts) == 1
+    assert result.conflicts[0].base == "repeat\n"
+    assert result.conflicts[0].merged_start == len("repeat\nanchor\n")
+    merged_start = result.conflicts[0].merged_start
+    assert merged_start is not None
+    assert result.text[merged_start:].startswith("repeat\n")
+
+
+def test_empty_insertion_conflict_offset_follows_earlier_auto_edit() -> None:
+    base = "head\nanchor\n"
+    mine = "HEAD\nanchor\nmine\n"
+    current = "head\nanchor\ncurrent\n"
+
+    result = three_way_merge(base, mine, current)
+
+    assert result.text == "HEAD\nanchor\n"
+    assert result.conflicts[0].base == ""
+    assert result.conflicts[0].merged_start == len(result.text)
 
 
 def test_long_lines_are_preserved_without_character_normalization() -> None:

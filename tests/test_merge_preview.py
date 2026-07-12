@@ -71,6 +71,7 @@ def test_merge_preview_uses_exact_revision_and_does_not_mutate(ctx, principals, 
                 "mine": "MINE\n",
                 "current": "CURRENT\n",
                 "resolved": None,
+                "merged_start": 4,
             },
         ),
         (
@@ -83,6 +84,7 @@ def test_merge_preview_uses_exact_revision_and_does_not_mutate(ctx, principals, 
                 "mine": "",
                 "current": "TWO\n",
                 "resolved": None,
+                "merged_start": 4,
             },
         ),
     ],
@@ -100,6 +102,42 @@ def test_merge_preview_serializes_ordered_conflicts(
     assert preview["merged"] == base
     assert preview["conflicts"] == [expected]
     assert preview["manual_only"] is False
+
+
+@pytest.mark.parametrize(
+    ("base", "mine", "current", "merged", "expected_start", "expected_base"),
+    [
+        (
+            "repeat\nanchor\nrepeat\ntail\n",
+            "repeat\nanchor\nMINE\ntail\n",
+            "repeat\nanchor\nCURRENT\ntail\n",
+            "repeat\nanchor\nrepeat\ntail\n",
+            14,
+            "repeat\n",
+        ),
+        (
+            "head\nanchor\n",
+            "HEAD\nanchor\nmine\n",
+            "head\nanchor\ncurrent\n",
+            "HEAD\nanchor\n",
+            12,
+            "",
+        ),
+    ],
+)
+def test_merge_preview_preserves_exact_engine_placeholder_offsets(
+    ctx, principals, base, mine, current, merged, expected_start, expected_base
+):
+    docs = ctx.docs
+    editor = principals["editor"]
+    docs.create(editor, "offsets.md", base)
+    docs.update(editor, "offsets.md", 1, current)
+
+    preview = docs.merge_preview(editor, "offsets.md", 1, mine)
+
+    assert preview["merged"] == merged
+    assert preview["conflicts"][0]["merged_start"] == expected_start
+    assert preview["conflicts"][0]["base"] == expected_base
 
 
 def test_merge_preview_missing_base_is_explicit_manual_fallback(ctx, principals, monkeypatch):

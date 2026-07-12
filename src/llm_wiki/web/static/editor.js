@@ -33,7 +33,8 @@
   var form = document.querySelector(".editform");
   var textarea = document.getElementById("editor");
   var mountEl = document.getElementById("md-editor-mount");
-  if (!form || !textarea || !mountEl || !window.WikiMdEditor) return;
+  if (!form || !textarea) return;
+  var enhanced = Boolean(mountEl && window.WikiMdEditor);
   var W = window.WIKI || {};
   var csrf = (form.querySelector('input[name="csrf_token"]') || {}).value || W.csrf || "";
 
@@ -58,7 +59,12 @@
       .catch(function () { toast("업로드 실패"); return null; });
   }
 
-  function submit() { if (form.requestSubmit) form.requestSubmit(); else form.submit(); }
+  function submit() {
+    if (typeof form.requestSubmit === "function") { form.requestSubmit(); return; }
+    var submitter = form.querySelector('button[type="submit"], input[type="submit"]');
+    if (submitter && !submitter.disabled) { submitter.click(); return; }
+    form.dispatchEvent(new SubmitEvent("submit", { bubbles: true, cancelable: true }));
+  }
 
   // ---- live word/char count into the shell status bar (mirrors util.word_count) ----
   // The status bar lives in a later DOM block than this (content-block) script, so
@@ -74,14 +80,26 @@
     if (elC) elC.textContent = v.length + " 자";
   }
 
-  var api = window.WikiMdEditor.mount(mountEl, {
-    initialValue: textarea.value,
-    theme: document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light",
-    uploadImage: W.canWrite ? uploadImage : null,
-    onChange: function (v) { textarea.value = v; count(v); },
-    onSave: function (v) { textarea.value = v; submit(); },
-  });
-  mountEl.wikiEditorApi = api;
+  var api;
+  if (enhanced) {
+    api = window.WikiMdEditor.mount(mountEl, {
+      initialValue: textarea.value,
+      theme: document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light",
+      uploadImage: W.canWrite ? uploadImage : null,
+      onChange: function (v) { textarea.value = v; count(v); },
+      onSave: function (v) { textarea.value = v; submit(); },
+    });
+  } else {
+    textarea.hidden = false;
+    if (mountEl) mountEl.hidden = true;
+    api = {
+      getValue: function () { return textarea.value; },
+      getView: function () { return null; },
+      setTheme: function () {},
+    };
+    textarea.addEventListener("input", function () { count(textarea.value); });
+  }
+  if (mountEl) mountEl.wikiEditorApi = api;
   count(textarea.value);
 
   // ---- unsaved-changes guard ------------------------------------------
@@ -132,9 +150,11 @@
   }
 
   // Mirror the app's light/dark toggle into the editor.
-  new MutationObserver(function () {
-    api.setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light");
-  }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  if (enhanced) {
+    new MutationObserver(function () {
+      api.setTheme(document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light");
+    }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  }
 
   // =====================================================================
   // [[ ]] wikilink typeahead. md-editor-rt bundles its own CodeMirror, so we
@@ -142,7 +162,7 @@
   // we drive md-editor-rt's OWN view (api.getView()) with plain transaction
   // specs and render the dropdown ourselves.
   // =====================================================================
-  if (W.canWrite) setupWikiAutocomplete();
+  if (enhanced && W.canWrite) setupWikiAutocomplete();
 
   function setupWikiAutocomplete() {
     var menu = document.createElement("div");

@@ -56,7 +56,7 @@ beforeEach(() => {
 function editorPage({ csrf = "token", cancel = true, conflict = false, counters = true } = {}) {
   document.body.innerHTML = `
     <form class="editform">${csrf === null ? "" : `<input name="csrf_token" value="${csrf}">`}
-      <textarea id="editor">initial</textarea><div id="md-editor-mount"></div>
+      <textarea id="editor">initial</textarea><div id="md-editor-mount"></div><button type="submit">save</button>
     </form>
     ${cancel ? '<a id="cancel-edit" href="/">cancel</a>' : ""}
     ${conflict ? '<button id="load-current">load</button><pre id="server-current">server text</pre>' : ""}
@@ -122,10 +122,9 @@ describe("editor.js", () => {
     expect(document.querySelector("#loc-path").value).toBe("x.md");
   });
 
-  test("requires form, textarea, mount point and editor bundle", async () => {
+  test("requires form and textarea while falling back without mount or bundle", async () => {
     for (const html of [
       "", '<form class="editform"></form>',
-      '<form class="editform"><textarea id="editor"></textarea></form>',
     ]) {
       document.body.innerHTML = html;
       await loadStatic("editor");
@@ -134,6 +133,35 @@ describe("editor.js", () => {
     delete window.WikiMdEditor;
     await loadStatic("editor");
     expect(mountOptions).toBeNull();
+    expect(document.querySelector("#editor").hidden).toBe(false);
+    expect(document.querySelector("#md-editor-mount").hidden).toBe(true);
+
+    document.body.innerHTML = '<form class="editform"><textarea id="editor" hidden>draft</textarea><button type="submit">save</button></form>';
+    await loadStatic("editor");
+    expect(document.querySelector("#editor").hidden).toBe(false);
+  });
+
+  test("visible textarea fallback edits, loads current, counts, and submits normally", async () => {
+    editorPage({ conflict: true });
+    const textarea = document.querySelector("#editor");
+    textarea.hidden = true;
+    delete window.WikiMdEditor;
+    await loadStatic("editor");
+
+    expect(textarea.hidden).toBe(false);
+    expect(textarea.matches(":disabled")).toBe(false);
+    textarea.focus();
+    textarea.value = "keyboard draft";
+    event(textarea, "input");
+    expect(document.activeElement).toBe(textarea);
+    expect(document.querySelector("#sb-words").textContent).toBe("2 단어");
+    document.querySelector("#load-current").click();
+    expect(textarea.value).toBe("server text");
+
+    const submitted = vi.fn((e) => e.preventDefault());
+    document.querySelector("form").addEventListener("submit", submitted);
+    document.querySelector('button[type="submit"]').click();
+    expect(submitted).toHaveBeenCalledOnce();
   });
 
   test("mounts with theme, CSRF precedence, changes and CJK-aware counts", async () => {
@@ -197,7 +225,7 @@ describe("editor.js", () => {
     expect(document.querySelectorAll(".rt-toast")).toHaveLength(0);
   });
 
-  test("saves through requestSubmit and the submit fallback", async () => {
+  test("saves through requestSubmit and a cancellable submit-button fallback", async () => {
     let form = await boot();
     form.requestSubmit = vi.fn(() => event(form, "submit"));
     value = "saved";
@@ -210,8 +238,11 @@ describe("editor.js", () => {
     form = await boot();
     Object.defineProperty(form, "requestSubmit", { value: null, configurable: true });
     form.submit = vi.fn();
+    const submitted = vi.fn((e) => e.preventDefault());
+    form.addEventListener("submit", submitted);
     mountOptions.onSave("fallback");
-    expect(form.submit).toHaveBeenCalledOnce();
+    expect(submitted).toHaveBeenCalledOnce();
+    expect(form.submit).not.toHaveBeenCalled();
   });
 
   test("warns on dirty navigation and respects both cancel decisions", async () => {

@@ -62,13 +62,14 @@ def test_conflict_template_renders_escaped_accessible_resolver_payload(ctx, prin
     assert "\\u003cscript data-x=\\\"mine\\\"\\u003e\\u0026\\u003c/script\\u003e" in response.text
     assert '<section id="merge-resolver"' in response.text
     assert '<p id="merge-progress" role="status" aria-live="polite" aria-atomic="true">' in response.text
+    assert '<p id="merge-error" role="alert" hidden>' in response.text
     assert '<fieldset class="merge-conflict" data-conflict-index="0"' in response.text
     assert 'data-resolution="mine"' in response.text
     assert 'data-resolution="current"' in response.text
     assert 'data-resolution="manual"' in response.text
     assert 'class="merge-base"' in response.text
     assert 'value="base"' not in response.text
-    assert 'aria-describedby="merge-save-help"' in response.text
+    assert 'aria-describedby="merge-save-help merge-error"' in response.text
     assert response.text.index("editor.js") < response.text.index("merge.js")
 
 
