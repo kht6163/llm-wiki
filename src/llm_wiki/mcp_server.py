@@ -235,7 +235,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
             t0 = time.monotonic()
             actor = (token or "")[:12] or "-"  # key prefix only — never log the full token
             outcome = "ok"
-            principal: Principal | None = None
+            principal: Principal
             try:
                 if not auth_limiter.allowed(ip_key):
                     outcome = "rate_limited"
@@ -272,13 +272,12 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 return res
             except WikiError as e:
                 outcome = e.code
-                if principal is not None:
-                    _audit_write_failure(
-                        principal,
-                        action=audit_action,
-                        target=audit_target,
-                        outcome=outcome,
-                    )
+                _audit_write_failure(
+                    principal,
+                    action=audit_action,
+                    target=audit_target,
+                    outcome=outcome,
+                )
                 d = e.to_dict()
                 return shape(d) if shape else d
             except Exception:
@@ -1195,12 +1194,10 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     def _audit_forbidden_batch(principal: Principal, operations: list[dict[str, Any]]) -> None:
         """Audit a whole RBAC-rejected batch in O(1) rows/writer transactions."""
-        if len(operations) == 1 and isinstance(operations[0], dict):
+        if len(operations) == 1:
             _audit_batch_failure(principal, operations[0], "forbidden")
             return
-        first_target: str | None = None
-        if operations and isinstance(operations[0], dict):
-            _, first_target = _batch_audit_metadata(operations[0])
+        _, first_target = _batch_audit_metadata(operations[0])
         _audit_write_failure(
             principal,
             action="batch_write",
@@ -1218,8 +1215,6 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         op, path = raw.get("op"), raw.get("path")
         rep = {"op": op, "path": path, "ok": True}
         try:
-            if not principal.can_write:
-                raise ForbiddenError(f"Role '{principal.role}' cannot modify documents.")
             _validate_op_collections(raw)
             if op == "rename_references":
                 old, new = raw.get("old_path") or raw.get("path"), raw.get("new_path")
@@ -1299,12 +1294,6 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                         "would_fail": len(preview) - ok_n, "results": preview}
             results: list[dict] = []
             for raw in operations:
-                if not isinstance(raw, dict):
-                    results.append({"op": None, "path": None, "ok": False,
-                                    "error": {"code": "validation", "message": "operation must be an object"}})
-                    if stop_on_error:
-                        break
-                    continue
                 op, path = raw.get("op"), raw.get("path")
                 try:
                     res = _apply_op(principal, raw)

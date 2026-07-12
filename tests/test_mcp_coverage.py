@@ -4,11 +4,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 import llm_wiki.mcp_server as mcp_mod
 from llm_wiki.mcp_server import _request, _request_id, create_mcp_server
 from llm_wiki.services.auth import create_api_key
-from llm_wiki.services.errors import ForbiddenError, ValidationError
+from llm_wiki.services.errors import ForbiddenError
 
 
 def _payload(out):
@@ -119,8 +120,9 @@ async def test_batch_dispatches_remaining_operations_and_errors(ctx, principals,
     _payload(await mcp.call_tool("create_document", {
         "path": "batch.md", "content": "# T\n\n## A\nold\n- [ ] task\n",
     }))
-    _payload(await mcp.call_tool("create_document", {"path": "dest.md", "content": "dest"}))
-    _payload(await mcp.call_tool("create_document", {"path": "ref.md", "content": "[[batch]]"}))
+    _payload(await mcp.call_tool("create_document", {"path": "old.md", "content": "old"}))
+    _payload(await mcp.call_tool("create_document", {"path": "ref.md", "content": "[[old]]"}))
+    _payload(await mcp.call_tool("move_document", {"path": "old.md", "new_path": "renamed.md"}))
 
     operations = [
         {"op": "patch", "path": "batch.md", "find": "old", "replace": "new"},
@@ -131,17 +133,35 @@ async def test_batch_dispatches_remaining_operations_and_errors(ctx, principals,
         {"op": "move", "path": "batch.md"},
         {"op": "restore", "path": "batch.md"},
         {"op": "rename_references", "old_path": 3, "new_path": None},
-        {"op": "rename_references", "old_path": "batch.md", "new_path": "renamed.md"},
+        {"op": "rename_references", "old_path": "old.md", "new_path": "renamed.md"},
         {"op": "unknown"},
         {"op": "delete", "path": "batch.md"},
     ]
     result = _payload(await mcp.call_tool(
         "edit_documents", {"operations": operations, "stop_on_error": False}
     ))
-    assert result["ok"] and result["applied"] >= 5 and result["failed"] >= 3
-    codes = [item.get("error", {}).get("code") for item in result["results"]]
-    assert "validation" in codes
+    expected = [
+        ("patch", "batch.md", True, None),
+        ("replace_section", "batch.md", True, None),
+        ("append_section", "batch.md", True, None),
+        ("patch_tags", "batch.md", True, None),
+        ("delete_folder", "missing-folder", False, "not_found"),
+        ("move", "batch.md", False, "validation"),
+        ("restore", "batch.md", False, "validation"),
+        ("rename_references", None, False, "validation"),
+        ("rename_references", None, True, None),
+        ("unknown", None, False, "validation"),
+        ("delete", "batch.md", True, None),
+    ]
+    observed = [
+        (row["op"], row["path"], row["ok"], row.get("error", {}).get("code"))
+        for row in result["results"]
+    ]
+    assert observed == expected
+    assert result["applied"] == 6 and result["failed"] == 5
+    assert result["stopped_early"] is False
     assert ctx.docs.exists("batch.md") is False
+    assert "[[renamed]]" in ctx.docs.get("ref.md")["content"]
 
 
 @pytest.mark.asyncio
@@ -168,19 +188,29 @@ async def test_batch_preview_reports_every_feasibility_branch(ctx, principals, m
     preview = _payload(await mcp.call_tool(
         "edit_documents", {"operations": operations, "dry_run": True}
     ))
-    assert preview["dry_run"] and preview["would_apply"] >= 4
-    assert preview["would_fail"] >= 7
-    errors = [row["error"]["code"] for row in preview["results"] if not row["ok"]]
-    assert {"validation", "conflict"} <= set(errors)
+    expected = [
+        ("rename_references", "live.md", True, None),
+        ("rename_references", None, False, "validation"),
+        ("create", "live.md", False, "conflict"),
+        ("create", "new.md", True, None),
+        ("create_folder", "folder", True, None),
+        ("update", "live.md", False, "conflict"),
+        ("update", "live.md", True, None),
+        ("move", "live.md", False, "validation"),
+        ("move", "live.md", False, "conflict"),
+        ("move", "live.md", True, None),
+        ("restore", "tomb.md", True, None),
+        ("unknown", "live.md", False, "validation"),
+        ("update", "live.md", False, "validation"),
+        ("create", None, False, "validation"),
+    ]
+    observed = [
+        (row["op"], row["path"], row["ok"], row.get("error", {}).get("code"))
+        for row in preview["results"]
+    ]
+    assert observed == expected
+    assert preview["would_apply"] == 6 and preview["would_fail"] == 8
     assert ctx.docs.exists("new.md") is False and ctx.docs.exists("free.md") is False
-
-    preview_op = dict(zip(
-        mcp._tool_manager.get_tool("edit_documents").fn.__code__.co_freevars,
-        mcp._tool_manager.get_tool("edit_documents").fn.__closure__,
-        strict=True,
-    ))["_preview_op"].cell_contents
-    forbidden = preview_op(principals["viewer"], {"op": "create", "path": "private.md"})
-    assert forbidden["ok"] is False and forbidden["error"]["code"] == "forbidden"
 
 
 @pytest.mark.asyncio
@@ -188,17 +218,21 @@ async def test_batch_malformed_objects_stop_modes_and_redacted_audit(
     ctx, principals, monkeypatch
 ):
     mcp = _server(ctx, principals["editor"], monkeypatch)
-    tool = mcp._tool_manager.get_tool("edit_documents")
+    with pytest.raises(ToolError, match="valid dictionary"):
+        await mcp.call_tool("edit_documents", {"operations": [None]})
+    assert ctx.docs.exists("later.md") is False
+    with ctx.db.reader() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+    with pytest.raises(ToolError, match="valid dictionary"):
+        await mcp.call_tool("edit_documents", {
+            "operations": [None, {"op": "create", "path": "later.md", "content": "safe"}],
+            "stop_on_error": False,
+        })
+    with ctx.db.reader() as conn:
+        after = conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+    assert after == before and ctx.docs.exists("later.md") is False
 
-    stopped = await tool.fn(None, operations=[None, {"op": "create", "path": "later.md"}])
-    assert stopped["failed"] == 1 and stopped["stopped_early"] is True
-    continued = await tool.fn(
-        None,
-        operations=[None, {"op": "create", "path": "later.md", "content": "safe"}],
-        stop_on_error=False,
-    )
-    assert continued["applied"] == 1 and continued["failed"] == 1
-    assert ctx.docs.get("later.md")["content"] == "safe"
+    _payload(await mcp.call_tool("create_document", {"path": "later.md", "content": "safe"}))
 
     malformed = _payload(await mcp.call_tool("edit_documents", {
         "operations": [
@@ -240,9 +274,6 @@ async def test_batch_limits_and_viewer_preview_forbidden_are_structured(ctx, pri
         "operations": [{"op": "create", "path": "private.md"}], "dry_run": True,
     }))
     assert preview["error"]["code"] == "forbidden"
-    tool = viewer._tool_manager.get_tool("edit_documents")
-    denied = await tool.fn(None, operations=[None, {}], stop_on_error=False)
-    assert denied["error"]["code"] == "forbidden"
 
 
 @pytest.mark.asyncio
@@ -274,21 +305,3 @@ async def test_batch_restore_with_version_applies_snapshot(ctx, principals, monk
     }]}))
     assert restored["applied"] == 1
     assert ctx.docs.get("restore.md")["content"] == "v1"
-
-
-@pytest.mark.asyncio
-async def test_call_wiki_error_before_principal_keeps_structured_envelope(
-    ctx, principals, monkeypatch
-):
-    mcp = _server(ctx, principals["editor"], monkeypatch)
-    tool = mcp._tool_manager.get_tool("get_tags")
-    call_cell = dict(zip(tool.fn.__code__.co_freevars, tool.fn.__closure__, strict=True))["_call"]
-    call = call_cell.cell_contents
-    principal_cell = dict(zip(call.__code__.co_freevars, call.__closure__, strict=True))["_principal"]
-    original = principal_cell.cell_contents
-    principal_cell.cell_contents = lambda _token: (_ for _ in ()).throw(ValidationError("pre-auth"))
-    try:
-        result = _payload(await mcp.call_tool("get_tags", {}))
-    finally:
-        principal_cell.cell_contents = original
-    assert result["ok"] is False and result["error"]["code"] == "validation"

@@ -3,6 +3,8 @@
 import asyncio
 import importlib.metadata
 import re
+import subprocess
+import sys
 from io import BytesIO
 from types import SimpleNamespace
 
@@ -37,6 +39,22 @@ def _login(client: TestClient, username: str = "alice") -> None:
 def _client(ctx, principals, *, raise_server_exceptions: bool = True) -> TestClient:
     assert principals  # ensure the named users exist
     return TestClient(create_web_app(ctx), raise_server_exceptions=raise_server_exceptions)
+
+
+def test_web_package_lazily_exports_app_without_loading_numpy():
+    script = """
+import sys
+import llm_wiki.web
+assert 'llm_wiki.web.app' not in sys.modules
+assert not any(name == 'numpy' or name.startswith('numpy.') for name in sys.modules)
+from llm_wiki.web import create_web_app
+assert callable(create_web_app)
+assert 'llm_wiki.web.app' in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.asyncio
@@ -489,7 +507,13 @@ def test_key_mint_rate_limit_envelope(ctx, principals):
 async def test_websocket_timeout_continue_and_outer_disconnect(ctx, principals, monkeypatch):
     app = create_web_app(ctx)
     endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/ws")
-    monkeypatch.setattr(web_mod, "principal_from_session", lambda _db, _sid: principals["editor"])
+    session_checks = []
+
+    def active_session(_db, sid):
+        session_checks.append(sid)
+        return principals["editor"]
+
+    monkeypatch.setattr(web_mod, "principal_from_session", active_session)
     original_wait = asyncio.wait
     calls = 0
 
@@ -508,14 +532,35 @@ async def test_websocket_timeout_continue_and_outer_disconnect(ctx, principals, 
 
     ws.receive = inbound
     await endpoint(ws)
-    assert calls == 2 and ws.accepted
+    assert calls == 2 and ws.accepted and ws.closed == []
+    assert session_checks == ["sid", "sid"]
+    assert ctx.events.subscriber_count() == 0
+
+    revoked_checks = []
+
+    def revoked_session(_db, sid):
+        revoked_checks.append(sid)
+        return principals["editor"] if len(revoked_checks) == 1 else None
+
+    async def timeout_only(tasks, **kwargs):
+        return set(), set(tasks)
+
+    monkeypatch.setattr(web_mod, "principal_from_session", revoked_session)
+    monkeypatch.setattr(asyncio, "wait", timeout_only)
+    revoked = _FakeWebSocket()
+    await endpoint(revoked)
+    assert revoked_checks == ["sid", "sid"]
+    assert revoked.closed == [1008]
+    assert ctx.events.subscriber_count() == 0
 
     async def disconnecting_wait(*args, **kwargs):
         raise WebSocketDisconnect()
 
     monkeypatch.setattr(asyncio, "wait", disconnecting_wait)
+    monkeypatch.setattr(web_mod, "principal_from_session", active_session)
     ws2 = _FakeWebSocket()
     ws2.receive = inbound
     await endpoint(ws2)
-    assert ws2.accepted
+    assert ws2.accepted and ws2.closed == []
+    assert ctx.events.subscriber_count() == 0
     monkeypatch.setattr(asyncio, "wait", original_wait)
