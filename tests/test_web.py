@@ -537,6 +537,8 @@ def test_stale_edit_with_pruned_base_keeps_mine_and_manual_recovery(client, ctx,
 
     assert response.status_code == 409
     assert "자동 병합할 수 없어 수동 복구가 필요합니다" in response.text
+    assert "병합에 필요한 문서 상태를 확인할 수 없습니다" in response.text
+    assert "요청한 기준 v1 리비전이 없어" not in response.text
     assert "irreplaceable mine" in response.text
     assert '<fieldset class="merge-conflict"' not in response.text
     assert ctx.docs.get("manual.md")["content"] == "current"
@@ -650,11 +652,46 @@ def test_conflict_page_preserves_manual_recovery_if_document_is_deleted_before_p
 
     assert response.status_code == 409
     assert "자동 병합할 수 없어 수동 복구가 필요합니다" in response.text
+    assert "병합에 필요한 문서 상태를 확인할 수 없습니다" in response.text
     assert "irreplaceable mine" in response.text
     assert '<pre id="server-current">current</pre>' in response.text
     assert '<input type="hidden" name="base_version" value="2">' in response.text
     with pytest.raises(NotFoundError):
         ctx.docs.get("vanished.md")
+
+
+def test_conflict_page_preserves_manual_recovery_if_document_is_moved_before_preview(
+    client, ctx, principals, monkeypatch
+):
+    login(client, "admin")
+    ctx.docs.create(principals["admin"], "moving.md", "base")
+    ctx.docs.update(principals["admin"], "moving.md", 1, "current")
+    real_preview = ctx.docs.merge_preview
+
+    def moved_preview(principal, path, base_version, mine):
+        ctx.docs.move(principals["editor"], path, "moved.md")
+        return real_preview(principal, path, base_version, mine)
+
+    monkeypatch.setattr(ctx.docs, "merge_preview", moved_preview)
+    response = client.post(
+        "/doc/moving.md/edit",
+        data={
+            "content": "irreplaceable moved mine",
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/moving.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert "자동 병합할 수 없어 수동 복구가 필요합니다" in response.text
+    assert "병합에 필요한 문서 상태를 확인할 수 없습니다" in response.text
+    assert "irreplaceable moved mine" in response.text
+    assert '<pre id="server-current">current</pre>' in response.text
+    assert '<input type="hidden" name="base_version" value="2">' in response.text
+    with pytest.raises(NotFoundError):
+        ctx.docs.get("moving.md")
+    moved = ctx.docs.get("moved.md")
+    assert moved["content"] == "current" and moved["version"] == 3
 
 
 def test_new_post_invalid_path_stays_on_form(client):
