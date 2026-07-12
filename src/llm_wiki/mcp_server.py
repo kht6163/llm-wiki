@@ -569,6 +569,13 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         return await _call(ctx, lambda _p: {"ok": True, "folders": docs.list_folders()},
                            "list_folders")
 
+    @mcp.tool(description="List document templates available under vault `/_templates/` "
+                          "(name, path, title, preview). Pass a template's name to "
+                          "create_document(template=...) to seed a new note's body.")
+    async def list_templates(ctx: Context) -> dict:
+        return await _call(ctx, lambda _p: {"ok": True, "templates": docs.list_templates()},
+                           "list_templates")
+
     @mcp.tool(description="Identify the calling agent: the username, role, and exactly which "
                           "capabilities the presented API key grants (can_read/can_write/"
                           "can_admin). Call this first to decide whether you may create/edit "
@@ -700,12 +707,14 @@ def create_mcp_server(app: AppContext) -> FastMCP:
 
     # ---- write tools (editor/admin) -------------------------------------
     @mcp.tool(description="Create a new document. Fails with code 'conflict' if the path "
-                          "already exists, 'forbidden' for viewer role. By default the response "
-                          "omits the document body (you already have it) — pass "
-                          "return_content='full' to echo it back.")
+                          "already exists, 'forbidden' for viewer role. Optional 'template' "
+                          "(name with or without .md from list_templates) seeds the body from "
+                          "vault `/_templates/`. By default the response omits the document body "
+                          "(you already have it) — pass return_content='full' to echo it back.")
     async def create_document(
-        ctx: Context, path: str, content: str,
+        ctx: Context, path: str, content: str = "",
         title: str | None = None, tags: list[str] | None = None,
+        template: str | None = None,
         return_content: Annotated[Literal["full", "metadata"],
                                   Field(description="'full' echoes the body (and current_content on a "
                                         "conflict); 'metadata' (default) omits them, giving char counts.")] = "metadata",
@@ -713,7 +722,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         def fn(p: Principal) -> dict:
             _validate_items(tags, "tags", MAX_TAGS)
             return {"ok": True, **_shape_write(
-                docs.create(p, path, content, title, tags), return_content)}
+                docs.create(p, path, content, title, tags, template=template), return_content)}
         return await _call(ctx, fn, "create_document",
             shape=lambda d: _shape_conflict(d, return_content),
             audit_action="doc_create", audit_target=path)

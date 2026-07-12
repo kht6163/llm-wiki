@@ -97,6 +97,11 @@ ATTACH_DIR = "_attachments"
 ATTACH_MAX_BYTES = 10 * 1024 * 1024
 ALLOWED_ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".pdf"}
 
+# Document templates live as plain .md files under this vault subdir. They are
+# listable via list_templates() but not indexed as normal wiki documents.
+TEMPLATES_DIR = "_templates"
+TEMPLATE_PREVIEW_CHARS = 200
+
 # ---- bulk import (Obsidian/markdown directory ingest) ----------------------
 IMPORT_MAX_BYTES = 50 * 1024 * 1024  # per-file ceiling for one note
 IMPORT_DEFAULT_INCLUDE = ("*.md", "*.markdown", "*.mdown", "*.mkd")
@@ -112,6 +117,7 @@ IMPORT_EXCLUDED_DIRS = {
     ".venv",
     "node_modules",
     "__pycache__",
+    TEMPLATES_DIR,
 }
 # Assets the importer may copy when --import-attachments is on (same allow-list as
 # interactive uploads, so they pass save_attachment's validation unchanged).
@@ -2590,6 +2596,88 @@ class DocumentService:
         with self.db.reader() as conn:
             return graph.resolve_path(conn, target, src_folder)
 
+    # ---- templates ------------------------------------------------------
+    def list_templates(self) -> list[dict]:
+        """List ``.md`` templates under vault ``/_templates/``.
+
+        Returns ``[{name, path, title, preview}]`` sorted by name. ``preview`` is
+        the first ~200 characters of the body after frontmatter is stripped.
+        Templates are not indexed as wiki documents.
+        """
+        root = self.vault / TEMPLATES_DIR
+        if not root.is_dir():
+            return []
+        items: list[dict] = []
+        try:
+            entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            return []
+        for entry in entries:
+            if not entry.is_file() or entry.suffix.lower() != ".md":
+                continue
+            if entry.name.startswith("."):
+                continue
+            try:
+                raw = entry.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            meta, body_start = parse_frontmatter(raw)
+            body = raw[body_start:]
+            rel = f"{TEMPLATES_DIR}/{entry.name}"
+            title = derive_title(meta, raw, rel)
+            preview = body.lstrip("\n\r")[:TEMPLATE_PREVIEW_CHARS]
+            items.append({
+                "name": entry.stem,
+                "path": rel,
+                "title": title,
+                "preview": preview,
+            })
+        return items
+
+    def _resolve_template_path(self, name: str) -> Path:
+        """Resolve a template name to a file under ``_templates/`` only.
+
+        Accepts ``foo`` or ``foo.md``. Rejects path traversal and absolute paths.
+        """
+        if name is None or not str(name).strip():
+            raise ValidationError("template name is required")
+        raw = str(name).strip().replace("\\", "/").lstrip("/")
+        # Optional vault-relative prefix is allowed but stripped.
+        if raw.lower().startswith(f"{TEMPLATES_DIR}/"):
+            raw = raw[len(TEMPLATES_DIR) + 1 :]
+        if not raw or raw.startswith("~"):
+            raise ValidationError("invalid template path")
+        parts: list[str] = []
+        for seg in raw.split("/"):
+            if seg in ("", "."):
+                continue
+            if seg == ".." or any(ord(c) < 0x20 or ord(c) == 0x7f for c in seg):
+                raise ValidationError("invalid template path")
+            parts.append(seg)
+        # Flat templates only: a single filename segment (no nested path / traversal).
+        if len(parts) != 1:
+            raise ValidationError("invalid template path")
+        filename = parts[0]
+        if not filename.lower().endswith(".md"):
+            filename = f"{filename}.md"
+        templates_root = (self.vault / TEMPLATES_DIR).resolve()
+        try:
+            target = safe_join(templates_root, filename)
+        except PathError as e:
+            raise ValidationError("invalid template path") from e
+        if templates_root not in target.parents:
+            raise ValidationError("invalid template path")
+        if not target.is_file():
+            raise ValidationError(f"template not found: {name}")
+        return target
+
+    def _load_template_body(self, name: str) -> str:
+        path = self._resolve_template_path(name)
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise ValidationError(f"template not readable: {name}") from e
+
     # ---- writes ---------------------------------------------------------
     def create(
         self,
@@ -2600,6 +2688,7 @@ class DocumentService:
         tags: list[str] | None = None,
         *,
         embed: bool = True,
+        template: str | None = None,
     ) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
@@ -2611,7 +2700,10 @@ class DocumentService:
         # staged projector, after the row is durably marked pending.
         fp.managed_path(self.vault, rel, namespace="live")
         norm, folder, stem = path_norm(rel), folder_of(rel), basename_stem(rel).lower()
-        content = content or ""
+        if template is not None:
+            content = self._load_template_body(template)
+        else:
+            content = content or ""
         meta = parse_frontmatter(content)[0]
         final_title = (title or derive_title(meta, content, rel)).strip()
         tagset = self._merge_tags(meta, content, tags)
@@ -4207,7 +4299,7 @@ class DocumentService:
         invalid_scan_conflicts: dict[str, dict] = {}
         for path in sorted(vault.rglob("*.md"), key=lambda item: item.as_posix()):
             relative = path.relative_to(vault)
-            if relative.parts[0].casefold() in (".trash", ".tmp"):
+            if relative.parts[0].casefold() in (".trash", ".tmp", ATTACH_DIR, TEMPLATES_DIR):
                 continue
             rel = relative.as_posix()
             try:
@@ -5481,6 +5573,7 @@ class DocumentService:
                     for d in dirnames
                     if d not in IMPORT_EXCLUDED_DIRS
                     and d != ATTACH_DIR
+                    and d != TEMPLATES_DIR
                     and not (base / d).is_symlink()
                 )
                 for fn in sorted(filenames):

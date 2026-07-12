@@ -960,16 +960,28 @@ def create_web_app(app: AppContext) -> FastAPI:
         return RedirectResponse("/new?path=" + quote(target), status_code=302)
 
     @web.get("/new", response_class=HTMLResponse)
-    def new_get(request: Request, path: str = "", p: Principal = Depends(require_user)):
-        return render("edit.html", request, is_new=True, path=path, title="", content="",
+    def new_get(request: Request, path: str = "", template: str = "",
+                p: Principal = Depends(require_user)):
+        content = ""
+        if template:
+            try:
+                content = docs._load_template_body(template)
+            except WikiError:
+                content = ""
+        return render("edit.html", request, is_new=True, path=path, title="", content=content,
                       base_version=0, conflict=None, error=None, can_write=p.can_write,
-                      folders=docs.list_folders())
+                      folders=docs.list_folders(), templates=docs.list_templates(),
+                      selected_template=template or "")
 
     @web.post("/new")
     def new_post(request: Request, path: str = Form(...), content: str = Form(""),
-                 title: str = Form(""), p: Principal = Depends(require_user)):
+                 title: str = Form(""), template: str = Form(""),
+                 p: Principal = Depends(require_user)):
+        # Template select is for GET prefill; on POST, only apply when the body is still
+        # empty so a user who edited after selecting a template keeps their edits.
+        tpl = (template.strip() or None) if not (content or "").strip() else None
         try:
-            doc = docs.create(p, path, content, title=title or None)
+            doc = docs.create(p, path, content, title=title or None, template=tpl)
         except PathError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
@@ -978,14 +990,18 @@ def create_web_app(app: AppContext) -> FastAPI:
             # field error, not a dead end) instead of bouncing to the global error page.
             return render("edit.html", request, status=400, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
-                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write, folders=docs.list_folders())
+                          error=f"잘못된 경로입니다: {e}", can_write=p.can_write,
+                          folders=docs.list_folders(), templates=docs.list_templates(),
+                          selected_template=template or "")
         except WikiError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
             )
             return render("edit.html", request, status=e.http_status, is_new=True, path=path,
                           title=title, content=content, base_version=0, conflict=None,
-                          error=e.message, can_write=p.can_write, folders=docs.list_folders())
+                          error=e.message, can_write=p.can_write,
+                          folders=docs.list_folders(), templates=docs.list_templates(),
+                          selected_template=template or "")
         return RedirectResponse("/doc/" + quote(doc["path"]), status_code=303)
 
     @web.get("/doc/{path:path}/edit", response_class=HTMLResponse)

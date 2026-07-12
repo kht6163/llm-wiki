@@ -125,6 +125,17 @@
       </datalist>
       <input type="hidden" name="path" id="loc-path" value="{{ path }}">
     </div>
+    {% if templates %}
+    <label class="tpl-field">템플릿
+      <select id="doc-template" name="template" aria-label="템플릿">
+        <option value="">(없음)</option>
+        {% for t in templates %}
+        <option value="{{ t.name }}" {% if selected_template == t.name or selected_template == t.name ~ '.md' %}selected{% endif %}
+                title="{{ t.preview }}">{{ t.title or t.name }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
   {% else %}
     <input type="hidden" name="base_version" value="{{ base_version }}">
   {% endif %}
