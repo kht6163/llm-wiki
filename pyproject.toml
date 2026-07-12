@@ -55,6 +55,7 @@ exclude = [
     "/.ruff_cache",
     "/.superpowers",
     "/.venv",
+    "/.wheel-smoke",
     "/.worktrees",
     "/build",
     "/data",

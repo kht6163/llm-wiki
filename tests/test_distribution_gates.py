@@ -51,6 +51,7 @@ def test_distribution_smoke_accepts_exact_wheel_asset_tree(tmp_path: Path):
 @pytest.mark.parametrize(
     "member",
     [
+        "llm_wiki-0.31.1/.wheel-smoke/bin/python",
         "llm_wiki-0.31.1/frontend/node_modules/pkg/index.js",
         "llm_wiki-0.31.1/data/llm_wiki.db",
         "llm_wiki-0.31.1/native/addon.node",

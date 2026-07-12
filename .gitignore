@@ -37,6 +37,7 @@ coverage.xml
 # Isolated Codex/Superpowers worktrees
 /.worktrees/
 /.superpowers/
+/.wheel-smoke/
 /docs/superpowers/
 /playwright-report/
 /test-results/

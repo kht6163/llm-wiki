@@ -18,6 +18,7 @@ MAX_SDIST_BYTES = 10 * 1024 * 1024
 REQUIRED_SDIST_FILES = {".env.example"}
 FORBIDDEN_SDIST_PREFIXES = (
     ".venv/",
+    ".wheel-smoke/",
     ".worktrees/",
     ".superpowers/",
     "build/",
