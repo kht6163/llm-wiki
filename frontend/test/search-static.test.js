@@ -1,14 +1,42 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { loadStatic, useStaticIsolation } from "./static-test-utils.js";
 
 useStaticIsolation();
+
+beforeEach(() => {
+  localStorage.clear();
+});
 
 afterEach(() => history.replaceState(null, "", "/"));
 
 function page() {
   document.body.innerHTML = `
     <section id="search-workbench">
-      <form id="search-remove-form">
+      <form action="/search" method="get" class="searchform" role="search">
+        <input id="search-query" type="search" name="q"
+               value='free tag:release tag:todo tag:release title:"API guide"'>
+        <select name="mode">
+          <option value="hybrid">hybrid</option>
+          <option value="bm25" selected>bm25</option>
+          <option value="vector">vector</option>
+        </select>
+        <input type="text" name="folder" value="notes">
+        <div class="search-tag-fields">
+          <input type="text" name="tag" value="release">
+          <input type="text" name="tag" value="todo">
+          <input type="text" name="tag" value="release">
+        </div>
+        <select name="per_page"><option value="10" selected>10</option></select>
+        <button class="primary" type="submit">검색</button>
+      </form>
+      <div class="saved-searches" id="saved-searches">
+        <div class="saved-searches-head">
+          <span class="saved-searches-label">저장한 검색</span>
+          <button type="button" id="save-search-btn" data-save-search>현재 검색 저장</button>
+        </div>
+        <ul class="saved-searches-list" id="saved-searches-list" aria-label="저장된 검색"></ul>
+      </div>
+      <form action="/search" method="get" id="search-remove-form" hidden>
         <input name="q" value='free tag:release tag:todo tag:release title:"API guide"'>
         <input name="mode" value="bm25">
         <input name="folder" value="notes">
@@ -18,7 +46,6 @@ function page() {
         <input name="page" value="8">
         <input name="per_page" value="10">
       </form>
-      <input id="search-query" type="search">
       <details id="search-help"><summary>검색 연산자 도움말</summary><p>help</p></details>
       <button type="button" class="filter-chip" data-remove-filter="query"
         data-filter-operator="tag" data-filter-value="release" data-filter-index="2">remove second</button>
@@ -39,7 +66,7 @@ describe("search.js", () => {
 
   test("removes only the selected duplicate query filter and resets the page", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.requestSubmit = vi.fn();
     await loadStatic("search");
 
@@ -58,7 +85,7 @@ describe("search.js", () => {
 
   test("preserves free-text and quoted-filter whitespace byte for byte", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.elements.q.value = 'free   words tag:release title:"API   guide"  tail';
     form.requestSubmit = vi.fn();
     document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "0";
@@ -72,7 +99,7 @@ describe("search.js", () => {
 
   test("uses server token order for adjacent quoted operators", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.elements.q.value = 'free title:"A"tag:x tag:x';
     form.requestSubmit = vi.fn();
     document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "0";
@@ -86,7 +113,7 @@ describe("search.js", () => {
 
   test("skips empty quoted and malformed bare operators before a valid filter", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.elements.q.value = 'needle title:"" path: has:"   " tag:release tag:todo tag:release tail';
     form.requestSubmit = vi.fn();
     document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "0";
@@ -102,7 +129,7 @@ describe("search.js", () => {
 
   test("removes the exact duplicate after empty operators between valid filters", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.elements.q.value = 'needle tag:release title:"  " tag:todo title: tag:release tail';
     form.requestSubmit = vi.fn();
     document.querySelector('[data-remove-filter="query"]').dataset.filterIndex = "2";
@@ -123,7 +150,7 @@ describe("search.js", () => {
 
   test("removes one repeated request tag without changing query or other state", async () => {
     page();
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.requestSubmit = vi.fn();
     await loadStatic("search");
 
@@ -140,7 +167,7 @@ describe("search.js", () => {
   test("removes the folder and ignores stale or unrelated removal controls", async () => {
     page();
     const root = document.querySelector("#search-workbench");
-    const form = document.querySelector("form");
+    const form = document.querySelector("#search-remove-form");
     form.requestSubmit = vi.fn();
     root.insertAdjacentHTML("beforeend", `
       <button type="button" data-remove-filter="folder">folder</button>
@@ -251,5 +278,102 @@ describe("search.js", () => {
     window.WikiSearch = { replacement: true };
     missing.dispose();
     expect(window.WikiSearch).toEqual({ replacement: true });
+  });
+});
+
+describe("search.js saved searches", () => {
+  test("saves current query mode folder and tags under a name to localStorage", async () => {
+    page();
+    vi.spyOn(window, "prompt").mockReturnValue("Release notes");
+    await loadStatic("search");
+
+    document.querySelector("[data-save-search]").click();
+
+    const saved = JSON.parse(localStorage.getItem("wiki-saved-searches"));
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      name: "Release notes",
+      q: 'free tag:release tag:todo tag:release title:"API guide"',
+      mode: "bm25",
+      folder: "notes",
+      tags: ["release", "todo", "release"],
+    });
+    const list = document.querySelector("#saved-searches-list");
+    expect(list.querySelectorAll("[data-saved-search]")).toHaveLength(1);
+    expect(list.textContent).toContain("Release notes");
+  });
+
+  test("lists saved searches and loads the search URL on click", async () => {
+    localStorage.setItem("wiki-saved-searches", JSON.stringify([
+      { name: "Hybrid API", q: "api", mode: "hybrid", folder: "docs", tags: ["guide"] },
+    ]));
+    page();
+    await loadStatic("search");
+
+    const link = document.querySelector("#saved-searches-list a[data-saved-search]");
+    expect(link).toBeTruthy();
+    expect(link.textContent).toContain("Hybrid API");
+    const href = new URL(link.href, "http://localhost");
+    expect(href.pathname).toBe("/search");
+    expect(href.searchParams.get("q")).toBe("api");
+    expect(href.searchParams.get("mode")).toBe("hybrid");
+    expect(href.searchParams.get("folder")).toBe("docs");
+    expect(href.searchParams.getAll("tag")).toEqual(["guide"]);
+  });
+
+  test("deletes a saved search without navigating", async () => {
+    localStorage.setItem("wiki-saved-searches", JSON.stringify([
+      { name: "Keep", q: "keep", mode: "bm25", folder: "", tags: [] },
+      { name: "Drop", q: "drop", mode: "vector", folder: "x", tags: ["t"] },
+    ]));
+    page();
+    await loadStatic("search");
+
+    const dropRow = [...document.querySelectorAll("[data-saved-name]")]
+      .find((el) => el.dataset.savedName === "Drop");
+    dropRow.querySelector("[data-delete-saved]").click();
+
+    expect(JSON.parse(localStorage.getItem("wiki-saved-searches"))).toEqual([
+      { name: "Keep", q: "keep", mode: "bm25", folder: "", tags: [] },
+    ]);
+    expect(document.querySelectorAll("#saved-searches-list [data-saved-search]")).toHaveLength(1);
+    expect(document.querySelector("#saved-searches-list").textContent).not.toContain("Drop");
+  });
+
+  test("caps saved searches at 20 and ignores empty names", async () => {
+    const existing = Array.from({ length: 20 }, (_, i) => ({
+      name: `S${i}`, q: `q${i}`, mode: "bm25", folder: "", tags: [],
+    }));
+    localStorage.setItem("wiki-saved-searches", JSON.stringify(existing));
+    page();
+    const prompt = vi.spyOn(window, "prompt");
+    await loadStatic("search");
+
+    prompt.mockReturnValue("Overflow");
+    document.querySelector("[data-save-search]").click();
+    expect(JSON.parse(localStorage.getItem("wiki-saved-searches"))).toHaveLength(20);
+    expect(document.querySelectorAll("#saved-searches-list [data-saved-search]")).toHaveLength(20);
+
+    prompt.mockReturnValue("   ");
+    document.querySelector("[data-save-search]").click();
+    expect(JSON.parse(localStorage.getItem("wiki-saved-searches"))).toHaveLength(20);
+
+    prompt.mockReturnValue("S0");
+    document.querySelector("[data-save-search]").click();
+    const updated = JSON.parse(localStorage.getItem("wiki-saved-searches"));
+    expect(updated).toHaveLength(20);
+    expect(updated.find((e) => e.name === "S0").mode).toBe("bm25");
+    expect(updated.find((e) => e.name === "S0").folder).toBe("notes");
+  });
+
+  test("survives corrupt localStorage and still saves", async () => {
+    localStorage.setItem("wiki-saved-searches", "{not-json");
+    page();
+    vi.spyOn(window, "prompt").mockReturnValue("Recovered");
+    await loadStatic("search");
+
+    expect(document.querySelectorAll("#saved-searches-list [data-saved-search]")).toHaveLength(0);
+    document.querySelector("[data-save-search]").click();
+    expect(JSON.parse(localStorage.getItem("wiki-saved-searches"))[0].name).toBe("Recovered");
   });
 });
