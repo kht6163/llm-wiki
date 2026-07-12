@@ -1,10 +1,11 @@
 """Signed public read-only share links for a single document."""
 from __future__ import annotations
 
+from starlette.testclient import TestClient
+
 from llm_wiki.services import share as share_svc
 from llm_wiki.services.errors import ValidationError
 from llm_wiki.web import create_web_app
-from starlette.testclient import TestClient
 
 
 def test_mint_and_verify_share_token(ctx, principals):

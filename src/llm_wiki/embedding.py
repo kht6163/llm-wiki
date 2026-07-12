@@ -22,36 +22,6 @@ from .embedding_contract import EMBEDDING_PIPELINE
 _QUERY_CACHE_MAX = 512
 
 
-class DisabledEmbedder:
-    """Stand-in when ``EMBEDDING_ENABLED=false``: no model load, no vectors."""
-
-    pipeline = EMBEDDING_PIPELINE
-    enabled = False
-
-    def __init__(self, model_name: str = "disabled"):
-        self.model_name = model_name
-
-    @property
-    def is_loaded(self) -> bool:
-        return False
-
-    def warm(self) -> None:
-        return None
-
-    @property
-    def dim(self) -> int:
-        return 0
-
-    def encode_passages(self, texts: list[str]):
-        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
-
-    def encode_queries(self, texts: list[str]):
-        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
-
-    def encode_query(self, text: str):
-        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
-
-
 class Embedder:
     pipeline = EMBEDDING_PIPELINE
     enabled = True
@@ -147,6 +117,39 @@ class Embedder:
     @staticmethod
     def serialize(vec) -> bytes:
         return sqlite_vec.serialize_float32([float(x) for x in vec])
+
+
+class DisabledEmbedder(Embedder):
+    """Stand-in when ``EMBEDDING_ENABLED=false``: no model load, no vectors."""
+
+    enabled = False
+
+    def __init__(self, model_name: str = "disabled"):
+        self.model_name = model_name
+        self._model = None
+        self._lock = threading.RLock()
+        self._is_e5 = False
+        self._query_cache: OrderedDict[str, Any] = OrderedDict()
+
+    def _load(self):
+        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
+
+    @property
+    def is_loaded(self) -> bool:
+        return False
+
+    def warm(self) -> None:
+        return None
+
+    @property
+    def dim(self) -> int:
+        return 0
+
+    def embed_passages(self, texts: list[str]):
+        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
+
+    def embed_query(self, text: str):
+        raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
 
 
 @lru_cache(maxsize=4)

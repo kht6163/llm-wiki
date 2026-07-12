@@ -58,21 +58,16 @@ def register_settings_admin(web: FastAPI, deps: WebDeps) -> None:
         key_limiter.record_failure(key_key)  # count this mint toward the window
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
-        try:
-            token = create_api_key(
-                db,
-                p,
-                name,
-                scope=scope,
-                audit_actor=p.username,
-                audit_via="web",
-            )
-        except WikiError as e:
-            return render(
-                "settings.html",
-                request,
-                **_settings_ctx(p, new_key=None, error=e.message),
-            )
+        # Let ValidationError/Forbidden bubble to the app WikiError handler so
+        # coverage audits (key_change) and structured error headers stay consistent.
+        token = create_api_key(
+            db,
+            p,
+            name,
+            scope=scope,
+            audit_actor=p.username,
+            audit_via="web",
+        )
         return render("settings.html", request, **_settings_ctx(p, new_key=token))
 
     @web.post("/settings/keys/{key_id}/revoke")

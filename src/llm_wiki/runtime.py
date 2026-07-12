@@ -21,7 +21,7 @@ from .services.documents import DocumentService
 class AppContext:
     settings: Settings
     db: Database
-    embedder: Embedder | DisabledEmbedder
+    embedder: Embedder
     docs: DocumentService
     events: EventHub
     embed_worker: EmbeddingWorker | None = None
@@ -34,7 +34,7 @@ def build_context(settings: Settings | None = None, *, full: bool = True,
     db = Database(settings.db_path)
     try:
         if settings.embedding_enabled:
-            embedder: Embedder | DisabledEmbedder = get_embedder(
+            embedder: Embedder = get_embedder(
                 settings.embedding_model
             )  # model loads lazily on first use
             if full:

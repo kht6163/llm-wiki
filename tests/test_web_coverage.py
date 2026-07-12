@@ -113,7 +113,11 @@ def test_ready_and_metrics_keep_stable_envelopes_when_gauges_fail(
     ctx, principals, monkeypatch
 ):
     client = _client(ctx, principals)
-    monkeypatch.setattr(web_mod, "collect_index_gauges", lambda _db: (_ for _ in ()).throw(RuntimeError("db")))
+    import llm_wiki.web.routes.health as health_mod
+
+    monkeypatch.setattr(
+        health_mod, "collect_index_gauges", lambda _db: (_ for _ in ()).throw(RuntimeError("db"))
+    )
 
     ready = client.get("/readyz")
     assert ready.status_code == 503
@@ -278,7 +282,9 @@ def test_diff_restore_and_edit_failure_branches(ctx, principals, monkeypatch):
 def test_admin_failures_are_audited(ctx, principals, monkeypatch, method, path, service, form, action):
     client = _client(ctx, principals)
     _login(client, "admin")
-    target = web_mod if service == "create_user" else users_svc
+    import llm_wiki.web.routes.settings_admin as settings_mod
+
+    target = settings_mod if service == "create_user" else users_svc
     monkeypatch.setattr(target, service, lambda *a, **k: (_ for _ in ()).throw(ValidationError("rejected")))
     form["csrf_token"] = _token(client, "/admin/users")
     response = getattr(client, method)(path, data=form, follow_redirects=False)
@@ -535,15 +541,17 @@ def test_write_actions_are_classified_through_public_http_routes(
     }
     monkeypatch.setattr(ctx.docs, "save_attachment", original)
 
-    original = web_mod.create_api_key
-    monkeypatch.setattr(web_mod, "create_api_key", reject(ValidationError("key rejected")))
+    import llm_wiki.web.routes.settings_admin as settings_mod
+
+    original = settings_mod.create_api_key
+    monkeypatch.setattr(settings_mod, "create_api_key", reject(ValidationError("key rejected")))
     response = client.post("/settings/keys", data={"name": "bad", "csrf_token": csrf})
     assert response.status_code == 400 and response.headers["x-error-code"] == "validation"
     assert latest() == {
         "action": "key_change", "target": "/settings/keys",
         "outcome": "error", "detail": "code=validation",
     }
-    monkeypatch.setattr(web_mod, "create_api_key", original)
+    monkeypatch.setattr(settings_mod, "create_api_key", original)
 
     original = ctx.docs.create_folder
     monkeypatch.setattr(ctx.docs, "create_folder", reject(PathError("bad folder")))
@@ -574,13 +582,15 @@ def test_html_path_error_and_unsafe_anonymous_wiki_error(ctx, principals, monkey
     assert response.status_code == 400 and "잘못된 경로" in response.text
 
     client.get("/logout")
-    monkeypatch.setattr(web_mod, "authenticate", lambda *a: (_ for _ in ()).throw(PathError("bad login")))
+    import llm_wiki.web.routes.auth_pages as auth_mod
+
+    monkeypatch.setattr(auth_mod, "authenticate", lambda *a: (_ for _ in ()).throw(PathError("bad login")))
     bad_path = client.post(
         "/login",
         data={"username": "alice", "password": "secret12", "csrf_token": _token(client)},
     )
     assert bad_path.status_code == 400 and "잘못된 경로" in bad_path.text
-    monkeypatch.setattr(web_mod, "authenticate", lambda *a: (_ for _ in ()).throw(ValidationError("login backend")))
+    monkeypatch.setattr(auth_mod, "authenticate", lambda *a: (_ for _ in ()).throw(ValidationError("login backend")))
     post = client.post(
         "/login",
         data={"username": "alice", "password": "secret12", "csrf_token": _token(client)},

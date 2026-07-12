@@ -114,7 +114,7 @@ def test_unhandled_error_returns_500_with_request_id(client, monkeypatch):
         raise RuntimeError("kaboom-internal")
 
     # /api/preview is CSRF-exempt and only needs a session; make its render raise.
-    monkeypatch.setattr("llm_wiki.web.app.render_markdown", boom)
+    monkeypatch.setattr("llm_wiki.web.routes.api.render_markdown", boom)
     r = client.post("/api/preview", data={"content": "# hi", "path": "p.md"})
     assert r.status_code == 500
     body = r.json()
