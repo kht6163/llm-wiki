@@ -20,6 +20,7 @@ from .metrics import SEARCH_LATENCY, SEARCH_QUERIES
 from .util import clamp_int
 
 _TOKEN_RE = re.compile(r"[\w가-힣]+", re.UNICODE)
+_SQLITE_VEC_MAX_K = 4096
 
 
 @dataclass(frozen=True)
@@ -277,11 +278,27 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
     with the matched chunk's distance/heading/text/heading_path, its stable
     ``chunk_id`` and ``ordinal`` (a chunk address for read_chunk), and its
     ``char_start``/``char_end`` offsets (the exact body range, for deep-linking)."""
-    rows = conn.execute(
-        "SELECT chunk_id, distance FROM chunk_vectors "
-        "WHERE embedding MATCH ? AND k=? ORDER BY distance",
-        (query_vector, limit + 1),
-    ).fetchall()
+    def stable_scan():
+        return conn.execute(
+            "SELECT v.chunk_id, vec_distance_cosine(v.embedding, ?) AS distance "
+            "FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id "
+            "JOIN documents d ON d.id=c.doc_id "
+            "ORDER BY distance, d.path_norm, c.ordinal LIMIT ?",
+            (query_vector, limit),
+        ).fetchall()
+
+    # sqlite-vec rejects k > 4096. At that boundary there is no room for the one-row
+    # look-ahead, so use the exact bounded scan directly. This preserves configured caps
+    # above 4096 instead of silently shrinking their candidate pool; the default cap (600)
+    # and every smaller non-tied query retain the indexed KNN path.
+    if limit >= _SQLITE_VEC_MAX_K:
+        rows = stable_scan()
+    else:
+        rows = conn.execute(
+            "SELECT chunk_id, distance FROM chunk_vectors "
+            "WHERE embedding MATCH ? AND k=? ORDER BY distance",
+            (query_vector, limit + 1),
+        ).fetchall()
     if not rows:
         return []
     # vec0 chooses its k rows before application-side tie-breaking, and its equal-distance
@@ -289,13 +306,7 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
     # boundary case. Fall back there to an exact scalar scan whose LIMIT stays bounded;
     # ordinary KNN queries retain the indexed path and fetch just one diagnostic row.
     if len(rows) > limit and rows[limit - 1]["distance"] == rows[limit]["distance"]:
-        rows = conn.execute(
-            "SELECT v.chunk_id, vec_distance_cosine(v.embedding, ?) AS distance "
-            "FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id "
-            "JOIN documents d ON d.id=c.doc_id "
-            "ORDER BY distance, d.path_norm, c.ordinal LIMIT ?",
-            (query_vector, limit),
-        ).fetchall()
+        rows = stable_scan()
     else:
         rows = rows[:limit]
     # Resolve all matched chunks in one query instead of one SELECT per hit.

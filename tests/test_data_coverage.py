@@ -712,6 +712,67 @@ def test_vector_tie_at_vector_cap_uses_stable_subset_across_insertion_orders(tmp
     assert forward == reverse == ["alpha.md", "bravo.md"]
 
 
+def test_vector_max_knn_boundary_and_larger_cap_stay_stable(tmp_path):
+    paths = [f"doc-{index:04}.md" for index in range(4097)]
+    query_vector = Embedder.serialize([1.0, 0.0])
+
+    def build_tied_db(name, insertion_order):
+        root = tmp_path / name
+        root.mkdir()
+        db = _fresh_db(root)
+        rows = list(enumerate(insertion_order, 1))
+        with db.writer() as conn:
+            conn.executemany(
+                "INSERT INTO documents(id,path,path_norm,title,content_hash,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                [
+                    (doc_id, path, path, path[:-3], f"hash-{doc_id}", "2024-01-01", "2024-01-01")
+                    for doc_id, path in rows
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO chunks(id,doc_id,ordinal,heading,text,char_start,char_end) "
+                "VALUES(?,?,0,NULL,'same',0,4)",
+                [(doc_id, doc_id) for doc_id, _path in rows],
+            )
+            conn.executemany(
+                "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(?,?)",
+                [(doc_id, query_vector) for doc_id, _path in rows],
+            )
+        return db
+
+    forward = build_tied_db("max-forward", paths)
+    reverse = build_tied_db("max-reverse", reversed(paths))
+    expected = sorted(paths)
+
+    for limit in (4095, 4096):
+        observed = []
+        for db in (forward, reverse):
+            with db.reader() as conn:
+                observed.append([
+                    info["path_norm"] for _doc_id, info in search._vector(
+                        conn, query_vector, limit
+                    )
+                ])
+        assert observed[0] == observed[1] == expected[:limit]
+
+    with forward.reader() as conn:
+        hits, _vec_info, _match = search._rank(
+            conn,
+            "same",
+            mode="vector",
+            k=5000,
+            folder=None,
+            tags=None,
+            query_vector=query_vector,
+            params=search.FusionParams(vector_factor=1, vector_cap=5000),
+        )
+        assert [
+            conn.execute("SELECT path FROM documents WHERE id=?", (doc_id,)).fetchone()[0]
+            for doc_id, _score in hits
+        ] == expected
+
+
 def test_search_pass_filters_without_batch_and_passage_boundaries():
     class TagConn:
         def execute(self, _sql, _params=()):
