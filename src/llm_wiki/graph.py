@@ -340,8 +340,9 @@ def build_graph(
             "alias": lk["alias"], "anchor": lk["anchor"],
         })
         nodes[src]["degree"] += 1
-        if target_id in nodes:
-            nodes[target_id]["degree"] += 1
+        # Resolved targets came from ``path_by_id`` and unresolved targets are inserted
+        # above, so every emitted edge has a node at both ends.
+        nodes[target_id]["degree"] += 1
 
     return {"ok": True, "root": root_path, "depth": depth, "truncated": truncated,
             "nodes": list(nodes.values()), "edges": edges}

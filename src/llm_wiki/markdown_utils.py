@@ -199,8 +199,10 @@ def derive_content_title(meta: dict, body: str) -> str | None:
     for hm in HEADING_RE.finditer(_mask(body)):
         if hm.group(1) == "#":
             raw_hm = HEADING_RE.fullmatch(body[hm.start():hm.end()])
-            if raw_hm:
-                return raw_hm.group(2).strip()
+            # Masking preserves newlines and span length, so a heading match has the
+            # same structural delimiters in the original slice.
+            assert raw_hm is not None
+            return raw_hm.group(2).strip()
     return None
 
 
@@ -380,8 +382,6 @@ def extract_links(text: str) -> list[Link]:
         else:
             target, anchor = url, None
         target = target.strip()
-        if not target:
-            continue
         links.append(Link(
             type="markdown", target=target,
             alias=text_part.strip() or None,
@@ -451,8 +451,6 @@ def chunk_markdown(
     ordinal = 0
     for heading, heading_path, s, e in sections:
         seg = body_region[s:e]
-        if not seg.strip():
-            continue
         base = meta_end + s
         if len(seg) <= max_chars:
             chunks.append(_mk_chunk(ordinal, heading, seg, base, text, heading_path))
@@ -473,9 +471,11 @@ def chunk_markdown(
                 if not cur:
                     cur_start = pstart
                 cur += ptext
-        if cur.strip():
-            chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text, heading_path))
-            ordinal += 1
+        # Every section is non-empty (a heading line, a checked preface, or the
+        # already-validated headingless body), so paragraph packing always leaves a
+        # final chunk to publish.
+        chunks.append(_mk_chunk(ordinal, heading, cur, base + cur_start, text, heading_path))
+        ordinal += 1
     return chunks
 
 

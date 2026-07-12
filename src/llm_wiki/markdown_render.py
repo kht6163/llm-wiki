@@ -113,8 +113,6 @@ def _highlight(html: str) -> str:
 
 def _wiki_repl(m: re.Match, src_path: str) -> str:
     inner = m.group(1).strip()
-    if not inner:
-        return m.group(0)
     if "|" in inner:
         linkpart, alias = inner.split("|", 1)
     else:
