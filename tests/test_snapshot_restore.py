@@ -175,10 +175,10 @@ def test_snapshot_retries_an_unstable_attachment(tmp_path, monkeypatch):
     real_stage = snapshot_writer._stage_attachment_once
     attempts = 0
 
-    def unstable_twice(path, root, staged):
+    def unstable_twice(path, root, staged, budget):
         nonlocal attempts
         attempts += 1
-        return None if attempts < 3 else real_stage(path, root, staged)
+        return None if attempts < 3 else real_stage(path, root, staged, budget)
 
     monkeypatch.setattr(snapshot_writer, "_stage_attachment_once", unstable_twice)
     out = tmp_path / "retry.tar"
@@ -227,7 +227,7 @@ def test_snapshot_fails_after_three_unstable_attachment_reads(tmp_path, monkeypa
     (src.settings.vault_path / "asset.bin").write_bytes(b"changing")
     attempts = 0
 
-    def always_unstable(path, root, staged):
+    def always_unstable(path, root, staged, budget):
         nonlocal attempts
         attempts += 1
         return None

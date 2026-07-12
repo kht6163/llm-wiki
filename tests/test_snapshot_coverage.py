@@ -9,6 +9,7 @@ import os
 import sqlite3
 import stat
 import tarfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -753,6 +754,150 @@ def test_snapshot_writer_enforces_restore_compatible_budgets(
     assert not list(tmp_path.glob(f".{out.name}.snapshot-tmp-*"))
 
 
+def test_attachment_staging_stops_before_stream_budget_is_exceeded(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    attachment = vault / "large.bin"
+    attachment.write_bytes(b"x" * (1024 * 1024))
+    staged = tmp_path / "staged.bin"
+    budget = snapshot._SnapshotWriteBudget(10, 1024, 1024)
+
+    with pytest.raises(ValueError, match="member size limit"):
+        snapshot._stage_stable_attachment(attachment, vault, staged, budget)
+
+    assert not staged.exists()
+
+
+def test_snapshot_write_budget_rejects_an_exhausted_member_count():
+    budget = snapshot._SnapshotWriteBudget(0, 1024, 1024)
+
+    with pytest.raises(ValueError, match="member count limit"):
+        budget.ensure_member_slot()
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "fifo"])
+def test_attachment_scan_rejects_unsafe_entry_types(tmp_path, entry_kind):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    entry = vault / "unsafe.bin"
+    if entry_kind == "symlink":
+        target = tmp_path / "target.bin"
+        target.write_bytes(b"content")
+        entry.symlink_to(target)
+        message = "unsafe vault path"
+    else:
+        os.mkfifo(entry)
+        message = "regular file"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    with pytest.raises(ValueError, match=message):
+        snapshot._stage_attachment_files(
+            vault,
+            set(),
+            staging,
+            snapshot._SnapshotWriteBudget(10, 1024, 1024),
+        )
+
+
+def test_managed_staging_stops_at_remaining_total_budget(snapshot_source, tmp_path):
+    ctx, _ = snapshot_source
+    staging = tmp_path / "managed-stage"
+    staging.mkdir()
+    with ctx.db.reader() as conn:
+        body_size = len(b"# Snapshot\n\nbody")
+        budget = snapshot._SnapshotWriteBudget(10, 1024, body_size - 1)
+        with pytest.raises(ValueError, match="total size limit"):
+            snapshot._stage_managed_files(conn, staging, budget)
+
+    assert not list(staging.iterdir())
+
+
+def test_writer_rejects_database_budget_before_clone(snapshot_source, tmp_path, monkeypatch):
+    ctx, _ = snapshot_source
+    out = tmp_path / "db-budget.tar"
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBER_BYTES", 1)
+    real_connect = snapshot.sqlite3.connect
+
+    def reject_clone_connect(*args, **kwargs):
+        raise AssertionError("database clone opened before budget rejection")
+
+    monkeypatch.setattr(snapshot.sqlite3, "connect", reject_clone_connect)
+    try:
+        with pytest.raises(ValueError, match="member size limit"):
+            snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+    finally:
+        monkeypatch.setattr(snapshot.sqlite3, "connect", real_connect)
+
+
+def test_writer_stops_when_database_grows_during_backup(snapshot_source, tmp_path):
+    ctx, _ = snapshot_source
+    out = tmp_path / "growing-database.tar"
+
+    class GrowingConnection:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def execute(self, *args, **kwargs):
+            return self.conn.execute(*args, **kwargs)
+
+        def backup(self, target, *, pages, progress):
+            self.conn.backup(target, pages=pages)
+            target.execute("PRAGMA journal_mode=DELETE")
+            target.execute("CREATE TABLE oversized(value BLOB)")
+            logical_size = (
+                self.conn.execute("PRAGMA page_size").fetchone()[0]
+                * self.conn.execute("PRAGMA page_count").fetchone()[0]
+            )
+            target.execute(
+                "INSERT INTO oversized VALUES (zeroblob(?))", (logical_size,)
+            )
+            target.commit()
+            progress(0, 0, 0)
+
+    class GrowingDatabase:
+        @contextmanager
+        def reader(self):
+            with ctx.db.reader() as conn:
+                yield GrowingConnection(conn)
+
+    with pytest.raises(ValueError, match="exceeded its preflight size"):
+        snapshot.write_snapshot(
+            GrowingDatabase(), ctx.settings.vault_path, out, force=False
+        )
+
+    assert not out.exists()
+
+
+def test_writer_rechecks_database_size_after_staging(
+    snapshot_source, tmp_path, monkeypatch
+):
+    ctx, _ = snapshot_source
+    out = tmp_path / "late-growing-database.tar"
+    monkeypatch.setattr(snapshot, "_file_metadata", lambda _path: (10**12, "0" * 64))
+
+    with pytest.raises(ValueError, match="exceeded its preflight size"):
+        snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+
+    assert not out.exists()
+
+
+def test_writer_rejects_member_count_before_staging(snapshot_source, tmp_path, monkeypatch):
+    ctx, _ = snapshot_source
+    out = tmp_path / "count-budget.tar"
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBERS", 1)
+    monkeypatch.setattr(
+        snapshot,
+        "_stage_managed_files",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("managed staging began before member count rejection")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="member count limit"):
+        snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+
+
 def test_restore_report_rejects_actions_after_finalize(snapshot_source, tmp_path):
     _, archive = snapshot_source
     pending = snapshot.restore_snapshot(
@@ -788,11 +933,12 @@ def test_attachment_staging_handles_identity_and_open_failures(
             st_ctime_ns=visible.st_ctime_ns,
         ),
     )
-    assert snapshot._stage_attachment_once(attachment, root, staged) is None
+    budget = snapshot._SnapshotWriteBudget(1, 1024, 1024)
+    assert snapshot._stage_attachment_once(attachment, root, staged, budget) is None
 
     monkeypatch.setattr(snapshot.os, "fstat", real_fstat)
     monkeypatch.setattr(snapshot.os, "open", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open")))
-    assert snapshot._stage_attachment_once(attachment, root, staged) is None
+    assert snapshot._stage_attachment_once(attachment, root, staged, budget) is None
 
 
 def test_snapshot_walk_skips_real_directories(snapshot_source, tmp_path):
@@ -1490,6 +1636,16 @@ def test_path_fingerprint_rejects_races_symlinks_and_special_files(
     with pytest.raises(ValueError, match="symlink or special"):
         snapshot._path_fingerprint(vault)
 
+    directory_vault = tmp_path / "directory-vault"
+    directory_vault.mkdir()
+    outside_directory = tmp_path / "outside-directory"
+    outside_directory.mkdir()
+    (directory_vault / "escape").symlink_to(
+        outside_directory, target_is_directory=True
+    )
+    with pytest.raises(ValueError, match="symlink or special"):
+        snapshot._path_fingerprint(directory_vault)
+
 
 def test_directory_fingerprint_rejects_root_mutation(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
@@ -1517,6 +1673,60 @@ def test_directory_fingerprint_rejects_root_mutation(tmp_path, monkeypatch):
     monkeypatch.setattr(snapshot.os, "lstat", mutate_root)
     with pytest.raises(ValueError, match="changed while hashing"):
         snapshot._path_fingerprint(vault)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"max_members": 1}, "member count limit"),
+        ({"max_member_bytes": 1}, "member size limit"),
+        ({"max_total_bytes": 3}, "total size limit"),
+    ],
+)
+def test_vault_fingerprint_streams_with_restore_budgets(
+    tmp_path, monkeypatch, kwargs, message
+):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "a.bin").write_bytes(b"aa")
+    (vault / "b.bin").write_bytes(b"bb")
+    monkeypatch.setattr(
+        Path,
+        "rglob",
+        lambda *args, **kw: (_ for _ in ()).throw(
+            AssertionError("vault fingerprint used an unbounded global path list")
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        snapshot._path_fingerprint(vault, **kwargs)
+
+
+def test_snapshot_fsyncs_archive_and_parent_before_success(
+    snapshot_source, tmp_path, monkeypatch
+):
+    ctx, _ = snapshot_source
+    out = tmp_path / "durable.tar"
+    events = []
+    real_file_fsync = snapshot._fsync_file
+    real_dir_fsync = snapshot._fsync_directory
+
+    def record_file(path):
+        if ".snapshot-tmp-" in Path(path).name:
+            events.append("archive")
+        return real_file_fsync(path)
+
+    def record_directory(path):
+        if Path(path) == out.parent:
+            events.append("parent")
+        return real_dir_fsync(path)
+
+    monkeypatch.setattr(snapshot, "_fsync_file", record_file)
+    monkeypatch.setattr(snapshot, "_fsync_directory", record_directory)
+
+    snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+
+    assert events[-2:] == ["archive", "parent"]
 
 
 def test_restore_journal_requires_original_fingerprint_and_unambiguous_prepared_state(

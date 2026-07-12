@@ -137,6 +137,31 @@ class _ArchiveFile:
         }
 
 
+@dataclass
+class _SnapshotWriteBudget:
+    members_remaining: int
+    member_limit: int
+    total_limit: int
+    total_used: int = 0
+
+    def check_stream(self, member_size: int, chunk_size: int) -> None:
+        new_size = member_size + chunk_size
+        if new_size > self.member_limit:
+            raise ValueError("snapshot member size limit exceeded")
+        if self.total_used + new_size > self.total_limit:
+            raise ValueError("snapshot total size limit exceeded")
+
+    def ensure_member_slot(self) -> None:
+        if self.members_remaining <= 0:
+            raise ValueError("snapshot member count limit exceeded")
+
+    def commit_member(self, size: int) -> None:
+        self.ensure_member_slot()
+        self.check_stream(0, size)
+        self.members_remaining -= 1
+        self.total_used += size
+
+
 def _normalized_archive_path(rel: str) -> tuple[str, str]:
     """Return a safe POSIX archive path and its case-insensitive identity."""
     if "\\" in rel or any(ord(char) < 0x20 or ord(char) == 0x7F for char in rel):
@@ -153,13 +178,17 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
 
 
-def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, str] | None:
+def _stage_attachment_once(
+    path: Path, root: Path, staged: Path, budget: _SnapshotWriteBudget
+) -> tuple[int, str] | None:
     """Stage one stable regular-file generation without following a final symlink."""
     fd = -1
     try:
         visible = os.lstat(path)
         if not stat.S_ISREG(visible.st_mode):
             return None
+        budget.ensure_member_slot()
+        budget.check_stream(0, visible.st_size)
         flags = (
             os.O_RDONLY
             | getattr(os, "O_BINARY", 0)
@@ -182,6 +211,7 @@ def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, s
         size = 0
         with staged.open("wb") as target:
             while chunk := os.read(fd, _COPY_CHUNK_SIZE):
+                budget.check_stream(size, len(chunk))
                 target.write(chunk)
                 digest.update(chunk)
                 size += len(chunk)
@@ -194,6 +224,7 @@ def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, s
             != (final_visible.st_dev, final_visible.st_ino)
         ):
             return None
+        budget.commit_member(size)
         return size, digest.hexdigest()
     except OSError:
         return None
@@ -202,10 +233,16 @@ def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, s
             os.close(fd)
 
 
-def _stage_stable_attachment(path: Path, root: Path, staged: Path) -> tuple[int, str]:
+def _stage_stable_attachment(
+    path: Path, root: Path, staged: Path, budget: _SnapshotWriteBudget
+) -> tuple[int, str]:
     for _ in range(_ATTACHMENT_ATTEMPTS):
         staged.unlink(missing_ok=True)
-        metadata = _stage_attachment_once(path, root, staged)
+        try:
+            metadata = _stage_attachment_once(path, root, staged, budget)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
         if metadata is not None:
             return metadata
     staged.unlink(missing_ok=True)
@@ -252,7 +289,7 @@ def _verify_archive(path: Path, files: list[_ArchiveFile]) -> None:
 
 
 def _stage_managed_files(
-    conn: sqlite3.Connection, staging: Path
+    conn: sqlite3.Connection, staging: Path, budget: _SnapshotWriteBudget
 ) -> tuple[list[_ArchiveFile], set[str]]:
     rows = conn.execute(
         "SELECT d.path, r.body FROM documents d "
@@ -271,15 +308,22 @@ def _stage_managed_files(
             raise ValueError(f"duplicate normalized snapshot path: {archive_path}")
         normalized.add(identity)
         source = staging / f"managed-{index}"
+        budget.ensure_member_slot()
         digest = hashlib.sha256()
         size = 0
         body = str(row["body"])
-        with source.open("wb") as target:
-            for offset in range(0, len(body), _COPY_CHUNK_SIZE // 4):
-                chunk = body[offset:offset + _COPY_CHUNK_SIZE // 4].encode("utf-8")
-                target.write(chunk)
-                digest.update(chunk)
-                size += len(chunk)
+        try:
+            with source.open("wb") as target:
+                for offset in range(0, len(body), _COPY_CHUNK_SIZE // 4):
+                    chunk = body[offset:offset + _COPY_CHUNK_SIZE // 4].encode("utf-8")
+                    budget.check_stream(size, len(chunk))
+                    target.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+        except BaseException:
+            source.unlink(missing_ok=True)
+            raise
+        budget.commit_member(size)
         files.append(_ArchiveFile(archive_path, "managed", source, size, digest.hexdigest()))
     if len(files) != expected:
         raise RuntimeError("active document has no revision at its current version")
@@ -287,7 +331,10 @@ def _stage_managed_files(
 
 
 def _stage_attachment_files(
-    vault: Path, normalized: set[str], staging: Path
+    vault: Path,
+    normalized: set[str],
+    staging: Path,
+    budget: _SnapshotWriteBudget,
 ) -> list[_ArchiveFile]:
     if not vault.exists():
         return []
@@ -316,9 +363,33 @@ def _stage_attachment_files(
             raise ValueError(f"duplicate normalized snapshot path: {archive_path}")
         normalized.add(identity)
         source = staging / f"attachment-{len(files)}"
-        size, digest = _stage_stable_attachment(path, root, source)
+        size, digest = _stage_stable_attachment(path, root, source, budget)
         files.append(_ArchiveFile(archive_path, "attachment", source, size, digest))
     return files
+
+
+def _count_snapshot_members(conn: sqlite3.Connection, vault: Path) -> int:
+    managed = int(
+        conn.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0]
+    )
+    attachments = 0
+    if vault.exists():
+        for path in vault.rglob("*"):
+            rel_path = path.relative_to(vault)
+            if rel_path.parts and rel_path.parts[0] == ".tmp":
+                continue
+            visible = os.lstat(path)
+            if stat.S_ISDIR(visible.st_mode):
+                continue
+            if stat.S_ISLNK(visible.st_mode):
+                raise ValueError(f"unsafe vault path: {rel_path.as_posix()!r}")
+            if not stat.S_ISREG(visible.st_mode):
+                raise ValueError(
+                    f"vault entry must be a regular file: {rel_path.as_posix()!r}"
+                )
+            if path.suffix.lower() != ".md":
+                attachments += 1
+    return managed + attachments + 2
 
 
 def write_snapshot(
@@ -347,21 +418,53 @@ def write_snapshot(
                 staging = Path(directory)
                 cloned_db = staging / "wiki.db"
                 with db.reader() as conn:
-                    conn.execute("VACUUM INTO ?", (str(cloned_db),))
+                    member_count = _count_snapshot_members(conn, vault)
+                    if member_count > MAX_SNAPSHOT_MEMBERS:
+                        raise ValueError("snapshot member count limit exceeded")
+                    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+                    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+                    logical_database_size = page_size * page_count
+                    budget = _SnapshotWriteBudget(
+                        member_count,
+                        MAX_SNAPSHOT_MEMBER_BYTES,
+                        MAX_SNAPSHOT_TOTAL_BYTES,
+                    )
+                    budget.commit_member(logical_database_size)
+                    clone_target = sqlite3.connect(cloned_db)
+                    try:
+                        def check_backup_size(
+                            _status: int, _remaining: int, _total: int
+                        ) -> None:
+                            if (
+                                cloned_db.exists()
+                                and cloned_db.stat().st_size > logical_database_size
+                            ):
+                                raise ValueError(
+                                    "snapshot database exceeded its preflight size"
+                                )
+
+                        conn.backup(clone_target, pages=64, progress=check_backup_size)
+                        clone_target.execute("PRAGMA journal_mode=DELETE")
+                    finally:
+                        clone_target.close()
 
                 clone = sqlite3.connect(cloned_db)
                 clone.row_factory = sqlite3.Row
                 try:
-                    managed, normalized = _stage_managed_files(clone, staging)
+                    managed, normalized = _stage_managed_files(clone, staging, budget)
                     schema = get_meta(clone, "schema_version")
                     embedding_model = get_meta(clone, "embedding_model")
                     embedding_dim = get_meta(clone, "embedding_dim")
                 finally:
                     clone.close()
 
-                attachments = _stage_attachment_files(vault, normalized, staging)
+                attachments = _stage_attachment_files(
+                    vault, normalized, staging, budget
+                )
                 archive_files = managed + attachments
                 database_size, database_digest = _file_metadata(cloned_db)
+                if database_size > logical_database_size:
+                    raise ValueError("snapshot database exceeded its preflight size")
                 schema_version = int(schema) if schema else None
                 manifest = {
                     "format": SNAPSHOT_FORMAT,
@@ -380,19 +483,9 @@ def write_snapshot(
                 manifest_data = json.dumps(
                     manifest, ensure_ascii=False, indent=2
                 ).encode("utf-8")
-                if len(archive_files) + 2 > MAX_SNAPSHOT_MEMBERS:
-                    raise ValueError("snapshot member count limit exceeded")
                 if len(manifest_data) > MAX_SNAPSHOT_MANIFEST_BYTES:
                     raise ValueError("snapshot manifest size limit exceeded")
-                member_sizes = [
-                    database_size,
-                    len(manifest_data),
-                    *(file.size for file in archive_files),
-                ]
-                if any(size > MAX_SNAPSHOT_MEMBER_BYTES for size in member_sizes):
-                    raise ValueError("snapshot member size limit exceeded")
-                if sum(member_sizes) > MAX_SNAPSHOT_TOTAL_BYTES:
-                    raise ValueError("snapshot total size limit exceeded")
+                budget.commit_member(len(manifest_data))
                 with tarfile.open(temporary_out, "w") as tar:
                     tar.add(cloned_db, arcname="wiki.db")
                     for file in archive_files:
@@ -413,11 +506,13 @@ def write_snapshot(
                 )
                 if temporary_out.stat().st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
                     raise ValueError("snapshot archive size limit exceeded")
+                _fsync_file(temporary_out)
             if force:
                 os.replace(temporary_out, out)
             else:
                 os.link(temporary_out, out)
                 temporary_out.unlink()
+            _fsync_directory(out.parent)
         except BaseException:
             temporary_out.unlink(missing_ok=True)
             raise
@@ -756,7 +851,13 @@ def _fsync_staging(staged_db: Path, staged_vault: Path) -> None:
         _fsync_directory(directory)
 
 
-def _path_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
+def _path_fingerprint(
+    path: Path,
+    *,
+    max_members: int = MAX_SNAPSHOT_MEMBERS,
+    max_member_bytes: int = MAX_SNAPSHOT_MEMBER_BYTES,
+    max_total_bytes: int = MAX_SNAPSHOT_TOTAL_BYTES,
+) -> tuple[int, int, int, int, str]:
     """Return a stable identity/content proof, rejecting symlinks and special files."""
     visible = os.lstat(path)
     kind = stat.S_IFMT(visible.st_mode)
@@ -775,6 +876,10 @@ def _path_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
             before = os.fstat(fd)
             if _stat_identity(visible) != _stat_identity(before):
                 raise ValueError(f"restore target identity changed: {path}")
+            if before.st_size > max_member_bytes:
+                raise ValueError("restore fingerprint member size limit exceeded")
+            if before.st_size > max_total_bytes:
+                raise ValueError("restore fingerprint total size limit exceeded")
             file_digest = hashlib.sha256()
             size = 0
             while chunk := os.read(fd, _COPY_CHUNK_SIZE):
@@ -789,12 +894,33 @@ def _path_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
                 os.close(fd)
     if not stat.S_ISDIR(visible.st_mode):
         raise ValueError(f"restore target must be a regular file or directory: {path}")
-    entries: list[tuple[object, ...]] = []
-    for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
-        relative = child.relative_to(path).as_posix()
-        child_visible = os.lstat(child)
-        if stat.S_ISDIR(child_visible.st_mode):
-            entries.append(
+    tree_digest = hashlib.sha256()
+    file_count = 0
+    total_bytes = 0
+
+    def add_entry(entry: tuple[object, ...]) -> None:
+        tree_digest.update(
+            json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        tree_digest.update(b"\n")
+
+    for current_raw, directory_names, file_names in os.walk(path, followlinks=False):
+        current = Path(current_raw)
+        directory_names.sort()
+        file_names.sort()
+        for name in directory_names:
+            child = current / name
+            relative = child.relative_to(path).as_posix()
+            child_visible = os.lstat(child)
+            if not stat.S_ISDIR(child_visible.st_mode) or stat.S_ISLNK(
+                child_visible.st_mode
+            ):
+                raise ValueError(
+                    f"restore vault contains a symlink or special file: {child}"
+                )
+            add_entry(
                 (
                     relative,
                     "directory",
@@ -802,18 +928,31 @@ def _path_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
                     child_visible.st_ino,
                 )
             )
-        elif stat.S_ISREG(child_visible.st_mode):
-            fingerprint = _path_fingerprint(child)
-            entries.append((relative, "file", *fingerprint))
-        else:
-            raise ValueError(f"restore vault contains a symlink or special file: {child}")
+        for name in file_names:
+            child = current / name
+            relative = child.relative_to(path).as_posix()
+            child_visible = os.lstat(child)
+            if not stat.S_ISREG(child_visible.st_mode) or stat.S_ISLNK(
+                child_visible.st_mode
+            ):
+                raise ValueError(
+                    f"restore vault contains a symlink or special file: {child}"
+                )
+            file_count += 1
+            if file_count > max_members:
+                raise ValueError("restore fingerprint member count limit exceeded")
+            fingerprint = _path_fingerprint(
+                child,
+                max_members=max_members,
+                max_member_bytes=max_member_bytes,
+                max_total_bytes=max_total_bytes - total_bytes,
+            )
+            total_bytes += fingerprint[3]
+            add_entry((relative, "file", *fingerprint))
     after = os.lstat(path)
     if _stat_identity(visible) != _stat_identity(after):
         raise ValueError(f"restore target changed while hashing: {path}")
-    tree_digest = hashlib.sha256(
-        json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
-    return visible.st_dev, visible.st_ino, kind, len(entries), tree_digest
+    return visible.st_dev, visible.st_ino, kind, total_bytes, tree_digest.hexdigest()
 
 
 @dataclass
