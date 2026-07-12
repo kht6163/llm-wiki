@@ -1117,6 +1117,40 @@ def test_import_rename_skips_variants_claimed_earlier_in_the_batch(ctx, principa
     assert docs.get("a-3.md")["content"] == "lower"
 
 
+def test_import_rename_reports_exhaustion_without_writes(ctx, principals, tmp_path, monkeypatch):
+    docs, editor = ctx.docs, principals["editor"]
+    for suffix in ("", "-2", "-3"):
+        docs.create(editor, f"note{suffix}.md", f"existing {suffix}", embed=False)
+    source = tmp_path / "source"
+    _write(source, "note.md", "incoming")
+    monkeypatch.setattr("llm_wiki.services.documents._IMPORT_RENAME_MAX_SUFFIX", 3, raising=False)
+    with ctx.db.reader() as conn:
+        before = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("documents", "revisions", "audit_log")
+        )
+
+    report = docs.import_from_directory(editor, source, on_conflict="rename", embed=False)
+
+    assert report["renamed"] == 0
+    assert report["plan"] == []
+    assert report["errors"] == [
+        {"path": "note.md", "error": "no free rename variant for note.md (3 tried)."}
+    ]
+    with ctx.db.reader() as conn:
+        after = tuple(
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("documents", "revisions", "audit_log")
+        )
+    assert after == before
+    assert not docs.exists("note-4.md")
+    assert sorted(path.name for path in docs.vault.glob("note*.md")) == [
+        "note-2.md",
+        "note-3.md",
+        "note.md",
+    ]
+
+
 def test_import_large_file_records_skip_audit_outside_dry_run(
     ctx, principals, tmp_path, monkeypatch
 ):

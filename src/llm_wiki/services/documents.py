@@ -99,6 +99,7 @@ ALLOWED_ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp",
 IMPORT_MAX_BYTES = 50 * 1024 * 1024  # per-file ceiling for one note
 IMPORT_DEFAULT_INCLUDE = ("*.md", "*.markdown", "*.mdown", "*.mkd")
 IMPORT_MD_EXTS = {".md", ".markdown", ".mdown", ".mkd"}
+_IMPORT_RENAME_MAX_SUFFIX = 10_000
 # Directories that legitimately appear inside an external vault but must never be
 # ingested (app/editor metadata, VCS, dependency trees, our own scratch/trash).
 IMPORT_EXCLUDED_DIRS = {
@@ -5019,11 +5020,9 @@ class DocumentService:
         def free_variant(target_rel: str) -> str:
             base = target_rel[:-3]  # strip the guaranteed lowercase '.md'
             with self.db.reader() as conn:
-                n = 2
-                while True:
+                for n in range(2, _IMPORT_RENAME_MAX_SUFFIX + 1):
                     cand = f"{base}-{n}.md"
                     cnorm = path_norm(cand)
-                    n += 1
                     if cnorm in claimed:
                         continue
                     if conn.execute(
@@ -5031,6 +5030,9 @@ class DocumentService:
                     ).fetchone():
                         continue
                     return cand
+            raise ValidationError(
+                f"no free rename variant for {target_rel} ({_IMPORT_RENAME_MAX_SUFFIX} tried)."
+            )
 
         # -- per-file classify + (optionally) write -------------------------
         def handle(md_abs: Path, source_rel: str) -> None:
