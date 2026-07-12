@@ -347,7 +347,7 @@ describe("file tree state and refresh", () => {
     expect(window.WikiShell).toBeDefined();
   });
 
-  test("removes stale active state before returning for an absent path or disappearing tree", async () => {
+  test("removes stale active state before returning for an absent or unmatched path", async () => {
     shellPage({ tree: doc("old.md") });
     document.querySelector(".tree-doc").classList.add("active");
     await boot();
@@ -355,14 +355,6 @@ describe("file tree state and refresh", () => {
 
     shellPage({ tree: doc("other.md") });
     document.body.insertAdjacentHTML("beforeend", '<span id="rt-meta" data-path="missing.md"></span>');
-    const tree = document.querySelector("#file-tree");
-    const getElementById = vi.spyOn(document, "getElementById");
-    let treeReads = 0;
-    getElementById.mockImplementation((id) => {
-      if (id !== "file-tree") return Document.prototype.getElementById.call(document, id);
-      treeReads += 1;
-      return treeReads === 1 ? tree : null;
-    });
     await boot();
     expect(document.querySelector(".tree-doc").classList.contains("active")).toBe(false);
   });
@@ -513,8 +505,7 @@ describe("inline creation and tree menus", () => {
     shellPage({ tree: folder("docs") });
     document.body.insertAdjacentHTML("beforeend", '<button id="new-doc" data-action="new-doc"></button>');
     document.querySelector("summary").insertAdjacentHTML("beforeend", '<button id="new-here" data-action="new-doc-here" data-folder="docs"></button>');
-    const encode = vi.spyOn(globalThis, "encodeURIComponent");
-    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubGlobal("location", { href: "" });
     await boot();
 
     document.querySelector("#new-doc").click();
@@ -522,10 +513,8 @@ describe("inline creation and tree menus", () => {
     expect(document.querySelector(".tree-twisty-leaf")).not.toBeNull();
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Other", bubbles: true }));
     input.value = "root note";
-    history.replaceState(null, "", "/new?path=root%20note");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(encode).toHaveBeenCalledWith("root note");
-    expect(location.pathname + location.search).toBe("/new?path=root%20note");
+    expect(location.href).toBe("/new?path=root%20note");
     expect(document.querySelector(".tree-inline-input")).toBeNull();
 
     const here = new MouseEvent("click", { bubbles: true, cancelable: true });
@@ -534,17 +523,15 @@ describe("inline creation and tree menus", () => {
     input = document.querySelector(".tree-inline-input");
     expect(input.previousElementSibling.textContent).toBe("docs/");
     input.value = "child";
-    history.replaceState(null, "", "/new?path=docs%2Fchild");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(encode).toHaveBeenCalledWith("docs/child");
+    expect(location.href).toBe("/new?path=docs%2Fchild");
 
     document.querySelector("summary").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
     document.querySelector(".ctx-item").click();
     input = document.querySelector(".tree-inline-input");
     input.value = "menu child";
-    history.replaceState(null, "", "/new?path=docs%2Fmenu%20child");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(encode).toHaveBeenCalledWith("docs/menu child");
+    expect(location.href).toBe("/new?path=docs%2Fmenu%20child");
 
     document.querySelector("#file-tree").dispatchEvent(new MouseEvent("contextmenu", { bubbles: true }));
     document.querySelectorAll(".ctx-item")[1].click();
@@ -556,9 +543,8 @@ describe("inline creation and tree menus", () => {
     document.querySelector(".ctx-item").click();
     input = document.querySelector(".tree-inline-input");
     input.value = "menu root";
-    history.replaceState(null, "", "/new?path=menu%20root");
     input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    expect(encode).toHaveBeenCalledWith("menu root");
+    expect(location.href).toBe("/new?path=menu%20root");
   });
 
   test("falls back to the tree when a requested folder or child container is missing", async () => {

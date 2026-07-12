@@ -202,14 +202,12 @@
         saveOpen(s);
       });
     });
-    revealActive();
+    revealActive(tree);
   }
 
-  function revealActive() {
+  function revealActive(tree) {
     var meta = document.getElementById("rt-meta");
     var path = meta && meta.getAttribute("data-path");
-    var tree = document.getElementById("file-tree");
-    if (!tree) return;
     tree.querySelectorAll(".tree-doc.active").forEach(function (a) { a.classList.remove("active"); });
     if (!path) return;
     var link = tree.querySelector('.tree-doc[data-doc="' + cssEsc(path) + '"]');
