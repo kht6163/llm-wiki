@@ -14,7 +14,7 @@
   function msg(d) { return (d && d.error && (d.error.message || d.error)) || (d && d.message) || "오류"; }
   function el(tag, cls, text) {
     var e = document.createElement(tag);
-    if (cls) e.className = cls;
+    e.className = cls;
     if (text != null) e.textContent = text;
     return e;
   }
@@ -42,7 +42,7 @@
       var k = el("input", "pe-key"); k.type = "text"; k.placeholder = "속성"; k.value = key || "";
       k.setAttribute("aria-label", "속성 이름");
       var v = el("input", "pe-val"); v.type = "text"; v.placeholder = "값 (여러 개는 쉼표로)";
-      v.value = (values || []).join(", "); v.setAttribute("aria-label", "속성 값");
+      v.value = values.join(", "); v.setAttribute("aria-label", "속성 값");
       var rm = el("button", "pe-rm", "×"); rm.type = "button";
       rm.title = "이 속성 삭제"; rm.setAttribute("aria-label", "이 속성 삭제");
       rm.addEventListener("click", function () { row.remove(); });

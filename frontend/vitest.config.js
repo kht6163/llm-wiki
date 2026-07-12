@@ -6,7 +6,11 @@ export default defineConfig({
     setupFiles: ["./test/setup.js"],
     coverage: {
       provider: "v8",
-      include: ["src/**/*.{js,jsx}"],
+      allowExternal: true,
+      include: [
+        "src/**/*.{js,jsx}",
+        "../src/llm_wiki/web/static/{datetime,preview,props,related,tasks,outline}.js",
+      ],
       exclude: ["node_modules/**", "coverage/**", "../src/llm_wiki/web/static/vendor/**"],
       reporter: ["text", "json-summary"],
       thresholds: {
