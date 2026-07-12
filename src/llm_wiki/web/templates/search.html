@@ -68,6 +68,14 @@
     <button class="primary" type="submit">검색</button>
   </form>
 
+  <div class="saved-searches" id="saved-searches">
+    <div class="saved-searches-head">
+      <span class="saved-searches-label">저장한 검색</span>
+      <button type="button" id="save-search-btn" data-save-search>현재 검색 저장</button>
+    </div>
+    <ul class="saved-searches-list" id="saved-searches-list" aria-label="저장된 검색"></ul>
+  </div>
+
   {% if search_page and (search_page.filters.normalized or active_folder or active_tags) %}
   <div class="search-filters" aria-label="적용된 검색 필터">
     <span class="search-filters-label">필터</span>

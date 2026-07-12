@@ -39,8 +39,8 @@ async def test_tools_registered(ctx):
     mcp = create_mcp_server(ctx)
     names = {t.name for t in await mcp.list_tools()}
     expected = {
-        "search_documents", "read_document", "get_document_info", "get_outline", "read_chunk",
-        "list_documents",
+        "search_documents", "read_document", "read_documents", "get_document_info", "get_outline",
+        "read_chunk", "list_documents",
         "list_recent_changes", "list_activity", "list_broken_links", "get_tags", "get_links",
         "get_backlinks", "resolve_links", "get_revisions", "get_revision", "compare_revisions",
         "get_graph",

@@ -38,6 +38,7 @@ log = logging.getLogger("llm_wiki.mcp")
 MAX_QUERY_CHARS = 4096
 MAX_TAGS = 100
 MAX_RESOLVE_TARGETS = 500
+MAX_READ_DOCUMENTS = 20
 
 
 def _validate_text(value: str, name: str) -> None:
@@ -143,7 +144,8 @@ for an llms.txt site map of every document, or `list_folders`/`get_tags` for the
 For a question, prefer `assemble_context` (returns citation-tagged, budget-bounded context) \
 over reading documents one by one; use `search_documents` for exploratory discovery.
 - READ: `read_document` returns a `version` — that is the `base_version` you echo back when \
-writing. `get_outline`/`read_chunk` read a slice without pulling the whole body.
+writing. `read_documents` batches up to 20 paths (per-item errors keep the rest). \
+`get_outline`/`read_chunk` read a slice without pulling the whole body.
 - WRITE (editor/admin only): pass the `base_version` you last read. If the document changed \
 since, the write is REJECTED with a `conflict` error carrying the current content — re-read \
 and retry, never force. Prefer token-cheap targeted edits (`patch_document`, `append_section`, \
@@ -401,6 +403,38 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 d = {**d, "content": body[:max_chars], "truncated": True, "full_length": len(body)}
             return {"ok": True, **d}
         return await _call(ctx, fn, "read_document")
+
+    @mcp.tool(description="Batch-read several documents in one call (max 20 paths). Each path is "
+                          "read like read_document (content, version, title, path, …); missing or "
+                          "invalid paths become per-item {ok:false, path, error} entries without "
+                          "failing the whole batch. Empty list or >20 paths → validation error. "
+                          "Optional max_chars truncates every successful body the same way.")
+    async def read_documents(
+        ctx: Context,
+        paths: Annotated[list[str], Field(description="Document paths to read (1..20).")],
+        max_chars: Annotated[int | None, Field(
+            description="Truncate each successful body to this many chars.")] = None,
+    ) -> dict:
+        def fn(_p: Principal) -> dict:
+            if not paths:
+                raise ValidationError("paths must be a non-empty list.")
+            if len(paths) > MAX_READ_DOCUMENTS:
+                raise ValidationError(
+                    f"too many paths (max {MAX_READ_DOCUMENTS} per call).")
+            items: list[dict] = []
+            for path in paths:
+                try:
+                    d = docs.get(path)
+                    body = d.get("content")
+                    if max_chars and isinstance(body, str) and len(body) > max_chars:
+                        d = {**d, "content": body[:max_chars], "truncated": True,
+                             "full_length": len(body)}
+                    items.append({"ok": True, **d})
+                except WikiError as e:
+                    err = e.to_dict()["error"]
+                    items.append({"ok": False, "path": path, "error": err})
+            return {"ok": True, "items": items, "count": len(items)}
+        return await _call(ctx, fn, "read_documents")
 
     @mcp.tool(description="Cheap metadata-only check for a document: returns version, title, tags, "
                           "folder, updated_at, updated_by, and last_via (web=human, mcp=agent, cli) "
