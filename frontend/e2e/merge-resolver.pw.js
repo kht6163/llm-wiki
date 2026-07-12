@@ -154,3 +154,63 @@ test("해결 뒤 제3자 갱신은 두 번째 409와 새 resolver를 만든다",
   await stale.context.close();
   await third.context.close();
 });
+
+test("모호한 제목과 본문을 명시 해결하고 반복 409 뒤 최종 선택을 보존한다", async ({ browser }) => {
+  const first = await session(browser);
+  const stale = await session(browser);
+  const third = await session(browser);
+  await first.page.goto("/doc/merge-title.md/edit");
+  await stale.page.goto("/doc/merge-title.md/edit");
+
+  await first.page.getByLabel("제목").fill("Current <title> 🚀");
+  await replaceEditor(first.page, "top\nserver two");
+  await first.page.getByRole("button", { name: "저장" }).click();
+  await stale.page.getByLabel("제목").fill("Mine & title 🧠");
+  await replaceEditor(stale.page, "top\nmine two");
+  await stale.page.getByRole("button", { name: "저장" }).click();
+
+  const firstPayload = JSON.parse(await stale.page.locator("#merge-payload").textContent());
+  expect(firstPayload).toMatchObject({
+    base_title: "Base title 😀",
+    mine_title: "Mine & title 🧠",
+    current_title: "Current <title> 🚀",
+    merged_title: null,
+    title_conflict: true,
+  });
+  await expect(stale.page.getByRole("group", { name: "제목 충돌" })).toBeVisible();
+  await stale.page.getByRole("button", { name: "내 제목 선택" }).click();
+  await stale.page.getByRole("button", { name: "내 편집 선택" }).click();
+  await expect(stale.page.getByRole("button", { name: "저장" })).toBeEnabled();
+
+  await third.page.goto("/doc/merge-title.md/edit");
+  await third.page.getByLabel("제목").fill("Third title");
+  await replaceEditor(third.page, "top\nserver three");
+  await third.page.getByRole("button", { name: "저장" }).click();
+  const rejectedAgain = stale.page.waitForResponse((response) =>
+    response.url().endsWith("/doc/merge-title.md/edit") && response.request().method() === "POST"
+  );
+  await stale.page.getByRole("button", { name: "저장" }).click();
+  expect((await rejectedAgain).status()).toBe(409);
+
+  const secondPayload = JSON.parse(await stale.page.locator("#merge-payload").textContent());
+  expect(secondPayload).toMatchObject({
+    base_title: "Current <title> 🚀",
+    mine_title: "Mine & title 🧠",
+    current_title: "Third title",
+    merged_title: null,
+    title_conflict: true,
+  });
+  await expect(stale.page.getByLabel("제목")).toHaveValue("Mine & title 🧠");
+  await stale.page.locator("#merge-title-manual").fill("Final title 😀");
+  await stale.page.getByRole("button", { name: "직접 편집 적용" }).first().click();
+  await stale.page.locator('.merge-conflict[data-conflict-index] textarea').fill("final body");
+  await stale.page.locator('.merge-conflict[data-conflict-index] [data-resolution="manual"]').click();
+  await stale.page.getByRole("button", { name: "저장" }).click();
+
+  await expect(stale.page).toHaveURL(/\/doc\/merge-title\.md$/);
+  await expect(stale.page.getByRole("heading", { level: 1, name: "Final title 😀" })).toBeVisible();
+  await expectExactPersisted(stale.page, "merge-title.md", "top\r\nfinal body");
+  await first.context.close();
+  await stale.context.close();
+  await third.context.close();
+});

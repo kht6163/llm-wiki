@@ -101,6 +101,7 @@ def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
         "top\r\nalpha\r\nkeep-a\r\nbeta\r\nkeep-b\r\ngamma\r\nbottom\r\n",
     )
     docs.create(admin, "merge-repeat.md", "top\r\nshared")
+    docs.create(admin, "merge-title.md", "top\r\nshared", title="Base title 😀")
     for index in range(1, 6):
         docs.create(
             admin,

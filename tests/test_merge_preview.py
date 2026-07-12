@@ -38,7 +38,7 @@ def test_merge_preview_uses_exact_revision_and_does_not_mutate(ctx, principals, 
         return real_merge(base_text, mine_text, current_text)
 
     monkeypatch.setattr(documents_module, "three_way_merge", tracked)
-    preview = docs.merge_preview(editor, "merge.md", 1, mine)
+    preview = docs.merge_preview(editor, "merge.md", 1, mine, "Merge")
     current_updated_at = docs.get("merge.md")["updated_at"]
 
     assert calls == [(base, mine, current)]
@@ -49,8 +49,13 @@ def test_merge_preview_uses_exact_revision_and_does_not_mutate(ctx, principals, 
         "updated_at": current_updated_at,
         "current_via": "?",
         "base": base,
+        "base_title": "merge",
         "mine": mine,
+        "mine_title": "Merge",
         "current": current,
+        "current_title": "merge",
+        "merged_title": "Merge",
+        "title_conflict": False,
         "merged": "ONE\ntwo\nTHREE\n",
         "conflicts": [],
         "manual_only": False,
@@ -97,11 +102,39 @@ def test_merge_preview_serializes_ordered_conflicts(
     docs.create(editor, "overlap.md", base)
     docs.update(editor, "overlap.md", 1, current)
 
-    preview = docs.merge_preview(editor, "overlap.md", 1, mine)
+    preview = docs.merge_preview(editor, "overlap.md", 1, mine, "overlap")
 
     assert preview["merged"] == base
     assert preview["conflicts"] == [expected]
     assert preview["manual_only"] is False
+
+
+@pytest.mark.parametrize(
+    ("mine_title", "current_title", "expected", "conflict"),
+    [
+        ("Base", "Current", "Current", False),
+        ("Mine", "Base", "Mine", False),
+        ("Same", "Same", "Same", False),
+        ("Mine", "Current", None, True),
+    ],
+)
+def test_merge_preview_three_way_resolves_titles_without_persisting(
+    ctx, principals, mine_title, current_title, expected, conflict
+):
+    docs = ctx.docs
+    editor = principals["editor"]
+    docs.create(editor, "titles.md", "base body", title="Base")
+    docs.update(editor, "titles.md", 1, "current body", title=current_title)
+    before = _state(ctx, "titles.md")
+
+    preview = docs.merge_preview(editor, "titles.md", 1, "mine body", mine_title)
+
+    assert preview["base_title"] == "Base"
+    assert preview["mine_title"] == mine_title
+    assert preview["current_title"] == current_title
+    assert preview["merged_title"] == expected
+    assert preview["title_conflict"] is conflict
+    assert _state(ctx, "titles.md") == before
 
 
 @pytest.mark.parametrize(
@@ -133,7 +166,7 @@ def test_merge_preview_preserves_exact_engine_placeholder_offsets(
     docs.create(editor, "offsets.md", base)
     docs.update(editor, "offsets.md", 1, current)
 
-    preview = docs.merge_preview(editor, "offsets.md", 1, mine)
+    preview = docs.merge_preview(editor, "offsets.md", 1, mine, "offsets")
 
     assert preview["merged"] == merged
     assert preview["conflicts"][0]["merged_start"] == expected_start
@@ -150,7 +183,7 @@ def test_merge_preview_converts_non_bmp_offset_to_utf16_code_units(ctx, principa
     docs.create(editor, "emoji-offset.md", base)
     docs.update(editor, "emoji-offset.md", 1, current)
 
-    preview = docs.merge_preview(editor, "emoji-offset.md", 1, mine)
+    preview = docs.merge_preview(editor, "emoji-offset.md", 1, mine, "emoji-offset")
 
     assert preview["merged"] == base
     assert preview["conflicts"][0]["base"] == "repeat🔥\n"
@@ -175,7 +208,7 @@ def test_merge_preview_missing_base_is_explicit_manual_fallback(ctx, principals,
     from llm_wiki.services import documents as documents_module
 
     monkeypatch.setattr(documents_module, "three_way_merge", forbidden_call)
-    preview = docs.merge_preview(editor, "pruned.md", 1, "mine")
+    preview = docs.merge_preview(editor, "pruned.md", 1, "mine", "pruned")
     current_updated_at = docs.get("pruned.md")["updated_at"]
 
     assert preview == {
@@ -185,8 +218,13 @@ def test_merge_preview_missing_base_is_explicit_manual_fallback(ctx, principals,
         "updated_at": current_updated_at,
         "current_via": "?",
         "base": None,
+        "base_title": None,
         "mine": "mine",
+        "mine_title": "pruned",
         "current": "current",
+        "current_title": "pruned",
+        "merged_title": "pruned",
+        "title_conflict": False,
         "merged": None,
         "conflicts": [],
         "manual_only": True,
@@ -198,9 +236,9 @@ def test_merge_preview_enforces_write_authorization_and_document_existence(ctx, 
     docs.create(principals["editor"], "private.md", "body")
 
     with pytest.raises(ForbiddenError):
-        docs.merge_preview(principals["viewer"], "private.md", 1, "mine")
+        docs.merge_preview(principals["viewer"], "private.md", 1, "mine", "private")
     with pytest.raises(NotFoundError):
-        docs.merge_preview(principals["editor"], "missing.md", 1, "mine")
+        docs.merge_preview(principals["editor"], "missing.md", 1, "mine", "missing")
 
 
 def test_merge_preview_rejects_a_missing_current_revision(ctx, principals):
@@ -214,4 +252,18 @@ def test_merge_preview_rejects_a_missing_current_revision(ctx, principals):
         )
 
     with pytest.raises(RuntimeError, match="current document revision is missing or corrupt"):
-        docs.merge_preview(editor, "corrupt.md", 1, "mine")
+        docs.merge_preview(editor, "corrupt.md", 1, "mine", "corrupt")
+
+
+def test_merge_preview_rejects_incoherent_current_title_snapshot(ctx, principals):
+    docs = ctx.docs
+    editor = principals["editor"]
+    docs.create(editor, "corrupt-title.md", "body", title="Revision title")
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "UPDATE documents SET title=? WHERE path_norm=?",
+            ("Document title", "corrupt-title.md"),
+        )
+
+    with pytest.raises(RuntimeError, match="current document title revision is missing or corrupt"):
+        docs.merge_preview(editor, "corrupt-title.md", 1, "mine", "Mine title")

@@ -610,9 +610,9 @@ def test_conflict_page_uses_the_preview_snapshot_if_current_changes_during_respo
     ctx.docs.update(principals["admin"], "response-race.md", 1, "current two")
     real_preview = ctx.docs.merge_preview
 
-    def raced_preview(principal, path, base_version, mine):
+    def raced_preview(principal, path, base_version, mine, mine_title):
         ctx.docs.update(principals["editor"], path, 2, "current three")
-        return real_preview(principal, path, base_version, mine)
+        return real_preview(principal, path, base_version, mine, mine_title)
 
     monkeypatch.setattr(ctx.docs, "merge_preview", raced_preview)
     response = client.post(
@@ -640,9 +640,9 @@ def test_conflict_page_preserves_manual_recovery_if_document_is_deleted_before_p
 
     real_preview = ctx.docs.merge_preview
 
-    def deleted_preview(principal, path, base_version, mine):
+    def deleted_preview(principal, path, base_version, mine, mine_title):
         ctx.docs.delete(principals["admin"], path, 2)
-        return real_preview(principal, path, base_version, mine)
+        return real_preview(principal, path, base_version, mine, mine_title)
 
     monkeypatch.setattr(ctx.docs, "merge_preview", deleted_preview)
     response = client.post(
@@ -672,9 +672,9 @@ def test_conflict_page_preserves_manual_recovery_if_document_is_moved_before_pre
     ctx.docs.update(principals["admin"], "moving.md", 1, "current")
     real_preview = ctx.docs.merge_preview
 
-    def moved_preview(principal, path, base_version, mine):
+    def moved_preview(principal, path, base_version, mine, mine_title):
         ctx.docs.move(principals["editor"], path, "moved.md")
-        return real_preview(principal, path, base_version, mine)
+        return real_preview(principal, path, base_version, mine, mine_title)
 
     monkeypatch.setattr(ctx.docs, "merge_preview", moved_preview)
     response = client.post(

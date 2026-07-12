@@ -877,7 +877,7 @@ def create_web_app(app: AppContext) -> FastAPI:
                 request, p, e, action=write_action_for_path(request.url.path), target=path
             )
             try:
-                merge_preview = docs.merge_preview(p, path, base_version, content)
+                merge_preview = docs.merge_preview(p, path, base_version, content, title)
             except (WikiError, RuntimeError):
                 merge_preview = {
                     "base_version": base_version,
@@ -886,8 +886,13 @@ def create_web_app(app: AppContext) -> FastAPI:
                     "updated_at": e.extra.get("updated_at"),
                     "current_via": e.extra.get("current_via"),
                     "base": None,
+                    "base_title": None,
                     "mine": content,
+                    "mine_title": title,
                     "current": e.extra.get("current_content") or "",
+                    "current_title": e.extra.get("current_title"),
+                    "merged_title": title if title == e.extra.get("current_title") else None,
+                    "title_conflict": title != e.extra.get("current_title"),
                     "merged": None,
                     "conflicts": [],
                     "manual_only": True,
@@ -900,7 +905,13 @@ def create_web_app(app: AppContext) -> FastAPI:
                 "updated_at": merge_preview["updated_at"],
                 "current_via": merge_preview["current_via"],
             }
-            return render("edit.html", request, status=409, is_new=False, path=path, title=title,
+            resolved_title = (
+                merge_preview["merged_title"]
+                if not merge_preview["title_conflict"]
+                else title
+            )
+            return render("edit.html", request, status=409, is_new=False, path=path,
+                          title=resolved_title,
                           content=content, base_version=merge_preview["current_version"],
                           conflict=conflict, error=None, can_write=p.can_write,
                           merge_preview=merge_preview,

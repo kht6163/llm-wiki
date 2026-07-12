@@ -12,6 +12,32 @@
   다른 변경(현재 <b>v{{ conflict.current_version }}</b>{% if conflict.updated_by %}, {{ conflict.updated_by }}{% endif %})이 먼저 적용되었습니다.
   아래 차이를 확인해 병합한 뒤 다시 저장하세요. (base_version은 v{{ conflict.current_version }}로 갱신됨)
   <p id="merge-error" role="alert" hidden></p>
+  {% if merge_preview.title_conflict %}
+  <fieldset id="merge-title-conflict" class="merge-conflict merge-title-conflict">
+    <legend>제목 충돌</legend>
+    <p class="muted">기준 제목과 비교해 내 편집과 서버 제목이 모두 달라졌습니다. 저장할 제목을 선택하세요.</p>
+    <div class="merge-choice-grid">
+      <div class="merge-choice">
+        <h3>내 편집</h3>
+        <pre>{{ merge_preview.mine_title }}</pre>
+        <button type="button" data-title-resolution="mine">내 제목 선택</button>
+      </div>
+      <div class="merge-choice">
+        <h3>서버 현재</h3>
+        <pre>{{ merge_preview.current_title }}</pre>
+        <button type="button" data-title-resolution="current">서버 제목 선택</button>
+      </div>
+      <div class="merge-choice merge-choice-manual">
+        <label for="merge-title-manual">직접 편집</label>
+        <input id="merge-title-manual" type="text" value="{{ merge_preview.mine_title }}">
+        <button type="button" data-title-resolution="manual">직접 편집 적용</button>
+      </div>
+    </div>
+    {% if merge_preview.base_title is not none %}
+    <div class="merge-base"><h3>기준 제목 · 문맥 전용</h3><pre>{{ merge_preview.base_title }}</pre></div>
+    {% endif %}
+  </fieldset>
+  {% endif %}
   {% if merge_preview.manual_only %}
   <p><strong>자동 병합할 수 없어 수동 복구가 필요합니다.</strong>
     병합에 필요한 문서 상태를 확인할 수 없습니다. 내 편집과 마지막으로 확인한 서버 내용을 직접 비교하세요.</p>
@@ -102,18 +128,18 @@
   {% else %}
     <input type="hidden" name="base_version" value="{{ base_version }}">
   {% endif %}
-  <label>제목 <input type="text" name="title" value="{{ title }}" placeholder="{% if is_new %}(비우면 이름에서 자동){% else %}(비우면 자동 추출){% endif %}"></label>
+  <label>제목 <input id="document-title" type="text" name="title" value="{{ title }}" placeholder="{% if is_new %}(비우면 이름에서 자동){% else %}(비우면 자동 추출){% endif %}"></label>
   <!-- The textarea is the form field (carries content on submit); md-editor-rt
        mounts into #md-editor-mount and mirrors its value back into it. -->
   <textarea id="editor" name="content" aria-label="마크다운 본문" hidden>{{ content }}</textarea>
   <div id="md-editor-mount"></div>
   <div class="form-actions">
     <button type="submit" class="primary" data-merge-save
-            {% if conflict and not merge_preview.manual_only %}aria-describedby="merge-save-help merge-error" disabled{% elif not can_write %}disabled{% endif %}>저장</button>
+            {% if conflict and (not merge_preview.manual_only or merge_preview.title_conflict) %}aria-describedby="merge-save-help merge-error" disabled{% elif not can_write %}disabled{% endif %}>저장</button>
     {% if not is_new %}<a href="/doc/{{ path|urlpath }}" id="cancel-edit">취소</a>{% endif %}
   </div>
-  {% if conflict and not merge_preview.manual_only %}
-  <p class="muted" id="merge-save-help">{% if merge_preview.conflicts %}모든 충돌을 해결하면 저장할 수 있습니다.{% else %}자동 병합 제안을 먼저 적용하세요.{% endif %}</p>
+  {% if conflict and (not merge_preview.manual_only or merge_preview.title_conflict) %}
+  <p class="muted" id="merge-save-help">{% if merge_preview.title_conflict %}제목 충돌{% if not merge_preview.manual_only %}과 본문 병합{% endif %}을 해결하면 저장할 수 있습니다.{% elif merge_preview.conflicts %}모든 충돌을 해결하면 저장할 수 있습니다.{% else %}자동 병합 제안을 먼저 적용하세요.{% endif %}</p>
   {% endif %}
   {% if not can_write %}<p class="muted">현재 역할은 읽기 전용이라 저장할 수 없습니다.</p>{% endif %}
 </form>

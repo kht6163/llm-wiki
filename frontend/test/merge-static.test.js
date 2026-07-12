@@ -8,6 +8,11 @@ function payload(overrides = {}) {
     base: "head\nrepeat\nmiddle\nrepeat\ntail\n",
     mine: "head\nmine one\nmiddle\nmine two\ntail\n",
     current: "head\ncurrent one\nmiddle\ncurrent two\ntail\n",
+    base_title: "Base title",
+    mine_title: "Base title",
+    current_title: "Current title",
+    merged_title: "Current title",
+    title_conflict: false,
     merged: "head\nrepeat\nmiddle\nrepeat\ntail\n",
     current_version: 7,
     manual_only: false,
@@ -33,11 +38,18 @@ function page(data = payload(), { state = "conflicts", editorApi, saveDisabled =
     <section id="merge-resolver" data-merge-state="${state}">
       <p id="merge-progress"></p>
       <p id="merge-error" role="alert" hidden></p>
+      ${data.title_conflict ? `<fieldset id="merge-title-conflict" class="merge-conflict">
+        <button type="button" data-title-resolution="mine">mine title</button>
+        <button type="button" data-title-resolution="current">current title</button>
+        <input id="merge-title-manual" value="${data.mine_title}">
+        <button type="button" data-title-resolution="manual">manual title</button>
+      </fieldset>` : ""}
       ${state === "conflicts" ? data.conflicts.map((h, i) => conflictField(i, h.mine)).join("") : ""}
       ${state === "proposal" ? '<button type="button" id="apply-merge-proposal">apply</button>' : ""}
     </section>
     <script id="merge-payload" type="application/json">${JSON.stringify(data).replaceAll("<", "\\u003c")}</script>
     <form class="editform"><input name="base_version" value="${data.current_version}">
+      <input id="document-title" name="title" value="${data.title_conflict ? data.mine_title : data.merged_title}">
       <textarea id="editor">${data.mine}</textarea><div id="md-editor-mount"></div>
       <button data-merge-save type="submit" ${saveDisabled ? "disabled" : ""}>save</button></form>`;
   if (editorApi !== undefined) document.querySelector("#md-editor-mount").wikiEditorApi = editorApi;
@@ -76,6 +88,81 @@ describe("merge.js", () => {
     expect(document.querySelector("[data-merge-save]").disabled).toBe(false);
     expect(document.activeElement).toBe(document.querySelector("[data-merge-save]"));
     expect(submit(form).defaultPrevented).toBe(false);
+  });
+
+  test("requires an explicit ambiguous title choice and serializes manual title", async () => {
+    const data = payload({
+      conflicts: [], merged: "proposal\n", base_title: "Base 😀", mine_title: "Mine <title>",
+      current_title: "Current & title", merged_title: null, title_conflict: true,
+    });
+    page(data, { state: "proposal" });
+    await loadStatic("merge");
+    document.querySelector("#apply-merge-proposal").click();
+    const form = document.querySelector("form");
+    expect(submit(form).defaultPrevented).toBe(true);
+    expect(document.activeElement).toBe(document.querySelector('[data-title-resolution="mine"]'));
+    document.querySelector("#merge-title-manual").value = "Final 🧠 title";
+    document.querySelector('[data-title-resolution="manual"]').click();
+    expect(document.querySelector("#document-title").value).toBe("Final 🧠 title");
+    expect(document.querySelector("#merge-title-conflict").classList.contains("is-resolved")).toBe(true);
+    expect(document.querySelector('[data-title-resolution="manual"]').getAttribute("aria-pressed")).toBe("true");
+    expect(submit(form).defaultPrevented).toBe(false);
+  });
+
+  test("keeps an automatically merged title in the existing form field", async () => {
+    const data = payload({ conflicts: [], merged: "proposal\n" });
+    page(data, { state: "proposal" });
+    await loadStatic("merge");
+    expect(document.querySelector("#document-title").value).toBe("Current title");
+    document.querySelector("#apply-merge-proposal").click();
+    expect(document.querySelector("[data-merge-save]").disabled).toBe(false);
+  });
+
+  test("can change an explicit title choice between mine and current", async () => {
+    const data = payload({ title_conflict: true, merged_title: null });
+    page(data);
+    await loadStatic("merge");
+    document.querySelector('[data-title-resolution="mine"]').click();
+    expect(document.querySelector("#document-title").value).toBe("Base title");
+    document.querySelector('[data-title-resolution="current"]').click();
+    expect(document.querySelector("#document-title").value).toBe("Current title");
+  });
+
+  test.each([
+    ["fieldset", () => document.querySelector("#merge-title-conflict").remove()],
+    ["manual input", () => document.querySelector("#merge-title-manual").remove()],
+    ["choice", () => document.querySelector("[data-title-resolution]").remove()],
+    ["pre-resolved payload", () => {
+      const node = document.querySelector("#merge-payload");
+      const data = JSON.parse(node.textContent);
+      data.merged_title = "unsafe";
+      node.textContent = JSON.stringify(data);
+    }],
+  ])("blocks malformed title resolver shape: %s", async (_label, mutate) => {
+    page(payload({ title_conflict: true, merged_title: null }));
+    mutate();
+    await loadStatic("merge");
+    expect(document.querySelector("#merge-error").hidden).toBe(false);
+    expect(submit(document.querySelector("form")).defaultPrevented).toBe(true);
+  });
+
+  test.each([
+    ["missing merged title", () => {
+      const node = document.querySelector("#merge-payload");
+      const data = JSON.parse(node.textContent);
+      data.merged_title = null;
+      node.textContent = JSON.stringify(data);
+    }],
+    ["unexpected resolver", () => {
+      document.querySelector("#merge-resolver").insertAdjacentHTML(
+        "afterbegin", '<fieldset id="merge-title-conflict"></fieldset>'
+      );
+    }],
+  ])("blocks inconsistent resolved title state: %s", async (_label, mutate) => {
+    page();
+    mutate();
+    await loadStatic("merge");
+    expect(document.querySelector("#merge-error").hidden).toBe(false);
   });
 
   test("writes through the existing editor view and can change a resolved choice", async () => {

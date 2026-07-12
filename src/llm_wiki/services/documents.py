@@ -1515,7 +1515,7 @@ class DocumentService:
             }
 
     def merge_preview(
-        self, principal: Principal, path: str, base_version: int, mine: str
+        self, principal: Principal, path: str, base_version: int, mine: str, mine_title: str
     ) -> dict:
         """Build a non-persisting three-way merge proposal from an exact revision."""
         if not principal.can_write:
@@ -1528,8 +1528,10 @@ class DocumentService:
         requested_version = int(base_version)
         with self.db.reader() as conn:
             row = conn.execute(
-                "SELECT d.id,d.version,d.is_deleted,d.updated_at,u.username AS updated_by,"
-                "current.body AS current_body,current.via AS current_via,base.body AS base_body "
+                "SELECT d.id,d.version,d.title AS current_title,d.is_deleted,d.updated_at,"
+                "u.username AS updated_by,current.body AS current_body,"
+                "current.via AS current_via,current.title AS revision_current_title,"
+                "base.body AS base_body,base.title AS base_title "
                 "FROM documents d "
                 "LEFT JOIN revisions current "
                 "ON current.doc_id=d.id AND current.version=d.version "
@@ -1545,6 +1547,24 @@ class DocumentService:
             current = str(row["current_body"])
             current_version = int(row["version"])
             base = row["base_body"]
+            current_title = row["revision_current_title"]
+            if current_title != row["current_title"]:
+                raise RuntimeError("current document title revision is missing or corrupt")
+            base_title = row["base_title"]
+
+        title_conflict = False
+        merged_title = None
+        if base is None:
+            if mine_title == current_title:
+                merged_title = mine_title
+            else:
+                title_conflict = True
+        elif mine_title == base_title:
+            merged_title = current_title
+        elif current_title == base_title or mine_title == current_title:
+            merged_title = mine_title
+        else:
+            title_conflict = True
 
         preview = {
             "base_version": requested_version,
@@ -1553,8 +1573,13 @@ class DocumentService:
             "updated_at": row["updated_at"],
             "current_via": row["current_via"],
             "base": base,
+            "base_title": base_title,
             "mine": mine,
+            "mine_title": mine_title,
             "current": current,
+            "current_title": current_title,
+            "merged_title": merged_title,
+            "title_conflict": title_conflict,
             "merged": None,
             "conflicts": [],
             "manual_only": base is None,

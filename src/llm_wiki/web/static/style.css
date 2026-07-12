@@ -144,6 +144,9 @@ h1 { font-size: 1.6em; text-wrap: balance; }
 .merge-choice-manual > label { color: var(--fg-muted); font-size: 0.78em; font-weight: 600; }
 .merge-choice-manual textarea { width: 100%; min-height: 7.2em; resize: vertical;
   font-family: var(--font-mono); font-size: 0.82em; line-height: 1.45; }
+.merge-title-conflict { margin-bottom: 10px; }
+.merge-title-conflict .merge-choice pre { min-height: 3.2em; }
+.merge-title-conflict .merge-choice-manual input { width: 100%; }
 .merge-base { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
 .merge-base pre { min-height: 0; color: var(--fg-muted); }
 #apply-merge-proposal { margin-top: 8px; }

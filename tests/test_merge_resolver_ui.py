@@ -23,11 +23,14 @@ def _login(client: TestClient) -> None:
     )
 
 
-def _conflict(client: TestClient, path: str, mine: str, base_version: int = 1):
+def _conflict(
+    client: TestClient, path: str, mine: str, base_version: int = 1, title: str = ""
+):
     return client.post(
         f"/doc/{path}/edit",
         data={
             "content": mine,
+            "title": title,
             "base_version": str(base_version),
             "csrf_token": _token(client, f"/doc/{path}/edit"),
         },
@@ -108,3 +111,41 @@ def test_manual_only_preview_keeps_original_draft_without_fake_hunks(ctx, princi
     assert 'data-conflict-index=' not in response.text
     assert 'id="load-current"' in response.text
     assert ">original mine</textarea>" in response.text
+
+
+def test_ambiguous_title_conflict_requires_an_accessible_explicit_choice(ctx, principals):
+    client = TestClient(create_web_app(ctx))
+    _login(client)
+    ctx.docs.create(principals["admin"], "title-ui.md", "base", title="Base <title> 😀")
+    ctx.docs.update(principals["admin"], "title-ui.md", 1, "current", title="Current & title")
+
+    response = _conflict(client, "title-ui.md", "mine", title="Mine <script> title")
+
+    assert response.status_code == 409
+    payload = _payload(response.text)
+    assert payload["base_title"] == "Base <title> 😀"
+    assert payload["mine_title"] == "Mine <script> title"
+    assert payload["current_title"] == "Current & title"
+    assert payload["merged_title"] is None
+    assert payload["title_conflict"] is True
+    assert '<fieldset id="merge-title-conflict"' in response.text
+    assert 'data-title-resolution="mine"' in response.text
+    assert 'data-title-resolution="current"' in response.text
+    assert 'data-title-resolution="manual"' in response.text
+    assert 'id="merge-title-manual"' in response.text
+    assert "Mine &lt;script&gt; title" in response.text
+    assert "Current &amp; title" in response.text
+
+
+def test_concurrent_title_is_preserved_when_stale_editor_only_changes_body(ctx, principals):
+    client = TestClient(create_web_app(ctx))
+    _login(client)
+    ctx.docs.create(principals["admin"], "body-only.md", "base", title="Base")
+    ctx.docs.update(principals["admin"], "body-only.md", 1, "base", title="Current")
+
+    response = _conflict(client, "body-only.md", "mine body", title="Base")
+
+    assert response.status_code == 409
+    assert _payload(response.text)["merged_title"] == "Current"
+    assert 'value="Current"' in response.text
+    assert 'id="merge-title-conflict"' not in response.text

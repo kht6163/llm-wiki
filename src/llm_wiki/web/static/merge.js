@@ -68,6 +68,11 @@
       Number.isInteger(payload.current_version) && payload.current_version >= 0 &&
       typeof payload.mine === "string" && typeof payload.current === "string" &&
       typeof payload.manual_only === "boolean" &&
+      typeof payload.mine_title === "string" &&
+      (payload.base_title === null || typeof payload.base_title === "string") &&
+      (payload.current_title === null || typeof payload.current_title === "string") &&
+      (payload.merged_title === null || typeof payload.merged_title === "string") &&
+      typeof payload.title_conflict === "boolean" &&
       (payload.base === null || typeof payload.base === "string") && Array.isArray(payload.conflicts);
   }
 
@@ -106,17 +111,21 @@
     var payload = parsePayload(root);
     var form = root.querySelector(".editform");
     var save = form && form.querySelector("[data-merge-save]");
-    var ready = false;
+    var bodyReady = false;
+    var titleReady = false;
     var mode = resolver.dataset.mergeState;
+    var titleConflict = resolver.querySelector("#merge-title-conflict");
 
     function focusTarget() {
-      if (mode === "proposal") return resolver.querySelector("#apply-merge-proposal");
-      var unresolved = resolver.querySelector(".merge-conflict:not(.is-resolved)");
-      return unresolved ? unresolved.querySelector("[data-resolution]") : (save || error);
+      if (!bodyReady && mode === "proposal") return resolver.querySelector("#apply-merge-proposal");
+      var unresolved = resolver.querySelector(".merge-conflict[data-conflict-index]:not(.is-resolved)");
+      if (unresolved) return unresolved.querySelector("[data-resolution]");
+      if (!titleReady && titleConflict) return titleConflict.querySelector("[data-title-resolution]");
+      return save || error;
     }
 
     function blockUnresolved(event) {
-      if (ready) return;
+      if (bodyReady && titleReady) return;
       event.preventDefault();
       event.stopImmediatePropagation();
       var target = focusTarget();
@@ -126,7 +135,8 @@
     if (form) listen(form, "submit", blockUnresolved, true, cleanups);
 
     function fail() {
-      ready = false;
+      bodyReady = false;
+      titleReady = false;
       error.hidden = false;
       error.textContent = "병합 데이터를 확인할 수 없습니다. 원본 편집은 보존되었습니다. 페이지를 다시 여세요.";
       if (save) save.disabled = true;
@@ -136,15 +146,47 @@
     if (!form || !save || !validCore(payload)) return fail();
     var version = form.querySelector('input[name="base_version"]');
     var textarea = form.querySelector("#editor");
-    if (!version || !textarea) return fail();
+    var title = form.querySelector('input[name="title"]');
+    if (!version || !textarea || !title) return fail();
     active.mine = payload.mine;
     version.value = String(payload.current_version);
     if (["manual-only", "proposal", "conflicts"].indexOf(mode) === -1) return fail();
 
+    function updateSave() {
+      save.disabled = !(bodyReady && titleReady);
+    }
+
+    if (payload.title_conflict) {
+      var titleManual = titleConflict && titleConflict.querySelector("#merge-title-manual");
+      var titleButtons = titleConflict && titleConflict.querySelectorAll("[data-title-resolution]");
+      if (!titleConflict || !titleManual || !titleButtons || titleButtons.length !== 3 ||
+          payload.merged_title !== null) return fail();
+      titleButtons.forEach(function (button) {
+        button.setAttribute("aria-pressed", "false");
+        function chooseTitle() {
+          var kind = button.dataset.titleResolution;
+          title.value = kind === "manual" ? titleManual.value : payload[kind + "_title"];
+          titleReady = true;
+          titleConflict.classList.add("is-resolved");
+          titleButtons.forEach(function (choice) {
+            choice.setAttribute("aria-pressed", String(choice === button));
+          });
+          updateSave();
+          focusTarget().focus();
+        }
+        listen(button, "click", chooseTitle, false, cleanups);
+      });
+    } else {
+      if (typeof payload.merged_title !== "string" || titleConflict) return fail();
+      title.value = payload.merged_title;
+      titleReady = true;
+    }
+
     if (mode === "manual-only") {
       if (!payload.manual_only || payload.base !== null || payload.merged !== null ||
           payload.conflicts.length !== 0) return fail();
-      ready = true;
+      bodyReady = true;
+      updateSave();
       return active;
     }
 
@@ -156,15 +198,17 @@
           typeof payload.merged !== "string" || !apply) return fail();
       function applyProposal() {
         writeEditor(root, payload.merged);
-        ready = true;
-        save.disabled = false;
-        save.focus();
+        bodyReady = true;
+        updateSave();
+        focusTarget().focus();
       }
       listen(apply, "click", applyProposal, false, cleanups);
       return active;
     }
 
-    var fields = Array.prototype.slice.call(resolver.querySelectorAll(".merge-conflict"));
+    var fields = Array.prototype.slice.call(
+      resolver.querySelectorAll(".merge-conflict[data-conflict-index]")
+    );
     var progress = resolver.querySelector("#merge-progress");
     if (payload.manual_only || typeof payload.base !== "string" || !progress ||
         !validConflicts(payload, fields)) return fail();
@@ -173,9 +217,9 @@
     function updateProgress() {
       var count = resolutions.filter(function (resolution) { return resolution !== null; }).length;
       progress.textContent = "해결 " + count + " / " + fields.length;
-      ready = count === fields.length;
-      if (ready) writeEditor(root, serialize(payload, resolutions));
-      save.disabled = !ready;
+      bodyReady = count === fields.length;
+      if (bodyReady) writeEditor(root, serialize(payload, resolutions));
+      updateSave();
     }
 
     function resolve(index, kind, button) {
