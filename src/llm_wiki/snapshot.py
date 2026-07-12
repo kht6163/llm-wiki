@@ -858,12 +858,14 @@ def _path_fingerprint(
     max_member_bytes: int = MAX_SNAPSHOT_MEMBER_BYTES,
     max_total_bytes: int = MAX_SNAPSHOT_TOTAL_BYTES,
 ) -> tuple[int, int, int, int, str]:
-    """Return a stable identity/content proof, rejecting symlinks and special files."""
+    """Return a bounded identity proof; the root and every descendant are members."""
     visible = os.lstat(path)
     kind = stat.S_IFMT(visible.st_mode)
     if stat.S_ISLNK(visible.st_mode):
         raise ValueError(f"restore target must not be a symlink: {path}")
     if stat.S_ISREG(visible.st_mode):
+        if max_members < 1:
+            raise ValueError("restore fingerprint member count limit exceeded")
         fd = -1
         try:
             fd = os.open(
@@ -882,9 +884,20 @@ def _path_fingerprint(
                 raise ValueError("restore fingerprint total size limit exceeded")
             file_digest = hashlib.sha256()
             size = 0
-            while chunk := os.read(fd, _COPY_CHUNK_SIZE):
-                file_digest.update(chunk)
+            while chunk := os.read(
+                fd,
+                min(
+                    _COPY_CHUNK_SIZE,
+                    max_member_bytes - size + 1,
+                    max_total_bytes - size + 1,
+                ),
+            ):
                 size += len(chunk)
+                if size > max_member_bytes:
+                    raise ValueError("restore fingerprint member size limit exceeded")
+                if size > max_total_bytes:
+                    raise ValueError("restore fingerprint total size limit exceeded")
+                file_digest.update(chunk)
             after = os.fstat(fd)
             if _stat_identity(before) != _stat_identity(after) or size != before.st_size:
                 raise ValueError(f"restore target changed while hashing: {path}")
@@ -894,8 +907,10 @@ def _path_fingerprint(
                 os.close(fd)
     if not stat.S_ISDIR(visible.st_mode):
         raise ValueError(f"restore target must be a regular file or directory: {path}")
+    if max_members < 1:
+        raise ValueError("restore fingerprint member count limit exceeded")
     tree_digest = hashlib.sha256()
-    file_count = 0
+    member_count = 1
     total_bytes = 0
 
     def add_entry(entry: tuple[object, ...]) -> None:
@@ -920,6 +935,9 @@ def _path_fingerprint(
                 raise ValueError(
                     f"restore vault contains a symlink or special file: {child}"
                 )
+            member_count += 1
+            if member_count > max_members:
+                raise ValueError("restore fingerprint member count limit exceeded")
             add_entry(
                 (
                     relative,
@@ -938,12 +956,12 @@ def _path_fingerprint(
                 raise ValueError(
                     f"restore vault contains a symlink or special file: {child}"
                 )
-            file_count += 1
-            if file_count > max_members:
+            member_count += 1
+            if member_count > max_members:
                 raise ValueError("restore fingerprint member count limit exceeded")
             fingerprint = _path_fingerprint(
                 child,
-                max_members=max_members,
+                max_members=1,
                 max_member_bytes=max_member_bytes,
                 max_total_bytes=max_total_bytes - total_bytes,
             )

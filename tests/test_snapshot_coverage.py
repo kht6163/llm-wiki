@@ -1702,6 +1702,61 @@ def test_vault_fingerprint_streams_with_restore_budgets(
         snapshot._path_fingerprint(vault, **kwargs)
 
 
+@pytest.mark.parametrize(
+    ("max_member_bytes", "max_total_bytes", "message"),
+    [(100, 1, "total size limit"), (1, 100, "member size limit")],
+)
+def test_file_fingerprint_stops_reading_at_actual_byte_budget(
+    tmp_path, monkeypatch, max_member_bytes, max_total_bytes, message
+):
+    target = tmp_path / "growing.bin"
+    target.write_bytes(b"a")
+    real_read = snapshot.os.read
+    reads = []
+
+    def grow_then_read(fd, size):
+        if not reads:
+            target.write_bytes(b"abcd")
+        chunk = real_read(fd, size)
+        reads.append((size, len(chunk)))
+        return chunk
+
+    monkeypatch.setattr(snapshot.os, "read", grow_then_read)
+
+    with pytest.raises(ValueError, match=message):
+        snapshot._path_fingerprint(
+            target,
+            max_members=1,
+            max_member_bytes=max_member_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+
+    assert reads == [(2, 2)]
+
+
+def test_regular_file_fingerprint_counts_its_root_member(tmp_path):
+    target = tmp_path / "file.bin"
+    target.write_bytes(b"")
+
+    with pytest.raises(ValueError, match="member count limit"):
+        snapshot._path_fingerprint(target, max_members=0)
+
+
+@pytest.mark.parametrize("nested_depth", [0, 3])
+def test_directory_fingerprint_counts_root_and_empty_directories(
+    tmp_path, nested_depth
+):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    current = vault
+    for index in range(nested_depth):
+        current = current / str(index)
+        current.mkdir()
+
+    with pytest.raises(ValueError, match="member count limit"):
+        snapshot._path_fingerprint(vault, max_members=max(0, nested_depth))
+
+
 def test_snapshot_fsyncs_archive_and_parent_before_success(
     snapshot_source, tmp_path, monkeypatch
 ):
