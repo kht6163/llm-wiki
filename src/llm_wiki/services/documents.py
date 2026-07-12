@@ -6,6 +6,7 @@ the durable source of truth for content; the .md file is an atomically-written
 projection of it. On a crash between commit and file write, the file is re-projected
 from the latest revision (see ``recover_pending``).
 """
+
 from __future__ import annotations
 
 import difflib
@@ -17,11 +18,13 @@ import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from itertools import groupby, islice
 from pathlib import Path
+from typing import cast
 from urllib.parse import quote
 
 import regex as regex_lib
@@ -93,13 +96,20 @@ ATTACH_MAX_BYTES = 10 * 1024 * 1024
 ALLOWED_ATTACH_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".pdf"}
 
 # ---- bulk import (Obsidian/markdown directory ingest) ----------------------
-IMPORT_MAX_BYTES = 50 * 1024 * 1024          # per-file ceiling for one note
+IMPORT_MAX_BYTES = 50 * 1024 * 1024  # per-file ceiling for one note
 IMPORT_DEFAULT_INCLUDE = ("*.md", "*.markdown", "*.mdown", "*.mkd")
 IMPORT_MD_EXTS = {".md", ".markdown", ".mdown", ".mkd"}
 # Directories that legitimately appear inside an external vault but must never be
 # ingested (app/editor metadata, VCS, dependency trees, our own scratch/trash).
-IMPORT_EXCLUDED_DIRS = {".obsidian", ".trash", ".tmp", ".git", ".venv",
-                        "node_modules", "__pycache__"}
+IMPORT_EXCLUDED_DIRS = {
+    ".obsidian",
+    ".trash",
+    ".tmp",
+    ".git",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+}
 # Assets the importer may copy when --import-attachments is on (same allow-list as
 # interactive uploads, so they pass save_attachment's validation unchanged).
 IMPORT_ATTACH_EXTS = ALLOWED_ATTACH_EXTS
@@ -113,6 +123,16 @@ _IMG_RE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s]+)(?:[ \t]+\"[^\"]*\")?\)")
 # week is generous; older rows are swept opportunistically on each keyed write to
 # bound the ledger's growth.
 _IDEM_RETENTION_DAYS = 7
+
+
+class _ProjectionTokenState(StrEnum):
+    MISSING = "missing"
+    PURGE_PENDING = "purge_pending"
+    CHANGED = "changed"
+    CLEANUP_PENDING = "cleanup_pending"
+    SETTLED = "settled"
+    CURRENT_CLEANUP = "current_cleanup"
+    CURRENT = "current"
 
 
 @dataclass(frozen=True)
@@ -205,7 +225,7 @@ def _replace_outside_code(pattern: re.Pattern, repl: Callable[[re.Match], str], 
     out: list[str] = []
     last = 0
     for m in pattern.finditer(masked):
-        out.append(text[last:m.start()])
+        out.append(text[last : m.start()])
         out.append(repl(m))
         last = m.end()
     out.append(text[last:])
@@ -266,7 +286,9 @@ def _locate_or_raise(doc: dict, heading: str, occurrence: int):
     if n and occurrence > n:
         raise ValidationError(
             f"occurrence {occurrence} is out of range: the document has {n} "
-            f"section(s) titled {heading!r}.", path=doc["path"])
+            f"section(s) titled {heading!r}.",
+            path=doc["path"],
+        )
     raise NotFoundError(f"No section titled {heading!r} in this document.", path=doc["path"])
 
 
@@ -276,9 +298,15 @@ def _as_block(text: str) -> str:
 
 
 class DocumentService:
-    def __init__(self, db: Database, embedder: Embedder, vault_path: Path | str, events=None,
-                 search_params: search.FusionParams | None = None,
-                 embed_worker: indexing.EmbeddingWorker | None = None):
+    def __init__(
+        self,
+        db: Database,
+        embedder: Embedder,
+        vault_path: Path | str,
+        events=None,
+        search_params: search.FusionParams | None = None,
+        embed_worker: indexing.EmbeddingWorker | None = None,
+    ):
         self.db = db
         self.embedder = embedder
         self.vault = Path(vault_path)
@@ -306,8 +334,9 @@ class DocumentService:
         if self.events is None:
             return
         try:
-            self.events.publish({"type": "doc_changed", "op": op, "path": path,
-                                 "version": version, **extra})
+            self.events.publish(
+                {"type": "doc_changed", "op": op, "path": path, "version": version, **extra}
+            )
         except Exception:
             pass
 
@@ -374,9 +403,14 @@ class DocumentService:
             f"change on top of it, and retry with base_version={d['version']}."
         )
         return ConflictError(
-            msg, path=rel, current_version=d["version"], current_title=d["title"],
-            current_content=body, updated_by=self._username(conn, d["updated_by"]),
-            updated_at=d["updated_at"], current_via=lv["via"] if lv else None,
+            msg,
+            path=rel,
+            current_version=d["version"],
+            current_title=d["title"],
+            current_content=body,
+            updated_by=self._username(conn, d["updated_by"]),
+            updated_at=d["updated_at"],
+            current_via=lv["via"] if lv else None,
         )
 
     def _projection_snapshot(
@@ -406,9 +440,7 @@ class DocumentService:
             is_deleted=bool(row["is_deleted"]),
             file_state=str(row["file_state"]),
             revision_version=(
-                int(row["revision_version"])
-                if row["revision_version"] is not None
-                else None
+                int(row["revision_version"]) if row["revision_version"] is not None else None
             ),
             revision_content_hash=(
                 str(row["revision_content_hash"])
@@ -426,7 +458,7 @@ class DocumentService:
         snapshot: ProjectionSnapshot,
         *,
         allow_cleanup: bool = False,
-    ) -> str:
+    ) -> _ProjectionTokenState:
         """Revalidate a staged generation without loading its potentially large body."""
         row = conn.execute(
             "SELECT d.path,d.path_norm,d.version,d.content_hash,d.is_deleted,d.file_state,"
@@ -440,9 +472,9 @@ class DocumentService:
             (snapshot.doc_id,),
         ).fetchone()
         if row is None:
-            return "missing"
+            return _ProjectionTokenState.MISSING
         if row["has_purge_intent"]:
-            return "purge_pending"
+            return _ProjectionTokenState.PURGE_PENDING
         current_token = (
             str(row["path"]),
             str(row["path_norm"]),
@@ -458,14 +490,18 @@ class DocumentService:
             snapshot.is_deleted,
         )
         if current_token != staged_token or not row["exact_revision"]:
-            return "changed"
+            return _ProjectionTokenState.CHANGED
         if row["file_state"] == "clean":
             if row["has_cleanup_intent"]:
-                return "cleanup_pending"
-            return "settled"
+                return _ProjectionTokenState.CLEANUP_PENDING
+            return _ProjectionTokenState.SETTLED
         if row["has_cleanup_intent"]:
-            return "current_cleanup" if allow_cleanup else "cleanup_pending"
-        return "current"
+            return (
+                _ProjectionTokenState.CURRENT_CLEANUP
+                if allow_cleanup
+                else _ProjectionTokenState.CLEANUP_PENDING
+            )
+        return _ProjectionTokenState.CURRENT
 
     def _install_projection_target(
         self,
@@ -576,14 +612,11 @@ class DocumentService:
 
             try:
                 target = fp.managed_path(self.vault, rel, namespace="live")
-                current = fp.confined_file_signature(
-                    self.vault, target, missing_ok=True
-                )
+                current = fp.confined_file_signature(self.vault, target, missing_ok=True)
                 if current is None:
                     if fp.confirm_confined_absence(self.vault, target):
                         conn.execute(
-                            "DELETE FROM file_projection_cleanup "
-                            "WHERE doc_id=? AND path_norm=?",
+                            "DELETE FROM file_projection_cleanup WHERE doc_id=? AND path_norm=?",
                             (snapshot.doc_id, norm),
                         )
                     else:
@@ -611,9 +644,7 @@ class DocumentService:
         return str(rows[-1]["path_norm"]), tuple(issues)
 
     @staticmethod
-    def _purge_intent_snapshot(
-        conn: sqlite3.Connection, doc_id: int
-    ) -> PurgeIntentSnapshot | None:
+    def _purge_intent_snapshot(conn: sqlite3.Connection, doc_id: int) -> PurgeIntentSnapshot | None:
         row = conn.execute(
             "SELECT p.doc_id,p.path,p.path_norm,p.version,p.actor,p.via,"
             "d.path AS document_path,d.path_norm AS document_path_norm,"
@@ -688,9 +719,7 @@ class DocumentService:
 
             try:
                 target = fp.managed_path(self.vault, rel, namespace="live")
-                current = fp.confined_file_signature(
-                    self.vault, target, missing_ok=True
-                )
+                current = fp.confined_file_signature(self.vault, target, missing_ok=True)
                 if current is None:
                     if not fp.confirm_confined_absence(self.vault, target):
                         # A new generation appeared. Purge preserves it and retires
@@ -701,13 +730,9 @@ class DocumentService:
                     if expected is not None and current == expected:
                         # False means it changed/disappeared between stat and unlink;
                         # either way the new/external generation is preserved.
-                        removed = fp.unlink_regular(
-                            target, expected=expected, vault=self.vault
-                        )
+                        removed = fp.unlink_regular(target, expected=expected, vault=self.vault)
                         if not removed:
-                            after = fp.confined_file_signature(
-                                self.vault, target, missing_ok=True
-                            )
+                            after = fp.confined_file_signature(self.vault, target, missing_ok=True)
                             if after is None:
                                 fp.confirm_confined_absence(self.vault, target)
                 conn.execute(
@@ -759,17 +784,26 @@ class DocumentService:
         assert last_intent is not None
         if issues:
             with self.db.reader() as conn:
-                intent_exists = conn.execute(
-                    "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
-                    (last_intent.doc_id,),
-                ).fetchone() is not None
-                document_exists = conn.execute(
-                    "SELECT 1 FROM documents WHERE id=?", (last_intent.doc_id,)
-                ).fetchone() is not None
-                cleanup_remains = conn.execute(
-                    "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
-                    (last_intent.doc_id,),
-                ).fetchone() is not None
+                intent_exists = (
+                    conn.execute(
+                        "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
+                        (last_intent.doc_id,),
+                    ).fetchone()
+                    is not None
+                )
+                document_exists = (
+                    conn.execute(
+                        "SELECT 1 FROM documents WHERE id=?", (last_intent.doc_id,)
+                    ).fetchone()
+                    is not None
+                )
+                cleanup_remains = (
+                    conn.execute(
+                        "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
+                        (last_intent.doc_id,),
+                    ).fetchone()
+                    is not None
+                )
             if not intent_exists:
                 return fp.ProjectionResult(
                     last_intent.doc_id,
@@ -810,10 +844,13 @@ class DocumentService:
                         1,
                         True,
                     )
-                if conn.execute(
-                    "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
-                    (intent.doc_id,),
-                ).fetchone() is not None:
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM file_projection_cleanup WHERE doc_id=? LIMIT 1",
+                        (intent.doc_id,),
+                    ).fetchone()
+                    is not None
+                ):
                     return fp.ProjectionResult(
                         intent.doc_id,
                         intent.path,
@@ -824,23 +861,15 @@ class DocumentService:
                         True,
                     )
 
-                trash = fp.managed_path(
-                    self.vault, intent.path, namespace="trash"
-                )
-                trash_signature = fp.confined_file_signature(
-                    self.vault, trash, missing_ok=True
-                )
+                trash = fp.managed_path(self.vault, intent.path, namespace="trash")
+                trash_signature = fp.confined_file_signature(self.vault, trash, missing_ok=True)
                 if trash_signature is not None:
-                    if not fp.unlink_regular(
-                        trash, expected=trash_signature, vault=self.vault
-                    ):
+                    if not fp.unlink_regular(trash, expected=trash_signature, vault=self.vault):
                         raise fp.FileGenerationChanged(
                             f"purge trash changed during removal: {trash}"
                         )
                 elif not fp.confirm_confined_absence(self.vault, trash):
-                    raise fp.FileGenerationChanged(
-                        f"purge trash changed during removal: {trash}"
-                    )
+                    raise fp.FileGenerationChanged(f"purge trash changed during removal: {trash}")
 
                 graph.unresolve_incoming(conn, intent.doc_id)
                 deleted = conn.execute(
@@ -892,9 +921,7 @@ class DocumentService:
                 f"{type(exc).__name__}: {exc}",
             )
 
-    def _project_current(
-        self, doc_id: int, *, max_attempts: int = 3
-    ) -> fp.ProjectionResult:
+    def _project_current(self, doc_id: int, *, max_attempts: int = 3) -> fp.ProjectionResult:
         """Install only the latest exact revision, fenced by a final writer token.
 
         Staging is intentionally outside the SQLite writer. Publication, removal of
@@ -910,9 +937,7 @@ class DocumentService:
             with self.db.reader() as conn:
                 snapshot = self._projection_snapshot(conn, int(doc_id))
             if snapshot is None:
-                return fp.ProjectionResult(
-                    int(doc_id), None, True, False, "missing", attempt
-                )
+                return fp.ProjectionResult(int(doc_id), None, True, False, "missing", attempt)
 
             last_path = snapshot.path
             last_deleted = snapshot.is_deleted
@@ -962,7 +987,7 @@ class DocumentService:
                 # recovery can discharge the durable intents instead of looping on
                 # cleanup_pending forever.
                 with self.db.writer() as conn:
-                    reopened = conn.execute(
+                    conn.execute(
                         "UPDATE documents SET file_state='pending' "
                         "WHERE id=? AND path=? AND path_norm=? AND version=? "
                         "AND content_hash=? AND is_deleted=? AND file_state='clean' "
@@ -986,9 +1011,7 @@ class DocumentService:
                             snapshot.content_hash,
                         ),
                     )
-                if reopened.rowcount != 1:
-                    continue
-                snapshot = replace(snapshot, file_state="pending")
+                continue
 
             current_installed = False
             live_target: Path
@@ -996,9 +1019,7 @@ class DocumentService:
             target: Path
             try:
                 live_target = fp.managed_path(self.vault, snapshot.path, namespace="live")
-                trash_target = fp.managed_path(
-                    self.vault, snapshot.path, namespace="trash"
-                )
+                trash_target = fp.managed_path(self.vault, snapshot.path, namespace="trash")
                 target = trash_target if snapshot.is_deleted else live_target
             except (OSError, fp.FileProjectionError) as exc:
                 return fp.ProjectionResult(
@@ -1034,9 +1055,7 @@ class DocumentService:
                 )
             try:
                 with self.db.writer() as conn:
-                    token_state = self._projection_token_state(
-                        conn, snapshot, allow_cleanup=True
-                    )
+                    token_state = self._projection_token_state(conn, snapshot, allow_cleanup=True)
                     if token_state == "changed":
                         retry_snapshot = True
                     elif token_state == "missing":
@@ -1069,7 +1088,7 @@ class DocumentService:
                             attempt,
                             snapshot.is_deleted,
                         )
-                    elif token_state in ("current", "current_cleanup"):
+                    else:
                         file_mtime = self._install_projection_target(
                             snapshot,
                             staged,
@@ -1082,10 +1101,6 @@ class DocumentService:
                             self._mark_projection_clean(conn, snapshot, file_mtime)
                         else:
                             cleanup_required = True
-                    else:
-                        raise RuntimeError(
-                            f"unknown projection token state: {token_state}"
-                        )
             except (OSError, fp.FileProjectionError) as exc:
                 return fp.ProjectionResult(
                     snapshot.doc_id,
@@ -1134,9 +1149,7 @@ class DocumentService:
                 batch_cursor: str | None = None
                 batch_issues: tuple[CleanupIssue, ...] = ()
                 with self.db.writer() as conn:
-                    token_state = self._projection_token_state(
-                        conn, snapshot, allow_cleanup=True
-                    )
+                    token_state = self._projection_token_state(conn, snapshot, allow_cleanup=True)
                     if token_state == "changed":
                         retry_snapshot = True
                     elif token_state == "missing":
@@ -1176,10 +1189,6 @@ class DocumentService:
                         batch_cursor, batch_issues = self._process_cleanup_batch(
                             conn, snapshot, after_norm=cursor
                         )
-                    elif token_state != "current":
-                        raise RuntimeError(
-                            f"unknown projection token state: {token_state}"
-                        )
 
                 cleanup_issues.extend(batch_issues)
                 if retry_snapshot or terminal_result is not None:
@@ -1199,9 +1208,8 @@ class DocumentService:
                     else "cleanup_changed"
                 )
                 sample = ", ".join(issue.path for issue in cleanup_issues[:3])
-                detail = (
-                    f"{len(cleanup_issues)} cleanup path(s) remain unresolved"
-                    + (f": {sample}" if sample else "")
+                detail = f"{len(cleanup_issues)} cleanup path(s) remain unresolved" + (
+                    f": {sample}" if sample else ""
                 )
                 return fp.ProjectionResult(
                     snapshot.doc_id,
@@ -1271,7 +1279,7 @@ class DocumentService:
                             snapshot.is_deleted,
                             current_installed=current_installed,
                         )
-                    elif token_state == "current":
+                    else:
                         file_mtime = self._install_projection_target(
                             snapshot,
                             final_staged,
@@ -1281,10 +1289,6 @@ class DocumentService:
                         )
                         current_installed = True
                         self._mark_projection_clean(conn, snapshot, file_mtime)
-                    else:
-                        raise RuntimeError(
-                            f"unknown projection token state: {token_state}"
-                        )
             except (OSError, fp.FileProjectionError) as exc:
                 return fp.ProjectionResult(
                     snapshot.doc_id,
@@ -1368,10 +1372,13 @@ class DocumentService:
             for current_id in ids:
                 try:
                     with self.db.reader() as conn:
-                        has_purge_intent = conn.execute(
-                            "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
-                            (current_id,),
-                        ).fetchone() is not None
+                        has_purge_intent = (
+                            conn.execute(
+                                "SELECT 1 FROM document_purge_intents WHERE doc_id=?",
+                                (current_id,),
+                            ).fetchone()
+                            is not None
+                        )
                     result = (
                         self._finish_purge(current_id)
                         if has_purge_intent
@@ -1380,9 +1387,7 @@ class DocumentService:
                     if result.reason == "purge_pending":
                         result = self._finish_purge(current_id)
                 except Exception as exc:
-                    log.exception(
-                        "recover_pending: document %d raised unexpectedly", current_id
-                    )
+                    log.exception("recover_pending: document %d raised unexpectedly", current_id)
                     error_path = None
                     try:
                         with self.db.reader() as conn:
@@ -1417,11 +1422,16 @@ class DocumentService:
             row = conn.execute(
                 "SELECT result_path, result_version FROM idempotency_keys "
                 "WHERE scope=? AND user_id=? AND idem_key=?",
-                (scope, user_id, key)).fetchone()
+                (scope, user_id, key),
+            ).fetchone()
         if row is None:
             return None
-        return {"ok": True, "path": row["result_path"],
-                "version": row["result_version"], "deduplicated": True}
+        return {
+            "ok": True,
+            "path": row["result_path"],
+            "version": row["result_version"],
+            "deduplicated": True,
+        }
 
     # ---- reads ----------------------------------------------------------
     def get(self, path: str) -> dict:
@@ -1435,12 +1445,21 @@ class DocumentService:
             lv = conn.execute(
                 "SELECT via FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1", (d["id"],)
             ).fetchone()
-            tags = [t[0] for t in conn.execute(
-                "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],))]
+            tags = [
+                t[0]
+                for t in conn.execute(
+                    "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],)
+                )
+            ]
             return {
-                "path": d["path"], "title": d["title"], "content": body,
-                "version": d["version"], "tags": tags, "folder": d["folder"],
-                "created_at": d["created_at"], "updated_at": d["updated_at"],
+                "path": d["path"],
+                "title": d["title"],
+                "content": body,
+                "version": d["version"],
+                "tags": tags,
+                "folder": d["folder"],
+                "created_at": d["created_at"],
+                "updated_at": d["updated_at"],
                 "updated_by": self._username(conn, d["updated_by"]),
                 "last_via": lv["via"] if lv else None,
             }
@@ -1459,12 +1478,21 @@ class DocumentService:
             lv = conn.execute(
                 "SELECT via FROM revisions WHERE doc_id=? ORDER BY version DESC LIMIT 1", (d["id"],)
             ).fetchone()
-            tags = [t[0] for t in conn.execute(
-                "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],))]
+            tags = [
+                t[0]
+                for t in conn.execute(
+                    "SELECT tag FROM tags WHERE doc_id=? ORDER BY tag", (d["id"],)
+                )
+            ]
             return {
-                "path": d["path"], "title": d["title"], "version": d["version"],
-                "tags": tags, "folder": d["folder"], "created_at": d["created_at"],
-                "updated_at": d["updated_at"], "updated_by": self._username(conn, d["updated_by"]),
+                "path": d["path"],
+                "title": d["title"],
+                "version": d["version"],
+                "tags": tags,
+                "folder": d["folder"],
+                "created_at": d["created_at"],
+                "updated_at": d["updated_at"],
+                "updated_by": self._username(conn, d["updated_by"]),
                 "last_via": lv["via"] if lv else None,
             }
 
@@ -1483,7 +1511,8 @@ class DocumentService:
         after = clamp_int(after, 0, 20)
         with self.db.reader() as conn:
             d = conn.execute(
-                "SELECT id, path, version FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+                "SELECT id, path, version FROM documents WHERE path_norm=? AND is_deleted=0",
+                (norm,),
             ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
@@ -1500,18 +1529,29 @@ class DocumentService:
             if not rows:
                 raise NotFoundError(
                     "No chunk at this ordinal." if total else "Document has no indexed chunks.",
-                    path=rel, ordinal=int(ordinal), chunk_count=total,
+                    path=rel,
+                    ordinal=int(ordinal),
+                    chunk_count=total,
                 )
-            chunks = [{
-                "ordinal": r["ordinal"], "heading": r["heading"],
-                "heading_path": r["heading_path"], "text": r["text"],
-                "char_start": r["char_start"], "char_end": r["char_end"],
-                "anchor": heading_slug(r["heading"]) if r["heading"] else None,
-            } for r in rows]
+            chunks = [
+                {
+                    "ordinal": r["ordinal"],
+                    "heading": r["heading"],
+                    "heading_path": r["heading_path"],
+                    "text": r["text"],
+                    "char_start": r["char_start"],
+                    "char_end": r["char_end"],
+                    "anchor": heading_slug(r["heading"]) if r["heading"] else None,
+                }
+                for r in rows
+            ]
             return {
-                "path": d["path"], "version": d["version"],
-                "ordinal": int(ordinal), "chunk_count": total,
-                "char_start": chunks[0]["char_start"], "char_end": chunks[-1]["char_end"],
+                "path": d["path"],
+                "version": d["version"],
+                "ordinal": int(ordinal),
+                "chunk_count": total,
+                "char_start": chunks[0]["char_start"],
+                "char_end": chunks[-1]["char_end"],
                 "has_before": chunks[0]["ordinal"] > 0,
                 "has_after": chunks[-1]["ordinal"] < total - 1,
                 "text": "\n\n".join(c["text"] for c in chunks),
@@ -1526,17 +1566,22 @@ class DocumentService:
             ).fetchone()
         return r is not None
 
-    def list_docs(self, folder=None, tag=None, limit=100, offset=0, sort="updated_at",
-                  tags=None) -> list[dict]:
-        sort_col = {"updated_at": "updated_at", "title": "title", "path": "path"}.get(sort, "updated_at")
+    def list_docs(
+        self, folder=None, tag=None, limit=100, offset=0, sort="updated_at", tags=None
+    ) -> list[dict]:
+        sort_col = {"updated_at": "updated_at", "title": "title", "path": "path"}.get(
+            sort, "updated_at"
+        )
         order = "DESC" if sort_col == "updated_at" else "ASC"
         # The correlated subquery resolves each row's latest-revision surface (the
         # idx_revisions_doc(doc_id, version DESC) index makes it a single seek), so
         # the listing can mark which entries an agent/CLI touched last.
-        q = ("SELECT id, path, title, version, folder, updated_at, "
-             "(SELECT via FROM revisions r WHERE r.doc_id=documents.id "
-             " ORDER BY r.version DESC LIMIT 1) AS last_via "
-             "FROM documents WHERE is_deleted=0")
+        q = (
+            "SELECT id, path, title, version, folder, updated_at, "
+            "(SELECT via FROM revisions r WHERE r.doc_id=documents.id "
+            " ORDER BY r.version DESC LIMIT 1) AS last_via "
+            "FROM documents WHERE is_deleted=0"
+        )
         params: list = []
         if folder:
             f = folder.strip("/")
@@ -1552,11 +1597,17 @@ class DocumentService:
             rows = conn.execute(q, params).fetchall()
             tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
             for r in rows:
-                out.append({
-                    "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
-                    "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
-                    "last_via": r["last_via"],
-                })
+                out.append(
+                    {
+                        "path": r["path"],
+                        "title": r["title"] or r["path"],
+                        "version": r["version"],
+                        "folder": r["folder"],
+                        "tags": tags_by.get(r["id"], []),
+                        "updated_at": r["updated_at"],
+                        "last_via": r["last_via"],
+                    }
+                )
         return out
 
     @staticmethod
@@ -1603,7 +1654,7 @@ class DocumentService:
         excerpt of the body (frontmatter stripped, heading markers removed). Plain
         text only — the caller renders it as text, never HTML."""
         doc = self.get(path)
-        body = doc["content"][parse_frontmatter(doc["content"])[1]:]
+        body = doc["content"][parse_frontmatter(doc["content"])[1] :]
         parts: list[str] = []
         total = 0
         for line in body.splitlines():
@@ -1690,7 +1741,8 @@ class DocumentService:
             ensure(fr["path"])
         for r in doc_rows:
             ensure(r["folder"] or "")["docs"].append(
-                {"path": r["path"], "title": r["title"] or r["path"]})
+                {"path": r["path"], "title": r["title"] or r["path"]}
+            )
 
         def finalize(node: dict) -> dict:
             children = sorted(node["folders"].values(), key=lambda c: c["name"].lower())
@@ -1705,7 +1757,9 @@ class DocumentService:
         Idempotent-ish: a duplicate raises ConflictError. Projects a real directory
         into the vault to mirror the DB."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot create folders (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot create folders (read/search only)."
+            )
         rel = normalize_folder_path(path)
         if not rel:
             raise ValidationError("folder path must not be empty.")
@@ -1725,8 +1779,13 @@ class DocumentService:
                 "INSERT INTO folders(path, path_norm, created_at, created_by) VALUES(?,?,?,?)",
                 (rel, norm, now, principal.user_id),
             )
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="folder_create", target=rel)
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="folder_create",
+                target=rel,
+            )
         safe_join(self.vault, rel).mkdir(parents=True, exist_ok=True)
         self._bump_nav()
         return {"ok": True, "path": rel}
@@ -1735,7 +1794,9 @@ class DocumentService:
         """Remove an empty folder (and any explicitly-created empty subfolders).
         Refuses if any document still lives under it."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot delete folders (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot delete folders (read/search only)."
+            )
         rel = normalize_folder_path(path)
         if not rel:
             raise ValidationError("folder path must not be empty.")
@@ -1746,23 +1807,30 @@ class DocumentService:
                 (rel, norm + "/%"),
             ).fetchone()[0]
             if n:
-                raise ValidationError(f"Folder is not empty ({n} document(s)); move or delete them first.")
+                raise ValidationError(
+                    f"Folder is not empty ({n} document(s)); move or delete them first."
+                )
             cur = conn.execute(
-                "DELETE FROM folders WHERE path_norm=? OR path_norm LIKE ?", (norm, norm + "/%"))
+                "DELETE FROM folders WHERE path_norm=? OR path_norm LIKE ?", (norm, norm + "/%")
+            )
             if cur.rowcount == 0:
                 raise NotFoundError("No such folder.", path=rel)
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="folder_delete", target=rel)
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="folder_delete",
+                target=rel,
+            )
         # Best-effort: prune the now-empty projected directory tree (bottom-up,
         # leaving any directory that still holds stray external files).
         target = safe_join(self.vault, rel)
         if target.is_dir():
-            for root_, _dirs, files in os.walk(target, topdown=False):
-                if not files:
-                    try:
-                        os.rmdir(root_)
-                    except OSError:
-                        pass
+            for root_, _dirs, _files in os.walk(target, topdown=False):
+                try:
+                    os.rmdir(root_)
+                except OSError:
+                    pass
         self._bump_nav()
         return {"ok": True, "path": rel, "deleted": True}
 
@@ -1800,7 +1868,8 @@ class DocumentService:
             rows = conn.execute(
                 "SELECT t.tag AS tag, COUNT(*) AS count FROM tags t "
                 "JOIN documents d ON d.id=t.doc_id WHERE d.is_deleted=0 "
-                "GROUP BY t.tag ORDER BY count DESC, t.tag ASC LIMIT ?", (n,)
+                "GROUP BY t.tag ORDER BY count DESC, t.tag ASC LIMIT ?",
+                (n,),
             ).fetchall()
         return [{"tag": r["tag"], "count": r["count"]} for r in rows]
 
@@ -1827,7 +1896,9 @@ class DocumentService:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.reader() as conn:
-            d = conn.execute("SELECT id, version FROM documents WHERE path_norm=?", (norm,)).fetchone()
+            d = conn.execute(
+                "SELECT id, version FROM documents WHERE path_norm=?", (norm,)
+            ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             rows = conn.execute(
@@ -1853,8 +1924,16 @@ class DocumentService:
             ).fetchone()
             if not r:
                 raise NotFoundError(f"No revision {version} for this document.", path=rel)
-            return {"path": rel, "version": r["version"], "title": r["title"], "content": r["body"],
-                    "op": r["op"], "via": r["via"], "author": r["author"], "created_at": r["created_at"]}
+            return {
+                "path": rel,
+                "version": r["version"],
+                "title": r["title"],
+                "content": r["body"],
+                "op": r["op"],
+                "via": r["via"],
+                "author": r["author"],
+                "created_at": r["created_at"],
+            }
 
     def compare_revisions(self, path: str, from_version: int, to_version: int) -> dict:
         """Unified line diff between two revisions, computed server-side (the bodies
@@ -1867,9 +1946,13 @@ class DocumentService:
             d = conn.execute("SELECT id FROM documents WHERE path_norm=?", (norm,)).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
-            rows = {r["version"]: r for r in conn.execute(
-                "SELECT version, body, title FROM revisions WHERE doc_id=? AND version IN (?,?)",
-                (d["id"], int(from_version), int(to_version)))}
+            rows = {
+                r["version"]: r
+                for r in conn.execute(
+                    "SELECT version, body, title FROM revisions WHERE doc_id=? AND version IN (?,?)",
+                    (d["id"], int(from_version), int(to_version)),
+                )
+            }
         fr, to = rows.get(int(from_version)), rows.get(int(to_version))
         if fr is None:
             raise NotFoundError(f"No revision {from_version} for this document.", path=rel)
@@ -1878,7 +1961,8 @@ class DocumentService:
         diff: list[dict] = []
         added = deleted = 0
         for line in difflib.unified_diff(
-                (fr["body"] or "").splitlines(), (to["body"] or "").splitlines(), lineterm="", n=3):
+            (fr["body"] or "").splitlines(), (to["body"] or "").splitlines(), lineterm="", n=3
+        ):
             if line.startswith(("+++", "---")):
                 continue
             if line.startswith("@@"):
@@ -1890,25 +1974,37 @@ class DocumentService:
             else:
                 cls = "ctx"
             diff.append({"cls": cls, "text": line})
-        return {"path": rel, "from_version": int(from_version), "to_version": int(to_version),
-                "from_title": fr["title"], "to_title": to["title"], "diff": diff,
-                "summary": {"lines_added": added, "lines_deleted": deleted}}
+        return {
+            "path": rel,
+            "from_version": int(from_version),
+            "to_version": int(to_version),
+            "from_title": fr["title"],
+            "to_title": to["title"],
+            "diff": diff,
+            "summary": {"lines_added": added, "lines_deleted": deleted},
+        }
 
     def backlinks(self, path: str, *, with_context: bool = False) -> dict:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.reader() as conn:
-            d = conn.execute("SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+            d = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
-            return {"path": rel,
-                    "backlinks": graph.get_backlinks(conn, d["id"], with_context=with_context)}
+            return {
+                "path": rel,
+                "backlinks": graph.get_backlinks(conn, d["id"], with_context=with_context),
+            }
 
     def links(self, path: str) -> dict:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.reader() as conn:
-            d = conn.execute("SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+            d = conn.execute(
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             return {"path": rel, "links": graph.get_outgoing(conn, d["id"])}
@@ -1917,18 +2013,32 @@ class DocumentService:
         with self.db.reader() as conn:
             return graph.build_graph(conn, root, depth, limit, include_unresolved)
 
-    def search_page(self, query: str, *, mode: str = "hybrid", top_k: int = 10,
-                    folder: str | None = None, tags: list[str] | None = None,
-                    since: str | None = None, until: str | None = None,
-                    ) -> tuple[list[search.SearchResult], bool]:
+    def search_page(
+        self,
+        query: str,
+        *,
+        mode: str = "hybrid",
+        top_k: int = 10,
+        folder: str | None = None,
+        tags: list[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> tuple[list[search.SearchResult], bool]:
         """Hybrid search returning ``(results, truncated)``, applying this service's
         configured fusion tuning (``search_params``). The single entry point both the
         web and MCP surfaces go through so tuning is honored uniformly. ``since``/``until``
         bound hits by ``updated_at`` (recency filter)."""
         try:
             return search.search_page(
-                self.db, self.embedder, query, mode=mode, top_k=top_k,
-                folder=folder, tags=tags, since=since, until=until,
+                self.db,
+                self.embedder,
+                query,
+                mode=mode,
+                top_k=top_k,
+                folder=folder,
+                tags=tags,
+                since=since,
+                until=until,
                 params=self.search_params,
             )
         except EmbeddingBindingChanged as exc:
@@ -1953,16 +2063,29 @@ class DocumentService:
             raise EmbeddingUnavailableError(_EMBEDDING_UNAVAILABLE_MESSAGE) from exc
         return {"path": rel, "related": items}
 
-    def assemble_context(self, question: str, *, max_chars: int = 6000,
-                         max_sources: int = 8, mode: str = "hybrid",
-                         folder: str | None = None, tags: list[str] | None = None) -> dict:
+    def assemble_context(
+        self,
+        question: str,
+        *,
+        max_chars: int = 6000,
+        max_sources: int = 8,
+        mode: str = "hybrid",
+        folder: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
         """Retrieve + assemble citation-tagged context for a question (RAG primitive)."""
         if not question or not question.strip():
             raise ValidationError("question must not be empty.")
         try:
             return search.assemble_context(
-                self.db, self.embedder, question, max_chars=max_chars,
-                max_sources=max_sources, mode=mode, folder=folder, tags=tags,
+                self.db,
+                self.embedder,
+                question,
+                max_chars=max_chars,
+                max_sources=max_sources,
+                mode=mode,
+                folder=folder,
+                tags=tags,
                 params=self.search_params,
             )
         except EmbeddingBindingChanged as exc:
@@ -1988,16 +2111,11 @@ class DocumentService:
         self,
         folder: str | None = None,
         batch_size: int = 128,
-        conn: sqlite3.Connection | None = None,
+        *,
+        conn: sqlite3.Connection,
         body_max_chars: int | None = None,
     ) -> Iterator[dict]:
         """Yield ordered corpus metadata in batches, materializing one body at a time."""
-        if conn is None:
-            with self.db.reader() as read_conn:
-                yield from self._iter_corpus_docs(
-                    folder, batch_size, conn=read_conn, body_max_chars=body_max_chars
-                )
-            return
         where = " WHERE d.is_deleted=0"
         params: list = []
         if folder:
@@ -2006,8 +2124,7 @@ class DocumentService:
             params += [f, f + "/%"]
         order = " ORDER BY d.folder, d.path"
         metadata_q = (
-            "SELECT d.id, d.path, d.title, d.folder, d.updated_at "
-            "FROM documents d" + where + order
+            "SELECT d.id, d.path, d.title, d.folder, d.updated_at FROM documents d" + where + order
         )
         body_params = list(params)
         if body_max_chars is None:
@@ -2018,8 +2135,7 @@ class DocumentService:
         body_q = (
             f"SELECT d.id, {body_column}, length(r.body) AS body_chars "
             "FROM documents d "
-            "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version"
-            + where + order
+            "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version" + where + order
         )
         batch_size = max(1, int(batch_size))
         metadata_cursor = conn.execute(metadata_q, params)
@@ -2031,9 +2147,12 @@ class DocumentService:
                 if body_row is None or body_row["id"] != r["id"]:
                     raise RuntimeError("Corpus metadata and body cursors lost alignment.")
                 yield {
-                    "path": r["path"], "title": r["title"] or r["path"],
-                    "folder": r["folder"] or "", "updated_at": r["updated_at"],
-                    "tags": tags_by.get(r["id"], []), "body": body_row["body"],
+                    "path": r["path"],
+                    "title": r["title"] or r["path"],
+                    "folder": r["folder"] or "",
+                    "updated_at": r["updated_at"],
+                    "tags": tags_by.get(r["id"], []),
+                    "body": body_row["body"],
                     "body_chars": body_row["body_chars"],
                 }
 
@@ -2060,9 +2179,7 @@ class DocumentService:
         return cls._one_line(value).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
     @staticmethod
-    def _doc_description(
-        body: str, max_chars: int = 120, body_chars: int | None = None
-    ) -> str:
+    def _doc_description(body: str, max_chars: int = 120, body_chars: int | None = None) -> str:
         """A one-line description for the llms.txt index: a frontmatter
         ``description``/``summary`` if present, else the first non-empty body line
         with markdown markers stripped (single line, never HTML)."""
@@ -2116,7 +2233,8 @@ class DocumentService:
                 conn=conn, body_max_chars=_CORPUS_DESCRIPTION_PREFIX_CHARS
             )
             lines = [
-                f"# {self._md_label(site_title)}", "",
+                f"# {self._md_label(site_title)}",
+                "",
                 f"> 마크다운 지식베이스 — 문서 {total}개. "
                 "각 항목은 원문(.md) 링크이며, 전체 본문은 /llms-full.txt 로 한 번에 가져올 수 있습니다.",
                 "",
@@ -2142,10 +2260,7 @@ class DocumentService:
         limit = max(0, int(max_chars))
         with self._corpus_read_snapshot() as conn:
             total = self._corpus_count(conn=conn)
-            parts = [
-                f"# {self._md_label(site_title)}\n\n"
-                f"> 전체 코퍼스 export — 문서 {total}개.\n"
-            ]
+            parts = [f"# {self._md_label(site_title)}\n\n> 전체 코퍼스 export — 문서 {total}개.\n"]
             included = 0
             truncated = False
 
@@ -2157,17 +2272,17 @@ class DocumentService:
 
             size = len(parts[0])
             if size <= limit:
-                for d in self._iter_corpus_docs(
-                    conn=conn, body_max_chars=limit - size
-                ):
+                for d in self._iter_corpus_docs(conn=conn, body_max_chars=limit - size):
                     body, body_prefix_truncated = self._corpus_body_prefix(
                         d["body"], d["body_chars"]
                     )
                     body = body.strip()
-                    header = (f"---\n\n# {self._md_label(d['title'])}\n\n"
-                              f"- 경로: `{d['path']}`\n"
-                              + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
-                              + f"- 수정: {d['updated_at']}\n")
+                    header = (
+                        f"---\n\n# {self._md_label(d['title'])}\n\n"
+                        f"- 경로: `{d['path']}`\n"
+                        + (f"- 태그: {', '.join(d['tags'])}\n" if d["tags"] else "")
+                        + f"- 수정: {d['updated_at']}\n"
+                    )
                     block = header + "\n" + body + "\n"
                     separator = "\n"
                     candidate = separator + block
@@ -2211,12 +2326,20 @@ class DocumentService:
             return graph.resolve_path(conn, target, src_folder)
 
     # ---- writes ---------------------------------------------------------
-    def create(self, principal: Principal, path: str, content: str,
-               title: str | None = None, tags: list[str] | None = None,
-               *, embed: bool = True) -> dict:
+    def create(
+        self,
+        principal: Principal,
+        path: str,
+        content: str,
+        title: str | None = None,
+        tags: list[str] | None = None,
+        *,
+        embed: bool = True,
+    ) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot create documents (read/search only).")
+                f"Role '{principal.role}' cannot create documents (read/search only)."
+            )
         rel = normalize_rel_path(path)
         # Reject internal namespaces and unsafe existing path components before the
         # canonical DB write commits. Parent directories may be created later by the
@@ -2237,13 +2360,12 @@ class DocumentService:
                 (norm,),
             ).fetchone()
             if row and not row["is_deleted"]:
-                raise self._conflict(conn, row["id"], rel,
-                                     message="A document already exists at this path.")
+                raise self._conflict(
+                    conn, row["id"], rel, message="A document already exists at this path."
+                )
             if row and row["is_deleted"]:  # revive a tombstone
                 if row["has_purge_intent"]:
-                    raise ConflictError(
-                        "Permanent deletion is already in progress.", path=rel
-                    )
+                    raise ConflictError("Permanent deletion is already in progress.", path=rel)
                 # A normalized-path match may differ only in spelling/casing. Keep
                 # the tombstone's canonical path so the common live projector removes
                 # the exact existing trash copy instead of orphaning it.
@@ -2254,7 +2376,7 @@ class DocumentService:
                 fp.managed_path(self.vault, rel, namespace="live")
                 doc_id = int(row["id"])
                 new_version = int(row["version"]) + 1
-                changed = conn.execute(
+                conn.execute(
                     "UPDATE documents SET path=?, title=?, version=?, content_hash=?, folder=?, "
                     "file_state='pending', vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? "
                     "WHERE id=? AND version=? AND is_deleted=1 "
@@ -2272,50 +2394,84 @@ class DocumentService:
                         doc_id,
                     ),
                 )
-                if changed.rowcount != 1:
-                    raise ConflictError(
-                        "The deleted document changed before it could be revived.",
-                        path=rel,
-                    )
             else:
-                cur = conn.execute(
+                inserted = conn.execute(
                     "INSERT INTO documents(path, path_norm, title, version, content_hash, folder, "
                     "file_state, vector_dirty, is_deleted, created_at, created_by, updated_at, updated_by) "
-                    "VALUES(?,?,?,?,?,?, 'pending', 1, 0, ?,?,?,?)",
-                    (rel, norm, final_title, 1, chash, folder, now, principal.user_id, now, principal.user_id),
-                )
-                if cur.lastrowid is None:
-                    raise RuntimeError("document insert did not return an id")
-                doc_id, new_version = int(cur.lastrowid), 1
+                    "VALUES(?,?,?,?,?,?, 'pending', 1, 0, ?,?,?,?) RETURNING id",
+                    (
+                        rel,
+                        norm,
+                        final_title,
+                        1,
+                        chash,
+                        folder,
+                        now,
+                        principal.user_id,
+                        now,
+                        principal.user_id,
+                    ),
+                ).fetchone()
+                doc_id, new_version = int(inserted["id"]), 1
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'create', ?, ?)",
-                (doc_id, new_version, content, final_title, chash, principal.user_id, principal.via, now),
+                (
+                    doc_id,
+                    new_version,
+                    content,
+                    final_title,
+                    chash,
+                    principal.user_id,
+                    principal.via,
+                    now,
+                ),
             )
             self._set_tags(conn, doc_id, tagset)
             indexing.reindex_fts(conn, doc_id, final_title, content)
             indexing.rechunk(conn, doc_id, content)
             indexing.reindex_links(conn, doc_id, content, folder)
             graph.backfill_links_for(conn, doc_id, norm, stem)
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_create", target=rel, detail=f"v{new_version}")
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="doc_create",
+                target=rel,
+                detail=f"v{new_version}",
+            )
 
         self._require_projection(int(doc_id))
         if embed:
             self._embed(int(doc_id))
         DOC_WRITES.labels("create").inc()
-        self._emit("create", rel, new_version, title=final_title,
-                   updated_by=principal.username, via=principal.via)
+        self._emit(
+            "create",
+            rel,
+            new_version,
+            title=final_title,
+            updated_by=principal.username,
+            via=principal.via,
+        )
         self._bump_nav()
         return self.get(rel)
 
-    def update(self, principal: Principal, path: str, base_version: int | None, content: str,
-               title: str | None = None, tags: list[str] | None = None,
-               *, embed: bool = True,
-               idempotency: tuple[str, int, str] | None = None) -> dict:
+    def update(
+        self,
+        principal: Principal,
+        path: str,
+        base_version: int | None,
+        content: str,
+        title: str | None = None,
+        tags: list[str] | None = None,
+        *,
+        embed: bool = True,
+        idempotency: tuple[str, int, str] | None = None,
+    ) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot modify documents (read/search only).")
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         if base_version is None:
             raise ValidationError("base_version is required for updates.")
         rel = normalize_rel_path(path)
@@ -2350,8 +2506,16 @@ class DocumentService:
                 "UPDATE documents SET version=version+1, title=?, content_hash=?, folder=?, "
                 "file_state='pending', vector_dirty=CASE WHEN ? THEN 1 ELSE vector_dirty END, "
                 "updated_at=?, updated_by=? WHERE id=? AND version=?",
-                (final_title, chash, folder, 1 if content_changed else 0, now,
-                 principal.user_id, doc_id, int(base_version)),
+                (
+                    final_title,
+                    chash,
+                    folder,
+                    1 if content_changed else 0,
+                    now,
+                    principal.user_id,
+                    doc_id,
+                    int(base_version),
+                ),
             )
             if cur.rowcount == 0:
                 raise self._conflict(conn, doc_id, rel)
@@ -2359,15 +2523,30 @@ class DocumentService:
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'edit', ?, ?)",
-                (doc_id, new_version, content, final_title, chash, principal.user_id, principal.via, now),
+                (
+                    doc_id,
+                    new_version,
+                    content,
+                    final_title,
+                    chash,
+                    principal.user_id,
+                    principal.via,
+                    now,
+                ),
             )
             self._set_tags(conn, doc_id, tagset)
             indexing.reindex_fts(conn, doc_id, final_title, content)
             if content_changed:
                 indexing.rechunk(conn, doc_id, content)
             indexing.reindex_links(conn, doc_id, content, folder)
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_update", target=rel, detail=f"v{new_version}")
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="doc_update",
+                target=rel,
+                detail=f"v{new_version}",
+            )
             if idempotency is not None:
                 # Stamp the key in the SAME transaction as the write it guards. If a
                 # concurrent request already committed this key, the UNIQUE constraint
@@ -2377,18 +2556,26 @@ class DocumentService:
                 conn.execute(
                     "INSERT INTO idempotency_keys(scope, user_id, idem_key, doc_id, "
                     "result_version, result_path, created_at) VALUES(?,?,?,?,?,?,?)",
-                    (scope, uid, key, doc_id, new_version, rel, now))
+                    (scope, uid, key, doc_id, new_version, rel, now),
+                )
                 cutoff = (datetime.now(UTC) - timedelta(days=_IDEM_RETENTION_DAYS)).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ")
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
                 conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
 
         self._require_projection(int(doc_id))
         if content_changed and embed:
             self._embed(int(doc_id))
         DOC_WRITES.labels("update").inc()
-        self._emit("update", rel, new_version, title=final_title,
-                   updated_by=principal.username, via=principal.via,
-                   content_changed=content_changed)
+        self._emit(
+            "update",
+            rel,
+            new_version,
+            title=final_title,
+            updated_by=principal.username,
+            via=principal.via,
+            content_changed=content_changed,
+        )
         self._bump_nav()
         return self.get(rel)
 
@@ -2396,9 +2583,14 @@ class DocumentService:
     def get_section(self, path: str, heading: str, occurrence: int = 1) -> dict:
         doc = self.get(path)
         lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
-        return {"path": doc["path"], "heading": heading, "occurrence": occurrence,
-                "version": doc["version"], "tags": doc["tags"],
-                "content": "".join(lines[start:end])}
+        return {
+            "path": doc["path"],
+            "heading": heading,
+            "occurrence": occurrence,
+            "version": doc["version"],
+            "tags": doc["tags"],
+            "content": "".join(lines[start:end]),
+        }
 
     def outline(self, path: str) -> dict:
         """Flat heading outline of a document: [{level, text, line}] (1-based lines).
@@ -2408,24 +2600,44 @@ class DocumentService:
         for i, line in enumerate(doc["content"].splitlines()):
             m = _HEADING_RE.match(line)
             if m:
-                headings.append({"level": len(m.group(1)), "text": m.group(2).strip(), "line": i + 1})
+                headings.append(
+                    {"level": len(m.group(1)), "text": m.group(2).strip(), "line": i + 1}
+                )
         return {"path": doc["path"], "version": doc["version"], "headings": headings}
 
-    def replace_section(self, principal: Principal, path: str, heading: str, text: str,
-                        base_version: int | None = None, occurrence: int = 1) -> dict:
+    def replace_section(
+        self,
+        principal: Principal,
+        path: str,
+        heading: str,
+        text: str,
+        base_version: int | None = None,
+        occurrence: int = 1,
+    ) -> dict:
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         doc = self.get(path)
         lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
         # Keep the heading line; replace its body up to the next same/higher heading.
-        body = "".join(lines[:start + 1]) + _as_block(text) + "".join(lines[end:])
+        body = "".join(lines[: start + 1]) + _as_block(text) + "".join(lines[end:])
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, body)
 
-    def append_section(self, principal: Principal, path: str, heading: str, text: str,
-                       base_version: int | None = None, occurrence: int = 1) -> dict:
+    def append_section(
+        self,
+        principal: Principal,
+        path: str,
+        heading: str,
+        text: str,
+        base_version: int | None = None,
+        occurrence: int = 1,
+    ) -> dict:
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         doc = self.get(path)
         lines, start, end, _ = _locate_or_raise(doc, heading, occurrence)
         head = "".join(lines[:end])
@@ -2437,10 +2649,15 @@ class DocumentService:
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, body)
 
-    def append_to_document(self, principal: Principal, path: str, text: str,
-                           ensure_heading: str | None = None,
-                           base_version: int | None = None,
-                           idempotency_key: str | None = None) -> dict:
+    def append_to_document(
+        self,
+        principal: Principal,
+        path: str,
+        text: str,
+        ensure_heading: str | None = None,
+        base_version: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict:
         """Append a text block to the document — the natural agent-journaling
         primitive (decision logs, daily notes). With ``ensure_heading`` the block
         goes at the end of that heading's section, creating the heading (h2) at the
@@ -2454,7 +2671,9 @@ class DocumentService:
         retries after a lost response won't duplicate the block. Use a fresh key per
         logical append."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         if not text or not text.strip():
             raise ValidationError("'text' is required.")
         if idempotency_key:
@@ -2484,24 +2703,40 @@ class DocumentService:
         idem = ("append", principal.user_id, idempotency_key) if idempotency_key else None
         try:
             return self.update(principal, doc["path"], bv, new_body, idempotency=idem)
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, ConflictError):
             # A concurrent request with the same key committed between our pre-check and
-            # our commit; our write rolled back. Replay the original result.
-            cached = self._idem_lookup("append", principal.user_id, idempotency_key) if idempotency_key else None
+            # our commit. Depending on whether it won before or after our CAS, the loser
+            # sees either the key's UNIQUE constraint or the newer document version. Its
+            # transaction rolled back in both cases, so replay the original result.
+            cached = (
+                self._idem_lookup("append", principal.user_id, idempotency_key)
+                if idempotency_key
+                else None
+            )
             if cached is not None:
                 return cached
             raise
 
-    def patch(self, principal: Principal, path: str, find: str, replace: str,
-              base_version: int | None = None, count: int = 1,
-              mode: str = "literal", occurrence: int | None = None) -> dict:
+    def patch(
+        self,
+        principal: Principal,
+        path: str,
+        find: str,
+        replace: str,
+        base_version: int | None = None,
+        count: int = 1,
+        mode: str = "literal",
+        occurrence: int | None = None,
+    ) -> dict:
         """Find-and-replace a substring (``mode='literal'``) or a regular expression
         (``mode='regex'``, ``re.MULTILINE``; ``replace`` may use ``\\1`` backrefs).
         ``occurrence`` (1-based) targets a single match deterministically — the way
         out of "appears N times" failures on repetitive content; otherwise ``count``
         bounds how many matches may be replaced (0/None = all)."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         if not find:
             raise ValidationError("'find' text is required.")
         if mode not in ("literal", "regex"):
@@ -2519,9 +2754,12 @@ class DocumentService:
             except regex_lib.error as e:
                 raise ValidationError(f"invalid regex: {e}") from None
             try:
-                matches = list(islice(
-                    pat.finditer(content, timeout=REGEX_TIMEOUT_S), MAX_PATCH_MATCHES + 1,
-                ))
+                matches = list(
+                    islice(
+                        pat.finditer(content, timeout=REGEX_TIMEOUT_S),
+                        MAX_PATCH_MATCHES + 1,
+                    )
+                )
                 if len(matches) > MAX_PATCH_MATCHES:
                     raise ValidationError(
                         f"Pattern matches more than {MAX_PATCH_MATCHES} times; narrow the pattern."
@@ -2533,60 +2771,73 @@ class DocumentService:
                     if occurrence > n:
                         raise ValidationError(f"occurrence {occurrence} out of range (1..{n}).")
                     m = matches[occurrence - 1]
-                    new_body = content[:m.start()] + m.expand(replace) + content[m.end():]
+                    new_body = content[: m.start()] + m.expand(replace) + content[m.end() :]
                 else:
                     if count and n > count:
                         raise ValidationError(
                             f"Pattern matches {n} times (limit {count}); narrow it, pass "
-                            f"'occurrence', or raise 'count'.")
-                    new_body = pat.sub(replace, content, count=count or 0,
-                                       timeout=REGEX_TIMEOUT_S)
+                            f"'occurrence', or raise 'count'."
+                        )
+                    new_body = pat.sub(replace, content, count=count or 0, timeout=REGEX_TIMEOUT_S)
             except TimeoutError:
-                raise ValidationError(
-                    "regex evaluation timed out; narrow the pattern."
-                ) from None
+                raise ValidationError("regex evaluation timed out; narrow the pattern.") from None
         else:
             occurrences = content.count(find)
             if occurrences == 0:
                 raise NotFoundError("Search text not found; nothing patched.", path=rel)
             if occurrence is not None:
                 if occurrence > occurrences:
-                    raise ValidationError(f"occurrence {occurrence} out of range (1..{occurrences}).")
+                    raise ValidationError(
+                        f"occurrence {occurrence} out of range (1..{occurrences})."
+                    )
                 idx = -len(find)
                 for _ in range(occurrence):
                     idx = content.find(find, idx + len(find))
-                new_body = content[:idx] + replace + content[idx + len(find):]
+                new_body = content[:idx] + replace + content[idx + len(find) :]
             else:
                 if count and occurrences > count:
                     raise ValidationError(
                         f"Search text appears {occurrences} times (limit {count}); make it more "
-                        f"specific, pass 'occurrence', or raise 'count'.")
+                        f"specific, pass 'occurrence', or raise 'count'."
+                    )
                 new_body = content.replace(find, replace, count if count else -1)
 
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, rel, bv, new_body)
 
-    def restore_revision(self, principal: Principal, path: str, version: int,
-                         base_version: int | None = None) -> dict:
+    def restore_revision(
+        self, principal: Principal, path: str, version: int, base_version: int | None = None
+    ) -> dict:
         """Replay a past revision's body as a new edit (one CAS update) — a server-side
         undo. The old body is loaded here and never has to travel through the caller,
         so reverting a large document is a single small call. ``base_version`` defaults
         to the current version; pass it to reject the revert with 'conflict' if the
         document changed since you looked."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         rev = self.revision(path, int(version))
         bv = self.get(rev["path"])["version"] if base_version is None else int(base_version)
         return self.update(principal, rev["path"], bv, rev["content"], title=rev["title"])
 
-    def toggle_task(self, principal: Principal, path: str, line: int | None = None,
-                    *, index: int | None = None, base_version: int | None = None) -> dict:
+    def toggle_task(
+        self,
+        principal: Principal,
+        path: str,
+        line: int | None = None,
+        *,
+        index: int | None = None,
+        base_version: int | None = None,
+    ) -> dict:
         """Flip a single markdown task checkbox (``- [ ]`` <-> ``- [x]``), then save
         through the CAS update path. Target by 1-based ``line`` or by 0-based
         ``index`` (the Nth checkbox in document order — matches the rendered
         ``data-ti`` attribute used by click-to-toggle in the viewer)."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         doc = self.get(path)
         lines = doc["content"].split("\n")
         if index is not None:
@@ -2607,13 +2858,20 @@ class DocumentService:
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, "\n".join(lines))
 
-    def patch_tags(self, principal: Principal, path: str, add: list[str] | None = None,
-                   remove: list[str] | None = None) -> dict:
+    def patch_tags(
+        self,
+        principal: Principal,
+        path: str,
+        add: list[str] | None = None,
+        remove: list[str] | None = None,
+    ) -> dict:
         """Add/remove tags by rewriting the frontmatter ``tags`` list (body untouched).
         Returns the document's resulting tags. Tags written inline as ``#hashtags``
         in the body are re-derived on save, so they cannot be removed this way."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         doc = self.get(path)
         current = set(doc["tags"])
         add_set = {str(t).strip().lstrip("#") for t in (add or []) if str(t).strip()}
@@ -2622,9 +2880,7 @@ class DocumentService:
         if target == sorted(current):  # no net change — stay idempotent, skip the version bump
             return {"path": doc["path"], "version": doc["version"], "tags": sorted(current)}
         new_content = set_frontmatter_tags(doc["content"], target)
-        updated = self.update(
-            principal, doc["path"], doc["version"], new_content, tags=target
-        )
+        updated = self.update(principal, doc["path"], doc["version"], new_content, tags=target)
         return {"path": updated["path"], "version": updated["version"], "tags": updated["tags"]}
 
     def merge_tags(self, principal: Principal, sources: list[str], dest: str) -> dict:
@@ -2635,27 +2891,40 @@ class DocumentService:
         manages the frontmatter list) — edit the body for those. Returns the dest, the
         normalized sources, and how many documents were touched."""
         if not principal.can_write:
-            raise ForbiddenError(
-                f"Role '{principal.role}' cannot rewrite tags (read/search only).")
+            raise ForbiddenError(f"Role '{principal.role}' cannot rewrite tags (read/search only).")
         dest = str(dest or "").strip().lstrip("#")
         if not dest:
             raise ValidationError("dest tag must not be empty.")
-        src = sorted({str(s).strip().lstrip("#") for s in (sources or []) if str(s).strip()} - {dest})
+        src = sorted(
+            {str(s).strip().lstrip("#") for s in (sources or []) if str(s).strip()} - {dest}
+        )
         if not src:
             raise ValidationError("no source tags to merge (after removing the dest tag).")
         ph = ",".join("?" * len(src))
         with self.db.reader() as conn:
-            paths = [r["path"] for r in conn.execute(
-                f"SELECT DISTINCT d.path FROM tags t JOIN documents d ON d.id=t.doc_id "
-                f"WHERE t.tag IN ({ph}) AND d.is_deleted=0 ORDER BY d.path", src)]
+            paths = [
+                r["path"]
+                for r in conn.execute(
+                    f"SELECT DISTINCT d.path FROM tags t JOIN documents d ON d.id=t.doc_id "
+                    f"WHERE t.tag IN ({ph}) AND d.is_deleted=0 ORDER BY d.path",
+                    src,
+                )
+            ]
         changed = 0
         for p in paths:
             before = self.get(p)["version"]
             after = self.patch_tags(principal, p, add=[dest], remove=src)
-            if after["version"] != before:  # patch_tags is a no-op (no version bump) when there's no net change
+            if (
+                after["version"] != before
+            ):  # patch_tags is a no-op (no version bump) when there's no net change
                 changed += 1
-        return {"ok": True, "dest": dest, "sources": src,
-                "docs_affected": len(paths), "docs_changed": changed}
+        return {
+            "ok": True,
+            "dest": dest,
+            "sources": src,
+            "docs_affected": len(paths),
+            "docs_changed": changed,
+        }
 
     def rename_tag(self, principal: Principal, old: str, new: str) -> dict:
         """Rename one frontmatter tag across the whole vault (editor/admin only) — a
@@ -2682,12 +2951,20 @@ class DocumentService:
             return [str(v).strip() for v in value if str(v).strip()]
         return str(value).strip()
 
-    def set_property(self, principal: Principal, path: str, key: str,
-                     value: str | list[str], base_version: int | None = None) -> dict:
+    def set_property(
+        self,
+        principal: Principal,
+        path: str,
+        key: str,
+        value: str | list[str],
+        base_version: int | None = None,
+    ) -> dict:
         """Set/replace one frontmatter property (body + other keys untouched), through
         the CAS update path. An empty value removes the key."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         key = self._validate_prop_key(key)
         doc = self.get(path)
         val = self._norm_prop_value(value)
@@ -2695,17 +2972,21 @@ class DocumentService:
             new_content = remove_frontmatter_property(doc["content"], key)
         else:
             new_content = set_frontmatter_property(
-                doc["content"], key, val if isinstance(val, str) or len(val) > 1 else val[0])
+                doc["content"], key, val if isinstance(val, str) or len(val) > 1 else val[0]
+            )
         if new_content == doc["content"]:
             return self.get(doc["path"])
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, new_content)
 
-    def remove_property(self, principal: Principal, path: str, key: str,
-                        base_version: int | None = None) -> dict:
+    def remove_property(
+        self, principal: Principal, path: str, key: str, base_version: int | None = None
+    ) -> dict:
         """Remove one frontmatter property (no-op if absent), through CAS update."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         key = self._validate_prop_key(key)
         doc = self.get(path)
         new_content = remove_frontmatter_property(doc["content"], key)
@@ -2714,14 +2995,20 @@ class DocumentService:
         bv = doc["version"] if base_version is None else int(base_version)
         return self.update(principal, doc["path"], bv, new_content)
 
-    def replace_properties(self, principal: Principal, path: str,
-                           props: list[tuple[str, list[str]]],
-                           base_version: int | None = None) -> dict:
+    def replace_properties(
+        self,
+        principal: Principal,
+        path: str,
+        props: list[tuple[str, list[str]]],
+        base_version: int | None = None,
+    ) -> dict:
         """Replace the whole editable property set in one revision: drops omitted keys,
         sets the rest. ``title``/``tags`` and the body are preserved. ``props`` is an
         ordered list of (key, values); empty value-lists drop the key."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         cleaned: list[tuple[str, list[str]]] = []
         seen_keys: set[str] = set()
         for key, values in props:
@@ -2741,7 +3028,9 @@ class DocumentService:
             if not vals:
                 content = remove_frontmatter_property(content, key)
             else:
-                content = set_frontmatter_property(content, key, vals[0] if len(vals) == 1 else vals)
+                content = set_frontmatter_property(
+                    content, key, vals[0] if len(vals) == 1 else vals
+                )
         if content == doc["content"]:
             return self.get(doc["path"])
         bv = doc["version"] if base_version is None else int(base_version)
@@ -2762,13 +3051,21 @@ class DocumentService:
         if not self.exists(rel):
             raise NotFoundError("No document at this path.", path=rel)
         inbound = self.backlinks(rel)["backlinks"]
-        return {"from": rel, "to": new_rel, "dest_exists": self.exists(new_rel),
-                "inbound_count": len(inbound), "inbound": [b["src_path"] for b in inbound]}
+        return {
+            "from": rel,
+            "to": new_rel,
+            "dest_exists": self.exists(new_rel),
+            "inbound_count": len(inbound),
+            "inbound": [b["src_path"] for b in inbound],
+        }
 
-    def move(self, principal: Principal, path: str, new_path: str,
-             fix_references: bool = False) -> dict:
+    def move(
+        self, principal: Principal, path: str, new_path: str, fix_references: bool = False
+    ) -> dict:
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot move documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot move documents (read/search only)."
+            )
         rel, new_rel = normalize_rel_path(path), normalize_rel_path(new_path)
         norm, new_norm = path_norm(rel), path_norm(new_rel)
         if norm == new_norm:
@@ -2796,7 +3093,8 @@ class DocumentService:
             ):
                 raise RuntimeError("current document revision is missing or corrupt")
             clash = conn.execute(
-                "SELECT 1 FROM documents WHERE path_norm=?", (new_norm,)).fetchone()
+                "SELECT 1 FROM documents WHERE path_norm=?", (new_norm,)
+            ).fetchone()
             if clash:
                 raise ConflictError("The destination path is already occupied.", path=new_rel)
             doc_id, new_version = int(row["id"]), int(row["version"]) + 1
@@ -2805,9 +3103,7 @@ class DocumentService:
             # path. The DB writer fence serializes this authority with every managed
             # publisher; the full signature prevents a later external generation from
             # being deleted by a delayed cleanup.
-            source_target = fp.managed_path(
-                self.vault, source_rel, namespace="live"
-            )
+            source_target = fp.managed_path(self.vault, source_rel, namespace="live")
             source_signature = fp.confined_file_signature(
                 self.vault, source_target, missing_ok=True
             )
@@ -2847,7 +3143,7 @@ class DocumentService:
                     now,
                 ),
             )
-            changed = conn.execute(
+            conn.execute(
                 "UPDATE documents SET path=?, path_norm=?, folder=?, version=version+1, "
                 "file_state='pending', updated_at=?, updated_by=? "
                 "WHERE id=? AND path=? AND path_norm=? AND version=?",
@@ -2863,24 +3159,42 @@ class DocumentService:
                     int(row["version"]),
                 ),
             )
-            if changed.rowcount != 1:
-                raise ConflictError("The document changed before it could be moved.", path=source_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'rename', ?, ?)",
-                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, principal.via, now),
+                (
+                    doc_id,
+                    new_version,
+                    body,
+                    row["title"],
+                    sha256_hex(body),
+                    principal.user_id,
+                    principal.via,
+                    now,
+                ),
             )
             # Incoming links that resolved to the old path/name are now stale; drop
             # their resolution and re-resolve anything pointing at the new path/name.
             graph.unresolve_incoming(conn, doc_id)
             graph.backfill_links_for(conn, doc_id, new_norm, new_stem)
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_move", target=f"{source_rel} -> {new_rel}")
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="doc_move",
+                target=f"{source_rel} -> {new_rel}",
+            )
         self._require_projection(doc_id)
         DOC_WRITES.labels("move").inc()
         # Keyed on the OLD path so a viewer of the moved doc can follow it to `to`.
-        self._emit("move", source_rel, new_version, to=new_rel,
-                   updated_by=principal.username, via=principal.via)
+        self._emit(
+            "move",
+            source_rel,
+            new_version,
+            to=new_rel,
+            updated_by=principal.username,
+            via=principal.via,
+        )
         result = self.get(new_rel)
         if fix_references:
             # Re-resolution above fixed the GRAPH, but bodies still contain the old
@@ -2902,7 +3216,9 @@ class DocumentService:
         document instead of aborting the rest.
         Returns {from, to, docs_rewritten, links_rewritten, skipped_conflicts}."""
         if not principal.can_write:
-            raise ForbiddenError(f"Role '{principal.role}' cannot modify documents (read/search only).")
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
         old_rel, new_rel = normalize_rel_path(old_path), normalize_rel_path(new_path)
         old_norm, old_stem = path_norm(old_rel), basename_stem(old_rel).lower()
         new_noext = new_rel[:-3] if new_rel.lower().endswith(".md") else new_rel
@@ -2936,8 +3252,11 @@ class DocumentService:
                 # is a legitimately different target now and must be left intact.
                 if self.resolve_link(link.target, doc["path"]):
                     continue
-                new_target = (new_rel if link.target.lower().endswith(".md") else new_noext) \
-                    if is_path else new_basename
+                new_target = (
+                    (new_rel if link.target.lower().endswith(".md") else new_noext)
+                    if is_path
+                    else new_basename
+                )
                 edits.append((link.start, link.end, rewrite_link_target(link, new_target)))
             if not edits:
                 continue
@@ -2951,11 +3270,17 @@ class DocumentService:
                 continue
             docs_rewritten += 1
             links_rewritten += len(edits)
-        return {"from": old_rel, "to": new_rel, "docs_rewritten": docs_rewritten,
-                "links_rewritten": links_rewritten, "skipped_conflicts": skipped}
+        return {
+            "from": old_rel,
+            "to": new_rel,
+            "docs_rewritten": docs_rewritten,
+            "links_rewritten": links_rewritten,
+            "skipped_conflicts": skipped,
+        }
 
-    def recent_changes(self, limit: int = 20, since: str | None = None,
-                       until: str | None = None) -> list[dict]:
+    def recent_changes(
+        self, limit: int = 20, since: str | None = None, until: str | None = None
+    ) -> list[dict]:
         """Most-recently-updated non-deleted documents, optionally bounded by an
         ISO-8601 updated_at window (e.g. '2026-06-01')."""
         q = "SELECT id, path, title, version, folder, updated_at FROM documents WHERE is_deleted=0"
@@ -2971,13 +3296,21 @@ class DocumentService:
         with self.db.reader() as conn:
             rows = conn.execute(q, params).fetchall()
             tags_by = self._tags_for_ids(conn, [r["id"] for r in rows])
-            return [{
-                "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
-                "folder": r["folder"], "tags": tags_by.get(r["id"], []), "updated_at": r["updated_at"],
-            } for r in rows]
+            return [
+                {
+                    "path": r["path"],
+                    "title": r["title"] or r["path"],
+                    "version": r["version"],
+                    "folder": r["folder"],
+                    "tags": tags_by.get(r["id"], []),
+                    "updated_at": r["updated_at"],
+                }
+                for r in rows
+            ]
 
-    def daily_note(self, principal: Principal, date: str | None = None, *,
-                   folder: str = "daily") -> dict:
+    def daily_note(
+        self, principal: Principal, date: str | None = None, *, folder: str = "daily"
+    ) -> dict:
         """Open the daily note for ``date`` (YYYY-MM-DD; default today, UTC), creating it
         if absent — the journaling entry point. Reading an existing note needs no write
         permission; only creating one does. The new note carries a minimal ``# <date>``
@@ -2995,13 +3328,15 @@ class DocumentService:
             return {**self.get(rel), "created": False}
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot create the daily note (read/search only).")
+                f"Role '{principal.role}' cannot create the daily note (read/search only)."
+            )
         return {**self.create(principal, rel, f"# {date}\n\n", title=date), "created": True}
 
     def delete(self, principal: Principal, path: str, base_version: int | None = None) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot delete documents (read/search only).")
+                f"Role '{principal.role}' cannot delete documents (read/search only)."
+            )
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         now = now_iso()
@@ -3031,7 +3366,7 @@ class DocumentService:
             ):
                 raise RuntimeError("current document revision is missing or corrupt")
             new_version = int(row["version"]) + 1
-            changed = conn.execute(
+            conn.execute(
                 "UPDATE documents SET is_deleted=1, version=version+1, file_state='pending', "
                 "vector_dirty=0, updated_at=?, updated_by=? "
                 "WHERE id=? AND path=? AND path_norm=? AND version=? AND is_deleted=0 "
@@ -3046,23 +3381,37 @@ class DocumentService:
                     doc_id,
                 ),
             )
-            if changed.rowcount != 1:
-                raise self._conflict(conn, doc_id, actual_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'delete', ?, ?)",
-                (doc_id, new_version, body, row["title"], sha256_hex(body), principal.user_id, principal.via, now),
+                (
+                    doc_id,
+                    new_version,
+                    body,
+                    row["title"],
+                    sha256_hex(body),
+                    principal.user_id,
+                    principal.via,
+                    now,
+                ),
             )
             indexing.remove_fts(conn, doc_id)
             indexing.clear_chunks(conn, doc_id)
             graph.unresolve_incoming(conn, doc_id)
             conn.execute("DELETE FROM links WHERE src_doc_id=?", (doc_id,))
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_delete", target=actual_rel, detail=f"v{new_version}")
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="doc_delete",
+                target=actual_rel,
+                detail=f"v{new_version}",
+            )
         self._require_projection(doc_id)
         DOC_WRITES.labels("delete").inc()
-        self._emit("delete", actual_rel, new_version,
-                   updated_by=principal.username, via=principal.via)
+        self._emit(
+            "delete", actual_rel, new_version, updated_by=principal.username, via=principal.via
+        )
         self._bump_nav()
         return {"ok": True, "path": actual_rel, "deleted": True}
 
@@ -3076,11 +3425,17 @@ class DocumentService:
                 "FROM documents WHERE is_deleted=1 ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 (clamp_int(limit, 1, 1000), max(0, int(offset))),
             ).fetchall()
-            return [{
-                "path": r["path"], "title": r["title"] or r["path"], "version": r["version"],
-                "folder": r["folder"], "updated_at": r["updated_at"],
-                "deleted_by": self._username(conn, r["updated_by"]),
-            } for r in rows]
+            return [
+                {
+                    "path": r["path"],
+                    "title": r["title"] or r["path"],
+                    "version": r["version"],
+                    "folder": r["folder"],
+                    "updated_at": r["updated_at"],
+                    "deleted_by": self._username(conn, r["updated_by"]),
+                }
+                for r in rows
+            ]
 
     def restore(self, principal: Principal, path: str) -> dict:
         """Bring a soft-deleted document back (editor/admin only): un-tombstone it, rebuild
@@ -3089,7 +3444,8 @@ class DocumentService:
         is the latest revision's, so no content travels through the caller."""
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot restore documents (read/search only).")
+                f"Role '{principal.role}' cannot restore documents (read/search only)."
+            )
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         now = now_iso()
@@ -3119,7 +3475,7 @@ class DocumentService:
             ):
                 raise RuntimeError("current document revision is missing or corrupt")
             new_version = int(row["version"]) + 1
-            changed = conn.execute(
+            conn.execute(
                 "UPDATE documents SET version=version+1, content_hash=?, file_state='pending', "
                 "vector_dirty=1, is_deleted=0, updated_at=?, updated_by=? "
                 "WHERE id=? AND path=? AND path_norm=? AND version=? AND is_deleted=1 "
@@ -3135,12 +3491,19 @@ class DocumentService:
                     doc_id,
                 ),
             )
-            if changed.rowcount != 1:
-                raise ConflictError("The deleted document changed before restore.", path=actual_rel)
             conn.execute(
                 "INSERT INTO revisions(doc_id, version, body, title, content_hash, author_id, op, via, created_at) "
                 "VALUES(?,?,?,?,?,?, 'edit', ?, ?)",
-                (doc_id, new_version, body, title, sha256_hex(body), principal.user_id, principal.via, now),
+                (
+                    doc_id,
+                    new_version,
+                    body,
+                    title,
+                    sha256_hex(body),
+                    principal.user_id,
+                    principal.via,
+                    now,
+                ),
             )
             # tags survive a soft delete (delete() leaves the tags table alone), so only
             # the FTS/chunk/link artifacts — torn down on delete — need rebuilding.
@@ -3153,8 +3516,14 @@ class DocumentService:
                 str(row["path_norm"]),
                 basename_stem(actual_rel).lower(),
             )
-            audit.record(conn, actor=principal.username, via=principal.via,
-                         action="doc_restore", target=actual_rel, detail=f"v{new_version}")
+            audit.record(
+                conn,
+                actor=principal.username,
+                via=principal.via,
+                action="doc_restore",
+                target=actual_rel,
+                detail=f"v{new_version}",
+            )
         self._require_projection(doc_id)
         self._embed(doc_id)
         DOC_WRITES.labels("restore").inc()
@@ -3252,15 +3621,7 @@ class DocumentService:
                         retry = True
                     else:
                         if initially_pending:
-                            if (
-                                projection is not None
-                                and not projection.settled
-                                and not projection.current_installed
-                            ):
-                                raise ProjectionPendingError(projection)
-                            live = fp.managed_path(
-                                self.vault, actual_rel, namespace="live"
-                            )
+                            live = fp.managed_path(self.vault, actual_rel, namespace="live")
                             if not fp.confirm_confined_absence(self.vault, live):
                                 raise ProjectionPendingError(
                                     fp.ProjectionResult(
@@ -3272,10 +3633,7 @@ class DocumentService:
                                         1,
                                         True,
                                         "The pending tombstone still has a live file.",
-                                        bool(
-                                            projection
-                                            and projection.current_installed
-                                        ),
+                                        bool(projection and projection.current_installed),
                                     )
                                 )
                         conn.execute(
@@ -3292,7 +3650,7 @@ class DocumentService:
                                 now_iso(),
                             ),
                         )
-                        marked = conn.execute(
+                        conn.execute(
                             "UPDATE documents SET file_state='pending' "
                             "WHERE id=? AND path=? AND path_norm=? AND version=? "
                             "AND content_hash=? AND is_deleted=1 "
@@ -3307,10 +3665,6 @@ class DocumentService:
                                 doc_id,
                             ),
                         )
-                        if marked.rowcount != 1:
-                            raise RuntimeError(
-                                "purge intent committed without its tombstone fence"
-                            )
                         actual_rel = str(current["path"])
             if retry:
                 continue
@@ -3337,20 +3691,24 @@ class DocumentService:
         norm = path_norm(rel)
         with self.db.writer() as conn:
             d = conn.execute(
-                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             existing = conn.execute(
-                "SELECT 1 FROM favorites WHERE user_id=? AND doc_id=?",
-                (principal.user_id, d["id"])).fetchone()
+                "SELECT 1 FROM favorites WHERE user_id=? AND doc_id=?", (principal.user_id, d["id"])
+            ).fetchone()
             if existing:
-                conn.execute("DELETE FROM favorites WHERE user_id=? AND doc_id=?",
-                             (principal.user_id, d["id"]))
+                conn.execute(
+                    "DELETE FROM favorites WHERE user_id=? AND doc_id=?",
+                    (principal.user_id, d["id"]),
+                )
                 fav = False
             else:
                 conn.execute(
                     "INSERT OR IGNORE INTO favorites(user_id, doc_id, created_at) VALUES(?,?,?)",
-                    (principal.user_id, d["id"], now_iso()))
+                    (principal.user_id, d["id"], now_iso()),
+                )
                 fav = True
         return {"ok": True, "path": rel, "favorite": fav}
 
@@ -3362,16 +3720,20 @@ class DocumentService:
         norm = path_norm(rel)
         with self.db.writer() as conn:
             d = conn.execute(
-                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)).fetchone()
+                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
+            ).fetchone()
             if not d:
                 raise NotFoundError("No document at this path.", path=rel)
             if favorite:
                 conn.execute(
                     "INSERT OR IGNORE INTO favorites(user_id, doc_id, created_at) VALUES(?,?,?)",
-                    (principal.user_id, d["id"], now_iso()))
+                    (principal.user_id, d["id"], now_iso()),
+                )
             else:
-                conn.execute("DELETE FROM favorites WHERE user_id=? AND doc_id=?",
-                             (principal.user_id, d["id"]))
+                conn.execute(
+                    "DELETE FROM favorites WHERE user_id=? AND doc_id=?",
+                    (principal.user_id, d["id"]),
+                )
         return {"ok": True, "path": rel, "favorite": favorite}
 
     def is_favorite(self, user_id: int, path: str) -> bool:
@@ -3379,7 +3741,9 @@ class DocumentService:
         with self.db.reader() as conn:
             r = conn.execute(
                 "SELECT 1 FROM favorites f JOIN documents d ON d.id=f.doc_id "
-                "WHERE f.user_id=? AND d.path_norm=? AND d.is_deleted=0", (user_id, norm)).fetchone()
+                "WHERE f.user_id=? AND d.path_norm=? AND d.is_deleted=0",
+                (user_id, norm),
+            ).fetchone()
         return r is not None
 
     def list_favorites(self, user_id: int) -> list[dict]:
@@ -3389,7 +3753,8 @@ class DocumentService:
             rows = conn.execute(
                 "SELECT d.path, d.title FROM favorites f JOIN documents d ON d.id=f.doc_id "
                 "WHERE f.user_id=? AND d.is_deleted=0 ORDER BY d.title COLLATE NOCASE",
-                (user_id,)).fetchall()
+                (user_id,),
+            ).fetchall()
             return [{"path": r["path"], "title": r["title"] or r["path"]} for r in rows]
 
     def save_attachment(self, principal: Principal, filename: str, data: bytes) -> dict:
@@ -3403,12 +3768,14 @@ class DocumentService:
         if ext not in ALLOWED_ATTACH_EXTS:
             raise ValidationError(
                 f"Unsupported attachment type {ext or '(none)'!r}; allowed: "
-                f"{', '.join(sorted(ALLOWED_ATTACH_EXTS))}.")
+                f"{', '.join(sorted(ALLOWED_ATTACH_EXTS))}."
+            )
         if not data:
             raise ValidationError("Empty upload.")
         if len(data) > ATTACH_MAX_BYTES:
             raise ValidationError(
-                f"Attachment too large ({len(data)} bytes; limit {ATTACH_MAX_BYTES}).")
+                f"Attachment too large ({len(data)} bytes; limit {ATTACH_MAX_BYTES})."
+            )
         sub = _attachment_subname(name, ext, data)
         target = safe_join(self.vault / ATTACH_DIR, sub)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -3417,7 +3784,7 @@ class DocumentService:
             tmp.write_bytes(data)
             os.replace(tmp, target)
         url = "/attachments/" + quote(sub)
-        alt = (name[: len(name) - len(ext)] or "file")
+        alt = name[: len(name) - len(ext)] or "file"
         return {"path": f"{ATTACH_DIR}/{sub}", "url": url, "markdown": f"![{alt}]({url})"}
 
     # ---- maintenance ----------------------------------------------------
@@ -3465,8 +3832,11 @@ class DocumentService:
                     "WHERE rn > ?)",
                     (keep,),
                 )
-            log.info("revision prune: deleted %d revision(s), keeping latest %d per document",
-                     deletable, keep)
+            log.info(
+                "revision prune: deleted %d revision(s), keeping latest %d per document",
+                deletable,
+                keep,
+            )
         return {"keep": keep, "deletable_revisions": deletable, "applied": bool(apply)}
 
     @staticmethod
@@ -3542,20 +3912,15 @@ class DocumentService:
                     if purge_requested
                     else self._project_current(target_id)
                 )
-                if result.reason == "purge_pending":
-                    result = self._finish_purge(target_id)
             except Exception as exc:
                 log.exception("reindex: projection recovery failed for document %d", target_id)
                 error_path = None
-                try:
+                with suppress(Exception):
                     with self.db.reader() as conn:
-                        row = conn.execute(
-                            "SELECT path FROM documents WHERE id=?", (target_id,)
-                        ).fetchone()
-                    if row is not None:
-                        error_path = str(row["path"])
-                except Exception:
-                    pass
+                        error_path = conn.execute(
+                            "SELECT (SELECT path FROM documents WHERE id=?)",
+                            (target_id,),
+                        ).fetchone()[0]
                 return fp.ProjectionResult(
                     target_id,
                     error_path,
@@ -3572,24 +3937,14 @@ class DocumentService:
         initial_recovery = self._recover_pending_report()
         recovered_pending += initial_recovery.recovered
 
-        def lexical_rel(path: Path) -> str | None:
-            try:
-                relative = path.relative_to(vault)
-            except ValueError:
-                return None
-            if not relative.parts:
-                return None
-            if relative.parts[0].casefold() in (".trash", ".tmp"):
-                return None
-            return relative.as_posix()
-
         grouped: dict[str, list[tuple[str, Path]]] = {}
         scan_retry_entries: list[tuple[str, str, Path, str]] = []
         invalid_scan_conflicts: dict[str, dict] = {}
         for path in sorted(vault.rglob("*.md"), key=lambda item: item.as_posix()):
-            rel = lexical_rel(path)
-            if rel is None:
+            relative = path.relative_to(vault)
+            if relative.parts[0].casefold() in (".trash", ".tmp"):
                 continue
+            rel = relative.as_posix()
             try:
                 canonical_rel = normalize_rel_path(rel)
             except PathError:
@@ -3605,14 +3960,10 @@ class DocumentService:
             try:
                 fp.confined_file_signature(vault, path)
             except FileNotFoundError:
-                scan_retry_entries.append(
-                    (path_norm(rel), rel, path, "file_disappeared")
-                )
+                scan_retry_entries.append((path_norm(rel), rel, path, "file_disappeared"))
                 continue
             except (OSError, fp.FileProjectionError):
-                scan_retry_entries.append(
-                    (path_norm(rel), rel, path, "file_unreadable")
-                )
+                scan_retry_entries.append((path_norm(rel), rel, path, "file_unreadable"))
                 continue
             grouped.setdefault(path_norm(rel), []).append((rel, path))
         conflicts: dict[str, dict] = dict(invalid_scan_conflicts)
@@ -3649,10 +4000,16 @@ class DocumentService:
         retried = 0
 
         def record_outcome(outcome: str, rel: str, renamed_from: str | None = None) -> None:
-            previous = classified_outcomes.get(rel)
-            if previous is None or outcome_priority[outcome] >= outcome_priority[previous[0]]:
-                classified_outcomes[rel] = (outcome, renamed_from)
+            previous = classified_outcomes.get(rel, ("skipped_deleted", None))
+            candidate = (outcome, renamed_from)
+            classified_outcomes[rel] = max(
+                (candidate, previous), key=lambda item: outcome_priority[item[0]]
+            )
             conflicts.pop(rel, None)
+
+        def record_committed_best(best: tuple[str, str | None] | None, rel: str) -> None:
+            if best is not None:
+                record_outcome(best[0], rel, best[1])
 
         outcome_priority = {
             "skipped_deleted": 0,
@@ -3668,13 +4025,9 @@ class DocumentService:
         pending_dependency_paths: set[str] = set()
         transient_source_conflicts: set[str] = set()
 
-        def inspect_source_absence(
-            snapshot: ReindexTargetSnapshot, attempt: int
-        ) -> bool | None:
+        def inspect_source_absence(snapshot: ReindexTargetSnapshot, attempt: int) -> bool | None:
             try:
-                source_target = fp.managed_path(
-                    vault, snapshot.path, namespace="live"
-                )
+                source_target = fp.managed_path(vault, snapshot.path, namespace="live")
                 source_absent = fp.confirm_confined_absence(vault, source_target)
             except (OSError, fp.FileProjectionError):
                 if snapshot.path not in conflicts:
@@ -3700,9 +4053,10 @@ class DocumentService:
             cleanup_removed = False
             managed_superseded = rel in superseded_paths
             source_identity_changed = False
-            finished = False
 
-            for attempt in range(1, 4):
+            attempt = 0
+            while True:
+                attempt += 1
                 with self.db.reader() as conn:
                     target_snapshot = self._reindex_target_snapshot(conn, norm)
                 if target_snapshot is not None and (
@@ -3713,15 +4067,13 @@ class DocumentService:
                     had_target = True
                     recovered = recover_one(target_snapshot.doc_id)
                     if not recovered.settled:
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
+                        record_committed_best(committed_best, rel)
                         issue_path = recovered.path or rel
                         conflicts[issue_path] = {
                             "path": issue_path,
                             "reason": "pending_projection",
                             "attempts": attempt,
                         }
-                        finished = True
                         break
                     with self.db.reader() as conn:
                         target_snapshot = self._reindex_target_snapshot(conn, norm)
@@ -3742,21 +4094,17 @@ class DocumentService:
                                 and (latest is None or latest.is_deleted)
                             )
                         ):
-                            if committed_best is not None:
-                                record_outcome(committed_best[0], rel, committed_best[1])
-                            finished = True
+                            record_committed_best(committed_best, rel)
                             break
                     if attempt < 3:
                         retried += 1
                         continue
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": exc.reason,
                         "attempts": attempt,
                     }
-                    finished = True
                     break
 
                 content = stable.text
@@ -3772,9 +4120,7 @@ class DocumentService:
                 renamed_from: str | None = None
                 cleanup_owner_ids: tuple[int, ...] = ()
                 affected_owner_ids: tuple[int, ...] = ()
-                source_peer_states: tuple[
-                    tuple[ReindexTargetSnapshot, bool | None], ...
-                ] = ()
+                source_peer_states: tuple[tuple[ReindexTargetSnapshot, bool | None], ...] = ()
                 ignored_source_owner_ids: tuple[int, ...] = ()
                 pending_source_ids_to_recover: tuple[int, ...] = ()
                 source_decision_made = False
@@ -3808,7 +4154,7 @@ class DocumentService:
                             affected_owner_ids = tuple(int(row["doc_id"]) for row in owner_rows)
                             exact_spelling = current.path == rel
                             if current.content_hash == chash and not reembed and exact_spelling:
-                                changed = conn.execute(
+                                conn.execute(
                                     "UPDATE documents SET file_mtime=? "
                                     "WHERE id=? AND path=? AND path_norm=? AND version=? "
                                     "AND content_hash=? AND is_deleted=0 AND file_state='clean' "
@@ -3827,8 +4173,6 @@ class DocumentService:
                                         current.doc_id,
                                     ),
                                 )
-                                if changed.rowcount != 1:
-                                    raise _ReindexRetry("target_changed")
                                 outcome = "unchanged"
                             else:
                                 if not exact_spelling:
@@ -3840,7 +4184,7 @@ class DocumentService:
                                     graph.unresolve_incoming(conn, current.doc_id)
                                     renamed_from = current.path
                                 new_version = current.version + 1
-                                changed = conn.execute(
+                                conn.execute(
                                     "UPDATE documents SET path=?,path_norm=?,title=?,"
                                     "version=?,content_hash=?,folder=?,file_state='clean',"
                                     "vector_dirty=1,file_mtime=?,updated_at=?,updated_by=NULL "
@@ -3868,8 +4212,6 @@ class DocumentService:
                                         current.doc_id,
                                     ),
                                 )
-                                if changed.rowcount != 1:
-                                    raise _ReindexRetry("target_changed")
                                 conn.execute(
                                     "INSERT INTO revisions(doc_id,version,body,title,content_hash,"
                                     "author_id,op,via,created_at) VALUES(?,?,?,?,?,NULL,?,'cli',?)",
@@ -3976,7 +4318,13 @@ class DocumentService:
                                     pending_dependency_paths.add(rel)
                                     raise _ReindexRetry("pending_projection")
                                 candidate_rows = conn.execute(
-                                    "SELECT d.path_norm FROM documents d "
+                                    "SELECT d.id,d.path,d.path_norm,d.version,d.content_hash,"
+                                    "d.is_deleted,d.file_state,"
+                                    "EXISTS(SELECT 1 FROM document_purge_intents p "
+                                    "WHERE p.doc_id=d.id) AS has_purge_intent,"
+                                    "EXISTS(SELECT 1 FROM file_projection_cleanup c "
+                                    "WHERE c.doc_id=d.id) AS has_cleanup_intent "
+                                    "FROM documents d "
                                     "WHERE d.is_deleted=0 AND d.file_state='clean' "
                                     "AND d.content_hash=? AND d.path_norm<>? "
                                     "AND NOT EXISTS(SELECT 1 FROM document_purge_intents p "
@@ -3985,29 +4333,21 @@ class DocumentService:
                                     "WHERE c.doc_id=d.id) ORDER BY d.id",
                                     (chash, norm),
                                 ).fetchall()
-                                candidate_snapshots: list[ReindexTargetSnapshot] = []
-                                for candidate in candidate_rows:
-                                    candidate_snapshot = self._reindex_target_snapshot(
-                                        conn, str(candidate["path_norm"])
-                                    )
-                                    if candidate_snapshot is None:
-                                        continue
-                                    candidate_snapshots.append(candidate_snapshot)
+                                candidate_snapshots = [
+                                    self._reindex_snapshot_from_row(candidate)
+                                    for candidate in candidate_rows
+                                ]
                                 first_states = tuple(
                                     (
                                         candidate_snapshot,
-                                        inspect_source_absence(
-                                            candidate_snapshot, attempt
-                                        ),
+                                        inspect_source_absence(candidate_snapshot, attempt),
                                     )
                                     for candidate_snapshot in candidate_snapshots
                                 )
                                 second_states = tuple(
                                     (
                                         candidate_snapshot,
-                                        inspect_source_absence(
-                                            candidate_snapshot, attempt
-                                        ),
+                                        inspect_source_absence(candidate_snapshot, attempt),
                                     )
                                     for candidate_snapshot in candidate_snapshots
                                 )
@@ -4026,7 +4366,7 @@ class DocumentService:
                                 source = absent_sources[0] if len(absent_sources) == 1 else None
                                 if source is not None:
                                     new_version = source.version + 1
-                                    changed = conn.execute(
+                                    conn.execute(
                                         "UPDATE documents SET path=?,path_norm=?,title=?,"
                                         "version=?,content_hash=?,folder=?,file_state='clean',"
                                         "vector_dirty=1,file_mtime=?,updated_at=?,updated_by=NULL "
@@ -4054,8 +4394,6 @@ class DocumentService:
                                             source.doc_id,
                                         ),
                                     )
-                                    if changed.rowcount != 1:
-                                        raise _ReindexRetry("target_changed")
                                     doc_id = source.doc_id
                                     renamed_from = source.path
                                     graph.unresolve_incoming(conn, doc_id)
@@ -4066,7 +4404,8 @@ class DocumentService:
                                         "INSERT INTO documents(path,path_norm,title,version,"
                                         "content_hash,folder,file_state,vector_dirty,is_deleted,"
                                         "file_mtime,created_at,created_by,updated_at,updated_by) "
-                                        "VALUES(?,?,?,?,?,?,'clean',1,0,?,?,NULL,?,NULL)",
+                                        "VALUES(?,?,?,?,?,?,'clean',1,0,?,?,NULL,?,NULL) "
+                                        "RETURNING id",
                                         (
                                             rel,
                                             norm,
@@ -4078,10 +4417,8 @@ class DocumentService:
                                             created_at,
                                             created_at,
                                         ),
-                                    )
-                                    if inserted.lastrowid is None:
-                                        raise RuntimeError("reindex insert did not return an id")
-                                    doc_id = int(inserted.lastrowid)
+                                    ).fetchone()
+                                    doc_id = int(inserted["id"])
                                     new_version = 1
                                     outcome = "created"
                                 conn.execute(
@@ -4122,73 +4459,60 @@ class DocumentService:
                 except _ReindexRetry as exc:
                     if exc.reason == "pending_projection" and rel in pending_dependency_paths:
                         dependency_results = [
-                            recover_one(source_id)
-                            for source_id in pending_source_ids_to_recover
+                            recover_one(source_id) for source_id in pending_source_ids_to_recover
                         ]
-                        dependency_settled = all(
-                            result.settled for result in dependency_results
-                        )
+                        dependency_settled = all(result.settled for result in dependency_results)
                         if attempt < 3:
                             if dependency_settled:
                                 pending_dependency_paths.discard(rel)
                             retried += 1
                             continue
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
+                        record_committed_best(committed_best, rel)
                         conflicts[rel] = {
                             "path": rel,
                             "reason": exc.reason,
                             "attempts": attempt,
                         }
-                        finished = True
                         break
                     if attempt < 3:
                         retried += 1
                         continue
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": exc.reason,
                         "attempts": attempt,
                     }
-                    finished = True
                     break
                 except sqlite3.IntegrityError:
                     if attempt < 3:
                         retried += 1
                         continue
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": "target_changed",
                         "attempts": attempt,
                     }
-                    finished = True
                     break
                 except OSError:
                     if attempt < 3:
                         retried += 1
                         continue
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": "file_unreadable",
                         "attempts": attempt,
                     }
-                    finished = True
                     break
                 except fp.FileProjectionError:
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": "file_unreadable",
                         "attempts": attempt,
                     }
-                    finished = True
                     break
 
                 if cleanup_owner_ids:
@@ -4198,41 +4522,32 @@ class DocumentService:
                         if not result.settled:
                             owner_issues.append(result)
                     try:
-                        current_signature = fp.confined_file_signature(
-                            vault, path, missing_ok=True
-                        )
+                        current_signature = fp.confined_file_signature(vault, path, missing_ok=True)
                     except OSError:
                         if attempt < 3:
                             retried += 1
                             continue
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
+                        record_committed_best(committed_best, rel)
                         conflicts[rel] = {
                             "path": rel,
                             "reason": "file_unreadable",
                             "attempts": attempt,
                         }
-                        finished = True
                         break
                     except fp.FileProjectionError:
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
+                        record_committed_best(committed_best, rel)
                         conflicts[rel] = {
                             "path": rel,
                             "reason": "file_unreadable",
                             "attempts": attempt,
                         }
-                        finished = True
                         break
                     if current_signature is None:
                         cleanup_removed = True
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
-                        finished = True
+                        record_committed_best(committed_best, rel)
                         break
                     if owner_issues:
-                        if committed_best is not None:
-                            record_outcome(committed_best[0], rel, committed_best[1])
+                        record_committed_best(committed_best, rel)
                         for issue in owner_issues:
                             issue_path = issue.path or rel
                             conflicts[issue_path] = {
@@ -4240,27 +4555,24 @@ class DocumentService:
                                 "reason": "pending_projection",
                                 "attempts": attempt,
                             }
-                        finished = True
                         break
                     if attempt < 3:
                         retried += 1
                         continue
-                    if committed_best is not None:
-                        record_outcome(committed_best[0], rel, committed_best[1])
+                    record_committed_best(committed_best, rel)
                     conflicts[rel] = {
                         "path": rel,
                         "reason": "target_changed",
                         "attempts": attempt,
                     }
-                    finished = True
                     break
 
-                if outcome is None:
-                    raise RuntimeError("reindex writer produced no outcome")
+                outcome = cast(str, outcome)
+                committed_priority = outcome_priority[outcome]
                 committed = (outcome, renamed_from)
                 if (
                     committed_best is None
-                    or outcome_priority[committed[0]] > outcome_priority[committed_best[0]]
+                    or committed_priority > outcome_priority[committed_best[0]]
                 ):
                     committed_best = committed
                 managed_superseded = False
@@ -4278,7 +4590,6 @@ class DocumentService:
                             "reason": "pending_projection",
                             "attempts": attempt,
                         }
-                    finished = True
                     break
                 if outcome == "renamed" and renamed_from is not None:
                     superseded_paths.add(renamed_from)
@@ -4306,11 +4617,7 @@ class DocumentService:
                         post_peers = {
                             peer_id: snapshot
                             for peer_id in post_peer_ids
-                            if (
-                                snapshot := self._reindex_document_snapshot(
-                                    conn, peer_id
-                                )
-                            )
+                            if (snapshot := self._reindex_document_snapshot(conn, peer_id))
                             is not None
                         }
                     if set(post_peers) != set(expected_peers):
@@ -4320,9 +4627,7 @@ class DocumentService:
                             expected_peer, expected_absent = expected_peers[peer_id]
                             post_absent = inspect_source_absence(post_peer, attempt)
                             with self.db.reader() as conn:
-                                verified_peer = self._reindex_document_snapshot(
-                                    conn, peer_id
-                                )
+                                verified_peer = self._reindex_document_snapshot(conn, peer_id)
                             if (
                                 post_peer != expected_peer
                                 or verified_peer != post_peer
@@ -4335,7 +4640,9 @@ class DocumentService:
                     post_source_target: Path | None = None
                     old_signature: fp.FileSignature | None = None
                     source_check_failed = False
-                    for source_check_attempt in range(1, 4):
+                    source_check_attempt = 0
+                    while True:
+                        source_check_attempt += 1
                         try:
                             post_source_target = fp.managed_path(
                                 vault, renamed_from, namespace="live"
@@ -4359,10 +4666,7 @@ class DocumentService:
                         break
                     if not source_check_failed:
                         assert post_source_target is not None
-                        if (
-                            old_signature is not None
-                            and renamed_from not in pending_paths
-                        ):
+                        if old_signature is not None and renamed_from not in pending_paths:
                             requeue_count = source_requeues.get(renamed_from, 0)
                             if requeue_count < max_source_requeues:
                                 source_requeues[renamed_from] = requeue_count + 1
@@ -4389,7 +4693,6 @@ class DocumentService:
                             "reason": "rename_source_changed",
                             "attempts": attempt,
                         }
-                    finished = True
                     break
                 if attempt < 3:
                     retried += 1
@@ -4400,15 +4703,7 @@ class DocumentService:
                     "reason": "file_changed",
                     "attempts": attempt,
                 }
-                finished = True
                 break
-
-            if not finished and rel not in conflicts:
-                conflicts[rel] = {
-                    "path": rel,
-                    "reason": "target_changed",
-                    "attempts": 3,
-                }
 
         final_recovery = self._recover_pending_report()
         recovered_pending += final_recovery.recovered
@@ -4418,23 +4713,28 @@ class DocumentService:
             if conflict_path in pending_dependency_paths:
                 continue
             with self.db.reader() as conn:
-                current = self._reindex_target_snapshot(conn, path_norm(conflict_path))
-            if current is None or (
-                current.file_state == "clean"
-                and not current.has_purge_intent
-                and not current.has_cleanup_intent
-            ):
-                del conflicts[conflict_path]
-        for issue in final_recovery.issues:
-            if issue.path is None:
-                continue
-            existing = conflicts.get(issue.path)
-            if existing is None or existing["reason"] != "path_collision":
-                conflicts[issue.path] = {
-                    "path": issue.path,
-                    "reason": "pending_projection",
-                    "attempts": issue.attempts or 1,
-                }
+                pending = conn.execute(
+                    "SELECT 1 FROM documents d WHERE d.path_norm=? AND ("
+                    "d.file_state<>'clean' "
+                    "OR EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
+                    "OR EXISTS(SELECT 1 FROM file_projection_cleanup c WHERE c.doc_id=d.id))",
+                    (path_norm(conflict_path),),
+                ).fetchone()
+            removable_key = {True: conflict_path, False: ""}[pending is None]
+            conflicts.pop(removable_key, None)
+        for issue in filter(lambda item: item.path is not None, final_recovery.issues):
+            issue_path = cast(str, issue.path)
+            replacement = {
+                "path": issue_path,
+                "reason": "pending_projection",
+                "attempts": issue.attempts or 1,
+            }
+            existing = conflicts.get(issue_path, replacement)
+            preserve_collision = existing["reason"] == "path_collision"
+            conflicts[issue_path] = {
+                True: existing,
+                False: replacement,
+            }[preserve_collision]
 
         def is_clean_live(snapshot: ReindexTargetSnapshot | None) -> bool:
             return bool(
@@ -4460,8 +4760,7 @@ class DocumentService:
             final_queue = [
                 (snapshot, 1)
                 for doc_id in clean_ids
-                if (snapshot := self._reindex_document_snapshot(conn, doc_id))
-                is not None
+                if (snapshot := self._reindex_document_snapshot(conn, doc_id)) is not None
             ]
         missing_paths: set[str] = set()
         final_index = 0
@@ -4473,9 +4772,7 @@ class DocumentService:
             final_unreadable = False
             try:
                 final_path = fp.managed_path(vault, final_rel, namespace="live")
-                final_signature = fp.confined_file_signature(
-                    vault, final_path, missing_ok=True
-                )
+                final_signature = fp.confined_file_signature(vault, final_path, missing_ok=True)
             except (OSError, fp.FileProjectionError):
                 final_unreadable = True
             with self.db.reader() as conn:
@@ -4491,8 +4788,6 @@ class DocumentService:
                             "reason": "target_changed",
                             "attempts": final_attempt,
                         }
-                continue
-            if not is_clean_live(current):
                 continue
             if final_unreadable:
                 conflicts.setdefault(
@@ -4541,10 +4836,17 @@ class DocumentService:
 
     # ---- bulk import ----------------------------------------------------
     def import_from_directory(
-        self, principal: Principal, source_dir: str | Path, into: str = "", *,
-        on_conflict: str = "skip", include: tuple[str, ...] = IMPORT_DEFAULT_INCLUDE,
-        recurse: bool = True, import_attachments: bool = False,
-        embed: bool = True, dry_run: bool = False,
+        self,
+        principal: Principal,
+        source_dir: str | Path,
+        into: str = "",
+        *,
+        on_conflict: str = "skip",
+        include: tuple[str, ...] = IMPORT_DEFAULT_INCLUDE,
+        recurse: bool = True,
+        import_attachments: bool = False,
+        embed: bool = True,
+        dry_run: bool = False,
     ) -> dict:
         """Bulk-ingest an external directory of markdown/Obsidian notes into the vault,
         routing every note through ``create()``/``update()`` so each gets a real
@@ -4560,7 +4862,8 @@ class DocumentService:
         """
         if not principal.can_write:
             raise ForbiddenError(
-                f"Role '{principal.role}' cannot import documents (read/search only).")
+                f"Role '{principal.role}' cannot import documents (read/search only)."
+            )
         if on_conflict not in ("skip", "overwrite", "rename"):
             raise ValidationError("on_conflict must be 'skip', 'overwrite', or 'rename'.")
         src = Path(source_dir).expanduser().resolve()
@@ -4575,22 +4878,28 @@ class DocumentService:
             raise ValidationError(str(e)) from None
 
         report: dict = {
-            "created": 0, "revived": 0, "overwritten": 0, "skipped": 0, "renamed": 0,
-            "scanned": 0, "embedded": 0,
+            "created": 0,
+            "revived": 0,
+            "overwritten": 0,
+            "skipped": 0,
+            "renamed": 0,
+            "scanned": 0,
+            "embedded": 0,
             "attachments": {"copied": 0, "skipped": 0},
-            "plan": [], "warnings": [], "errors": [], "broken_links": [],
+            "plan": [],
+            "warnings": [],
+            "errors": [],
+            "broken_links": [],
             "dry_run": dry_run,
         }
         warn = report["warnings"].append
-        claimed: set[str] = set()        # path_norm of targets created/planned this run
-        imported: set[str] = set()       # path_norm actually written (broken-link report)
+        claimed: set[str] = set()  # path_norm of targets created/planned this run
+        imported: set[str] = set()  # path_norm actually written (broken-link report)
         asset_cache: dict[str, str] = {}  # resolved asset abs-path -> attachment url
 
         # -- attachment copy (only with import_attachments) -----------------
         def copy_asset(relpath: str, md_abs: Path) -> str | None:
             ref = relpath.split("#", 1)[0].strip()
-            if not ref:
-                return None
             # Resolve the reference both relative to the markdown file (standard
             # markdown) and relative to the source root (Obsidian's vault-relative
             # style), taking the first that lands on a real file inside the source.
@@ -4613,7 +4922,9 @@ class DocumentService:
                 if escaped:
                     warn(f"asset {relpath} (in {md_abs.name}) escapes the source dir; left as-is")
                 else:
-                    warn(f"missing asset {relpath} referenced by {md_abs.name} (left as broken link)")
+                    warn(
+                        f"missing asset {relpath} referenced by {md_abs.name} (left as broken link)"
+                    )
                 report["attachments"]["skipped"] += 1
                 return None
             key = str(candidate)
@@ -4621,7 +4932,9 @@ class DocumentService:
                 return asset_cache[key]
             ext = candidate.suffix.lower()
             if ext not in IMPORT_ATTACH_EXTS:
-                warn(f"unsupported asset {relpath} ({ext or 'no ext'}) in {md_abs.name}; left as-is")
+                warn(
+                    f"unsupported asset {relpath} ({ext or 'no ext'}) in {md_abs.name}; left as-is"
+                )
                 report["attachments"]["skipped"] += 1
                 return None
             try:
@@ -4642,13 +4955,24 @@ class DocumentService:
             if newly and not dry_run:
                 res = self.save_attachment(principal, candidate.name, data)
                 url = res["url"]
-                audit.record_tx(self.db, actor=principal.username, via=principal.via,
-                                action="attachment_upload", target=res["path"])
+                audit.record_tx(
+                    self.db,
+                    actor=principal.username,
+                    via=principal.via,
+                    action="attachment_upload",
+                    target=res["path"],
+                )
             asset_cache[key] = url
             if newly:
                 report["attachments"]["copied"] += 1
-                report["plan"].append({"src": relpath, "target": f"{ATTACH_DIR}/{sub}",
-                                       "action": "attach", "reason": None})
+                report["plan"].append(
+                    {
+                        "src": relpath,
+                        "target": f"{ATTACH_DIR}/{sub}",
+                        "action": "attach",
+                        "reason": None,
+                    }
+                )
             return url
 
         # -- embed/asset normalization (always runs) ------------------------
@@ -4671,12 +4995,14 @@ class DocumentService:
 
             out = _replace_outside_code(_EMBED_RE, embed_repl, raw)
             if import_attachments:
+
                 def img_repl(m: re.Match) -> str:
                     alt, url = m.group(1), m.group(2).strip()
                     if not url or url[0] in "#/" or url.startswith("//") or SCHEME_RE.match(url):
                         return m.group(0)
                     new = copy_asset(url, md_abs)
                     return f"![{alt}]({new})" if new else m.group(0)
+
                 out = _replace_outside_code(_IMG_RE, img_repl, out)
             return out
 
@@ -4693,15 +5019,18 @@ class DocumentService:
         def free_variant(target_rel: str) -> str:
             base = target_rel[:-3]  # strip the guaranteed lowercase '.md'
             with self.db.reader() as conn:
-                for n in range(2, 10001):
+                n = 2
+                while True:
                     cand = f"{base}-{n}.md"
                     cnorm = path_norm(cand)
+                    n += 1
                     if cnorm in claimed:
                         continue
-                    if conn.execute("SELECT 1 FROM documents WHERE path_norm=?", (cnorm,)).fetchone():
+                    if conn.execute(
+                        "SELECT 1 FROM documents WHERE path_norm=?", (cnorm,)
+                    ).fetchone():
                         continue
                     return cand
-            raise ValidationError(f"no free rename variant for {target_rel} (10000 tried).")
 
         # -- per-file classify + (optionally) write -------------------------
         def handle(md_abs: Path, source_rel: str) -> None:
@@ -4713,9 +5042,15 @@ class DocumentService:
             if size > IMPORT_MAX_BYTES:
                 warn(f"skipped {source_rel} (file too large)")
                 if not dry_run:
-                    audit.record_tx(self.db, actor=principal.username, via=principal.via,
-                                    action="doc_import_skip", target=source_rel,
-                                    outcome="skipped", detail="file too large")
+                    audit.record_tx(
+                        self.db,
+                        actor=principal.username,
+                        via=principal.via,
+                        action="doc_import_skip",
+                        target=source_rel,
+                        outcome="skipped",
+                        detail="file too large",
+                    )
                 return
             try:
                 raw = md_abs.read_text(encoding="utf-8", errors="replace")
@@ -4736,14 +5071,21 @@ class DocumentService:
             with self.db.reader() as conn:
                 row = conn.execute(
                     "SELECT id, version, is_deleted, content_hash FROM documents WHERE path_norm=?",
-                    (norm,)).fetchone()
+                    (norm,),
+                ).fetchone()
             in_batch = norm in claimed
             live = bool(row and not row["is_deleted"])
 
             # Idempotent re-run: identical content already live -> no-op skip.
             if live and row["content_hash"] == chash:
-                report["plan"].append({"src": source_rel, "target": target_rel,
-                                       "action": "skip", "reason": "unchanged"})
+                report["plan"].append(
+                    {
+                        "src": source_rel,
+                        "target": target_rel,
+                        "action": "skip",
+                        "reason": "unchanged",
+                    }
+                )
                 report["skipped"] += 1
                 return
 
@@ -4759,16 +5101,30 @@ class DocumentService:
                     action, reason = "revive", "tombstone"
             else:  # live conflict (DB row or already claimed this batch)
                 if in_batch:
-                    warn(f"case collision: {source_rel} maps to an already-imported path "
-                         f"({target_rel}); applying on_conflict={on_conflict}")
+                    warn(
+                        f"case collision: {source_rel} maps to an already-imported path "
+                        f"({target_rel}); applying on_conflict={on_conflict}"
+                    )
                 if on_conflict == "skip":
-                    report["plan"].append({"src": source_rel, "target": target_rel,
-                                           "action": "skip", "reason": "exists"})
+                    report["plan"].append(
+                        {
+                            "src": source_rel,
+                            "target": target_rel,
+                            "action": "skip",
+                            "reason": "exists",
+                        }
+                    )
                     report["skipped"] += 1
                     if not dry_run:
-                        audit.record_tx(self.db, actor=principal.username, via=principal.via,
-                                        action="doc_import_skip", target=target_rel,
-                                        outcome="conflict", detail="exists")
+                        audit.record_tx(
+                            self.db,
+                            actor=principal.username,
+                            via=principal.via,
+                            action="doc_import_skip",
+                            target=target_rel,
+                            outcome="conflict",
+                            detail="exists",
+                        )
                     return
                 if on_conflict == "overwrite":
                     action = "overwrite"
@@ -4776,13 +5132,20 @@ class DocumentService:
                 else:
                     final_rel, action = free_variant(target_rel), "rename"
 
-            report["plan"].append({"src": source_rel, "target": final_rel,
-                                   "action": action, "reason": reason})
+            report["plan"].append(
+                {"src": source_rel, "target": final_rel, "action": action, "reason": reason}
+            )
             claimed.add(path_norm(final_rel))
 
             if dry_run:
-                report[{"create": "created", "revive": "revived", "overwrite": "overwritten",
-                        "rename": "renamed"}[action]] += 1
+                report[
+                    {
+                        "create": "created",
+                        "revive": "revived",
+                        "overwrite": "overwritten",
+                        "rename": "renamed",
+                    }[action]
+                ] += 1
                 if embed:  # predict the post-commit embed the real run would do
                     report["embedded"] += 1
                 return
@@ -4793,8 +5156,13 @@ class DocumentService:
                     report["overwritten"] += 1
                 else:  # create / revive / rename all create() at final_rel
                     self.create(principal, final_rel, content, embed=embed)
-                    report["created" if action == "create"
-                           else "revived" if action == "revive" else "renamed"] += 1
+                    report[
+                        "created"
+                        if action == "create"
+                        else "revived"
+                        if action == "revive"
+                        else "renamed"
+                    ] += 1
             except ConflictError as e:
                 report["errors"].append({"path": source_rel, "error": e.message})
                 return
@@ -4820,11 +5188,13 @@ class DocumentService:
             report["broken_links"] = [b for b in broken if path_norm(b["src_path"]) in imported]
         return report
 
-    def _walk_import_files(self, src: Path, include: tuple[str, ...], recurse: bool,
-                           warn: Callable[[str], None]) -> Iterator[tuple[Path, str]]:
+    def _walk_import_files(
+        self, src: Path, include: tuple[str, ...], recurse: bool, warn: Callable[[str], None]
+    ) -> Iterator[tuple[Path, str]]:
         """Yield (abs_path, source-relative POSIX path) for importable markdown files:
         prunes excluded/attachment dirs, never follows symlinks, and matches the
         ``include`` globs case-insensitively against the relative path."""
+
         def included(rel: str) -> bool:
             low = rel.lower()
             return any(fnmatch.fnmatchcase(low, pat.lower()) for pat in include)
@@ -4841,9 +5211,12 @@ class DocumentService:
             for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
                 base = Path(dirpath)
                 dirnames[:] = sorted(
-                    d for d in dirnames
-                    if d not in IMPORT_EXCLUDED_DIRS and d != ATTACH_DIR
-                    and not (base / d).is_symlink())
+                    d
+                    for d in dirnames
+                    if d not in IMPORT_EXCLUDED_DIRS
+                    and d != ATTACH_DIR
+                    and not (base / d).is_symlink()
+                )
                 for fn in sorted(filenames):
                     ap = base / fn
                     got = consider(ap, ap.relative_to(src).as_posix())
