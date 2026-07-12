@@ -481,8 +481,6 @@ class DocumentService:
             if row["has_cleanup_intent"]:
                 return "cleanup_pending"
             return "settled"
-        if row["file_state"] != "pending":
-            return "changed"
         if row["has_cleanup_intent"]:
             return "current_cleanup" if allow_cleanup else "cleanup_pending"
         return "current"
@@ -547,8 +545,6 @@ class DocumentService:
             row["expected_mtime_ns"],
             row["expected_ctime_ns"],
         )
-        if any(value is None for value in values):
-            raise RuntimeError("cleanup intent has an incomplete file signature")
         return fp.FileSignature(*(int(value) for value in values))
 
     def _process_cleanup_batch(
