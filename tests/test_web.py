@@ -506,7 +506,11 @@ def test_stale_edit_renders_semantic_merge_preview_without_saving(client, ctx, p
     assert '<input type="hidden" name="base_version" value="2">' in response.text
     assert '<fieldset class="merge-conflict"' in response.text
     assert "<legend>2번째 줄 충돌</legend>" in response.text
-    assert 'name="conflict-0"' in response.text
+    assert 'data-conflict-index="0"' in response.text
+    assert 'data-resolution="mine"' in response.text
+    assert 'data-resolution="current"' in response.text
+    assert 'data-resolution="manual"' in response.text
+    assert 'value="base"' not in response.text
     assert "기준 버전" in response.text and "내 편집" in response.text and "서버 현재" in response.text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
     assert "&lt;strong&gt;server&lt;/strong&gt;" in response.text

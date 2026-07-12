@@ -26,6 +26,12 @@ def test_app_uses_requested_root_and_seeds_documents(tmp_path):
         assert (tmp_path / "vault" / "start.md").read_text(encoding="utf-8") == (
             "# 시작 안내\n\n키보드 탐색 기준 문서"
         )
+        assert (tmp_path / "vault" / "merge-disjoint.md").read_bytes() == (
+            b"one\r\ntwo\r\nthree\r\n"
+        )
+        assert (tmp_path / "vault" / "merge-repeat.md").read_bytes() == (
+            b"top\r\nshared\r\nbottom\r\n"
+        )
         assert "/login" in {route.path for route in app.routes}
     finally:
         app.state.e2e_db.close()

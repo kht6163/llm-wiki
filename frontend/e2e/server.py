@@ -91,6 +91,16 @@ def build_test_app(root: Path, *, gui_port: int, mcp_port: int) -> FastAPI:
     admin = Principal(user_id, "admin", "admin")
     docs.create(admin, "start.md", "# 시작 안내\n\n키보드 탐색 기준 문서")
     docs.create(admin, "conflict.md", "# 충돌 문서\n\n최초 본문")
+    # Browser form encoding canonicalizes textarea line endings to CRLF. Seed the
+    # merge fixtures the same way so these flows test hunk semantics, not an
+    # artificial whole-document LF/CRLF mismatch from direct service setup.
+    docs.create(admin, "merge-disjoint.md", "one\r\ntwo\r\nthree\r\n")
+    docs.create(
+        admin,
+        "merge-overlap.md",
+        "top\r\nalpha\r\nkeep-a\r\nbeta\r\nkeep-b\r\ngamma\r\nbottom\r\n",
+    )
+    docs.create(admin, "merge-repeat.md", "top\r\nshared\r\nbottom\r\n")
     for index in range(1, 6):
         docs.create(
             admin,

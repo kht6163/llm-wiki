@@ -119,6 +119,37 @@ h1 { font-size: 1.6em; text-wrap: balance; }
 .conflict pre { max-height: 320px; }
 .conflict-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 0; }
 
+/* Three-way resolver: dense comparison wells inside the existing warning surface.
+   Base is deliberately separated as read-only context; only explicit outline
+   controls resolve a hunk. */
+#merge-progress { margin: 10px 0 6px; color: var(--fg-muted); font-family: var(--font-mono);
+  font-size: 0.82em; font-variant-numeric: tabular-nums; }
+.merge-conflicts { display: grid; gap: 10px; margin-top: 8px; }
+.merge-conflict { min-width: 0; margin: 0; padding: 10px; border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); background: var(--bg); transition: border-color var(--t-fast) var(--ease); }
+.merge-conflict.is-resolved { border-color: color-mix(in srgb, var(--success) 60%, var(--line)); }
+.merge-conflict > legend { padding: 0 6px; font-family: var(--font-mono); font-size: 0.82em;
+  color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.merge-choice-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.merge-choice { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.merge-choice h3, .merge-base h3 { margin: 0; color: var(--fg-muted); font-size: 0.78em;
+  font-weight: 600; }
+.merge-choice pre, .merge-base pre { min-height: 5.2em; max-height: 220px; margin: 0; padding: 8px 10px;
+  background: var(--inset); white-space: pre-wrap; overflow-wrap: anywhere; }
+.merge-choice button { align-self: flex-start; margin-top: auto; }
+.merge-choice button[aria-pressed="true"] { color: var(--accent-hover); border-color: var(--accent);
+  background: var(--accent-soft); }
+.merge-choice-manual > label { color: var(--fg-muted); font-size: 0.78em; font-weight: 600; }
+.merge-choice-manual textarea { width: 100%; min-height: 7.2em; resize: vertical;
+  font-family: var(--font-mono); font-size: 0.82em; line-height: 1.45; }
+.merge-base { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line); }
+.merge-base pre { min-height: 0; color: var(--fg-muted); }
+#apply-merge-proposal { margin-top: 8px; }
+@media (max-width: 860px) {
+  .merge-choice-grid { grid-template-columns: 1fr; }
+  .merge-choice pre { min-height: 0; }
+}
+
 .doclist { list-style: none; padding: 0; }
 .doclist li { padding: 8px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .doclist .title { font-weight: 600; }

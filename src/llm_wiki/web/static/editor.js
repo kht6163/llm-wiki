@@ -81,6 +81,7 @@
     onChange: function (v) { textarea.value = v; count(v); },
     onSave: function (v) { textarea.value = v; submit(); },
   });
+  mountEl.wikiEditorApi = api;
   count(textarea.value);
 
   // ---- unsaved-changes guard ------------------------------------------

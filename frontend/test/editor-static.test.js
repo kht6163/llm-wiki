@@ -260,6 +260,11 @@ describe("editor.js", () => {
     expect(api.setTheme.mock.calls.map((call) => call[0])).toEqual(["dark", "light"]);
   });
 
+  test("exposes the mounted editor API on its DOM mount for merge resolution", async () => {
+    await boot();
+    expect(document.querySelector("#md-editor-mount").wikiEditorApi).toBe(api);
+  });
+
   test("scans wiki queries and rejects closed, nested or unpositioned contexts", async () => {
     vi.stubGlobal("fetch", vi.fn(() => new Promise(() => {})));
     await boot();

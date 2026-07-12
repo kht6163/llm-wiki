@@ -58,6 +58,7 @@ export function useStaticIsolation() {
     delete window.WIKI;
     delete window.WikiLocalizeTime;
     delete window.WikiMdEditor;
+    delete window.WikiMerge;
     delete window.WikiPalette;
     delete window.WikiSearch;
     delete window.WikiShell;
@@ -69,6 +70,7 @@ export async function loadStatic(name) {
   const modules = {
     datetime: () => import("../../src/llm_wiki/web/static/datetime.js"),
     editor: () => import("../../src/llm_wiki/web/static/editor.js"),
+    merge: () => import("../../src/llm_wiki/web/static/merge.js"),
     outline: () => import("../../src/llm_wiki/web/static/outline.js"),
     palette: () => import("../../src/llm_wiki/web/static/palette.js"),
     preview: () => import("../../src/llm_wiki/web/static/preview.js"),
