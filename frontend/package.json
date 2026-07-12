@@ -10,7 +10,8 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "vitest run",
-    "coverage": "vitest run --coverage"
+    "coverage": "vitest run --coverage",
+    "e2e": "node e2e/run.mjs"
   },
   "dependencies": {
     "cropperjs": "^1.6.2",
@@ -20,6 +21,7 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.61.1",
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "^0.25.0",
     "jsdom": "29.1.1",

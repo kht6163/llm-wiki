@@ -38,3 +38,5 @@ coverage.xml
 /.worktrees/
 /.superpowers/
 /docs/superpowers/
+/playwright-report/
+/test-results/
