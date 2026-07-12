@@ -46,6 +46,44 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/llm_wiki"]
 
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.cache",
+    "/.mypy_cache",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.superpowers",
+    "/.venv",
+    "/.worktrees",
+    "/build",
+    "/data",
+    "/dist",
+    "/frontend/coverage",
+    "/frontend/node_modules",
+    "/htmlcov",
+    "/models",
+    "/secrets",
+    "/vault",
+    "/.coverage",
+    "/.coverage.*",
+    "/coverage.xml",
+    "/.env",
+    "/.env.*",
+    "/**/__pycache__",
+    "/**/*.db",
+    "/**/*.db-*",
+    "/**/*.dll",
+    "/**/*.dylib",
+    "/**/*.key",
+    "/**/*.node",
+    "/**/*.pem",
+    "/**/*.pyc",
+    "/**/*.pyo",
+    "/**/*.so",
+    "/**/*.sqlite",
+    "/**/*.sqlite3",
+]
+
 # Route torch through the CPU-only wheel index. Without this, `uv` pulls the
 # multi-GB CUDA build of torch on Linux. `explicit = true` means this index is
 # used ONLY for packages explicitly assigned to it below (torch); everything

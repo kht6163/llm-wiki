@@ -9,6 +9,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -85,7 +88,9 @@ jobs:
         run: uv python install 3.12
 
       - name: Build wheel and source distribution
-        run: uv build
+        run: |
+          rm -rf dist
+          uv build
 
       - name: Install wheel in a clean environment
         run: |
@@ -93,7 +98,11 @@ jobs:
           uv pip install --python .wheel-smoke/bin/python --torch-backend cpu dist/*.whl
 
       - name: Verify installed CLI, version, and web assets
-        run: .wheel-smoke/bin/python scripts/distribution_smoke.py --expected-version "$(uv version --short)"
+        run: |
+          .wheel-smoke/bin/python scripts/distribution_smoke.py \
+            --expected-version "$(uv version --short)" \
+            --source-package src/llm_wiki \
+            --sdist dist/*.tar.gz
 
   docker:
     runs-on: ubuntu-latest

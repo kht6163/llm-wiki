@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -10,26 +11,72 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def test_distribution_smoke_rejects_missing_wheel_asset(tmp_path: Path):
+def _asset_trees(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "source"
+    installed = tmp_path / "installed"
+    for root in (source, installed):
+        for relative, content in (
+            ("web/templates/nested/page.html", b"template"),
+            ("web/static/nested/app.js", b"static"),
+        ):
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+    return source, installed
+
+
+@pytest.mark.parametrize("mutation", ["missing", "extra", "tampered"])
+def test_distribution_smoke_rejects_any_wheel_asset_regression(tmp_path: Path, mutation: str):
     from scripts.distribution_smoke import verify_assets
 
-    package_root = tmp_path / "llm_wiki"
-    package_root.mkdir()
+    source, installed = _asset_trees(tmp_path)
+    if mutation == "missing":
+        (installed / "web/static/nested/app.js").unlink()
+    elif mutation == "extra":
+        (installed / "web/static/extra.js").write_bytes(b"extra")
+    else:
+        (installed / "web/templates/nested/page.html").write_bytes(b"changed")
 
-    with pytest.raises(RuntimeError, match="web/templates/base.html"):
-        verify_assets(package_root)
+    with pytest.raises(RuntimeError, match=mutation):
+        verify_assets(source, installed)
 
 
-def test_distribution_smoke_accepts_required_wheel_assets(tmp_path: Path):
-    from scripts.distribution_smoke import REQUIRED_ASSETS, verify_assets
+def test_distribution_smoke_accepts_exact_wheel_asset_tree(tmp_path: Path):
+    from scripts.distribution_smoke import verify_assets
 
-    package_root = tmp_path / "llm_wiki"
-    for relative in REQUIRED_ASSETS:
-        target = package_root / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("smoke", encoding="utf-8")
+    source, installed = _asset_trees(tmp_path)
+    verify_assets(source, installed)
 
-    verify_assets(package_root)
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "llm_wiki-0.31.1/frontend/node_modules/pkg/index.js",
+        "llm_wiki-0.31.1/data/llm_wiki.db",
+        "llm_wiki-0.31.1/native/addon.node",
+    ],
+)
+def test_sdist_smoke_rejects_forbidden_members(tmp_path: Path, member: str):
+    from scripts.distribution_smoke import verify_sdist
+
+    archive = tmp_path / "package.tar.gz"
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"bad")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(payload, arcname=member)
+
+    with pytest.raises(RuntimeError, match="forbidden sdist member"):
+        verify_sdist(archive)
+
+
+def test_sdist_smoke_rejects_oversized_archive(tmp_path: Path):
+    from scripts.distribution_smoke import verify_sdist
+
+    archive = tmp_path / "package.tar.gz"
+    archive.write_bytes(b"x" * 11)
+
+    with pytest.raises(RuntimeError, match="exceeds size limit"):
+        verify_sdist(archive, max_bytes=10)
 
 
 def test_distribution_smoke_keeps_cli_in_virtual_environment():
