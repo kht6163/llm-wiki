@@ -609,7 +609,7 @@ def test_search_vector_orphans_reranking_and_rank_modes(monkeypatch):
 
     class TiedVectorConn:
         def execute(self, sql, _params=()):
-            if "FROM chunk_vectors" in sql:
+            if "embedding MATCH" in sql:
                 return _Rows(
                     [
                         {"chunk_id": 21, "distance": 0.25},
@@ -672,6 +672,44 @@ def test_search_vector_orphans_reranking_and_rank_modes(monkeypatch):
     assert [x[0] for x in bm] == [1, 2]
     assert [x[0] for x in vec] == [2, 1, 3]
     assert [x[0] for x in hybrid] == [2, 1, 3]
+
+
+def test_vector_tie_at_vector_cap_uses_stable_subset_across_insertion_orders(tmp_path):
+    paths = ["delta.md", "alpha.md", "charlie.md", "bravo.md"]
+    query_vector = Embedder.serialize([1.0, 0.0])
+
+    def tied_paths(name, insertion_order):
+        root = tmp_path / name
+        root.mkdir()
+        db = _fresh_db(root)
+        for path in insertion_order:
+            _insert_indexed_doc(db, path, "# Same\nidentical vector passage")
+        with db.writer() as conn:
+            chunk_ids = [row["id"] for row in conn.execute("SELECT id FROM chunks")]
+            conn.executemany(
+                "INSERT INTO chunk_vectors(chunk_id, embedding) VALUES(?, ?)",
+                [(chunk_id, query_vector) for chunk_id in chunk_ids],
+            )
+        with db.reader() as conn:
+            hits, _vec_info, _match = search._rank(
+                conn,
+                "identical vector passage",
+                mode="vector",
+                k=4,
+                folder=None,
+                tags=None,
+                query_vector=query_vector,
+                params=search.FusionParams(vector_factor=3, vector_cap=2),
+            )
+            return [
+                conn.execute("SELECT path FROM documents WHERE id=?", (doc_id,)).fetchone()[0]
+                for doc_id, _score in hits
+            ]
+
+    forward = tied_paths("forward", paths)
+    reverse = tied_paths("reverse", reversed(paths))
+
+    assert forward == reverse == ["alpha.md", "bravo.md"]
 
 
 def test_search_pass_filters_without_batch_and_passage_boundaries():

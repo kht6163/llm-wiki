@@ -280,10 +280,24 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
     rows = conn.execute(
         "SELECT chunk_id, distance FROM chunk_vectors "
         "WHERE embedding MATCH ? AND k=? ORDER BY distance",
-        (query_vector, limit),
+        (query_vector, limit + 1),
     ).fetchall()
     if not rows:
         return []
+    # vec0 chooses its k rows before application-side tie-breaking, and its equal-distance
+    # choice follows insertion-dependent rowids. One look-ahead detects only the unsafe
+    # boundary case. Fall back there to an exact scalar scan whose LIMIT stays bounded;
+    # ordinary KNN queries retain the indexed path and fetch just one diagnostic row.
+    if len(rows) > limit and rows[limit - 1]["distance"] == rows[limit]["distance"]:
+        rows = conn.execute(
+            "SELECT v.chunk_id, vec_distance_cosine(v.embedding, ?) AS distance "
+            "FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id "
+            "JOIN documents d ON d.id=c.doc_id "
+            "ORDER BY distance, d.path_norm, c.ordinal LIMIT ?",
+            (query_vector, limit),
+        ).fetchall()
+    else:
+        rows = rows[:limit]
     # Resolve all matched chunks in one query instead of one SELECT per hit.
     ids = [r["chunk_id"] for r in rows]
     ph = ",".join("?" * len(ids))
