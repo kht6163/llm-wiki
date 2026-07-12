@@ -30,6 +30,24 @@
     if (!name.value.trim()) { name.focus(); }
   })();
 
+  // ---- new-doc template select: reload /new with ?template= so the server prefills ----
+  (function templateControl() {
+    var sel = document.getElementById("doc-template");
+    if (!sel) return;
+    sel.addEventListener("change", function () {
+      var folder = document.getElementById("loc-folder");
+      var name = document.getElementById("loc-name");
+      var f = folder ? folder.value.trim().replace(/^\/+|\/+$/g, "") : "";
+      var stem = name ? name.value.trim().replace(/\.md$/i, "") : "";
+      var full = (f ? f + "/" : "") + stem;
+      var params = new URLSearchParams();
+      if (full) params.set("path", full + ".md");
+      if (sel.value) params.set("template", sel.value);
+      var q = params.toString();
+      window.location = "/new" + (q ? "?" + q : "");
+    });
+  })();
+
   var form = document.querySelector(".editform");
   var textarea = document.getElementById("editor");
   var mountEl = document.getElementById("md-editor-mount");
