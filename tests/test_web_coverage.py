@@ -57,6 +57,18 @@ assert 'llm_wiki.web.app' in sys.modules
     assert result.returncode == 0, result.stderr
 
 
+def test_web_package_rejects_unknown_public_attributes():
+    web_package = sys.modules["llm_wiki.web"]
+    missing_name = "missing_export"
+
+    with pytest.raises(AttributeError) as exc_info:
+        getattr(web_package, missing_name)
+
+    assert exc_info.value.args == (
+        f"module 'llm_wiki.web' has no attribute {missing_name!r}",
+    )
+
+
 @pytest.mark.asyncio
 async def test_format_helpers_cover_upload_diff_dates_and_windows():
     small = UploadFile(BytesIO(b"abc"), filename="small.txt")

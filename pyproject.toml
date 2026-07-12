@@ -130,3 +130,5 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+fail_under = 100
+partial_branches = ["pragma: no branch"]
