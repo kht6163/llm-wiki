@@ -63,25 +63,27 @@
     }, 4500);
   }
 
+  function applyRendered(d, ev, requestId) {
+    if (requestId !== refreshSeq || !d || !d.ok || !(d.version >= version)) return;
+    var rendered = document.querySelector(".rendered");
+    if (rendered && d.html != null) rendered.innerHTML = d.html;
+    version = d.version;
+    meta.setAttribute("data-version", String(d.version));
+    // Keep any base_version field (e.g. the delete form) current so it won't
+    // false-conflict against the change we just absorbed.
+    document.querySelectorAll('input[name="base_version"]').forEach(function (i) {
+      i.value = d.version;
+    });
+    // Prefer the live event's surface attribution; fall back to the fetched doc.
+    var who = whoVia(ev) || (d.updated_by || "");
+    toast("문서가 v" + d.version + "(으)로 업데이트되었습니다" + (who ? " · " + who : ""));
+  }
+
   function refreshRendered(ev) {
     var requestId = ++refreshSeq;
     fetch("/api/doc/" + encPath(path) + "/rendered", { credentials: "same-origin" })
       .then(function (r) { return r.json(); })
-      .then(function (d) {
-        if (requestId !== refreshSeq || !d || !d.ok || !(d.version >= version)) return;
-        var rendered = document.querySelector(".rendered");
-        if (rendered) rendered.innerHTML = d.html;
-        version = d.version;
-        meta.setAttribute("data-version", String(d.version));
-        // Keep any base_version field (e.g. the delete form) current so it won't
-        // false-conflict against the change we just absorbed.
-        document.querySelectorAll('input[name="base_version"]').forEach(function (i) {
-          i.value = d.version;
-        });
-        // Prefer the live event's surface attribution; fall back to the fetched doc.
-        var who = whoVia(ev) || (d.updated_by || "");
-        toast("문서가 v" + d.version + "(으)로 업데이트되었습니다" + (who ? " · " + who : ""));
-      })
+      .then(function (d) { applyRendered(d, ev, requestId); })
       .catch(function () {});
   }
 
@@ -116,6 +118,54 @@
   }
 
   var ws = null, backoff = 1000, closed = false, reconnectTimer = null, refreshSeq = 0;
+  var softRefreshTimer = null, softRefreshInFlight = false;
+
+  // When the tab becomes visible or the window regains focus, quietly re-check
+  // the document version (WS may have been suspended). Debounced to avoid spam.
+  function softRefreshCheck() {
+    if (closed || mode === "list" || !path || softRefreshInFlight) return;
+    softRefreshInFlight = true;
+    var requestId = ++refreshSeq;
+    fetch("/api/doc/" + encPath(path) + "/rendered", { credentials: "same-origin" })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || !d.ok || !(d.version > version)) return;
+        var ev = {
+          type: "doc_changed",
+          op: "update",
+          path: path,
+          version: d.version,
+          via: d.last_via,
+          updated_by: d.updated_by,
+        };
+        if (mode === "edit") {
+          var who = whoVia(ev) ? " · " + esc(whoVia(ev)) : "";
+          banner("⚠ 다른 곳에서 이 문서가 변경되었습니다 (v" + esc(d.version) + who +
+                 "). 지금 저장하면 충돌로 거부될 수 있습니다. 변경분을 합치려면 다시 여세요.", "warn");
+        } else {
+          // Apply the payload we already have — no second round-trip.
+          applyRendered(d, ev, requestId);
+        }
+      })
+      .catch(function () {})
+      .then(function () { softRefreshInFlight = false; });
+  }
+
+  function scheduleSoftRefresh() {
+    if (closed || mode === "list" || !path) return;
+    if (document.visibilityState && document.visibilityState !== "visible") return;
+    if (softRefreshTimer !== null) clearTimeout(softRefreshTimer);
+    softRefreshTimer = setTimeout(function () {
+      softRefreshTimer = null;
+      softRefreshCheck();
+    }, 2000);
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") scheduleSoftRefresh();
+  });
+  window.addEventListener("focus", scheduleSoftRefresh);
+
   function connect() {
     if (closed) return;
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -139,6 +189,7 @@
   window.addEventListener("beforeunload", function () {
     closed = true;
     if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (softRefreshTimer !== null) { clearTimeout(softRefreshTimer); softRefreshTimer = null; }
     if (ws) { try { ws.close(); } catch (e) {} }
   });
   connect();

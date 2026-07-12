@@ -256,3 +256,39 @@ def test_malformed_unknown_operator_remains_search_text(ctx, principals):
         ("title", "unterminate"),
     ]
     assert page.items == ()
+
+
+def test_bm25_cjk_query_shows_hybrid_hint_banner(ctx, principals):
+    """BM25 + Hangul/CJK query should surface a calm hybrid-mode suggestion banner."""
+    import re
+    from urllib.parse import quote
+
+    from starlette.testclient import TestClient
+
+    from llm_wiki.web import create_web_app
+
+    docs, editor = ctx.docs, principals["editor"]
+    docs.create(editor, "ko.md", "한글 검색 테스트 본문", embed=False)
+
+    client = TestClient(create_web_app(ctx))
+    token = re.search(
+        r'name="csrf_token" value="([^"]+)"', client.get("/login").text
+    ).group(1)
+    client.post(
+        "/login",
+        data={"username": "alice", "password": "secret12", "csrf_token": token},
+    )
+
+    q = "한글검색"
+    body = client.get("/search", params={"q": q, "mode": "bm25"}).text
+    assert "cjk-hint" in body or "search-cjk-hint" in body
+    assert "hybrid" in body
+    # Link should keep the query and switch mode to hybrid.
+    assert "mode=hybrid" in body or 'value="hybrid"' in body
+    assert quote(q) in body or q in body
+
+    # No banner for hybrid mode, or for ASCII-only BM25 queries.
+    hybrid = client.get("/search", params={"q": q, "mode": "hybrid"}).text
+    assert "search-cjk-hint" not in hybrid and "cjk-hint" not in hybrid
+    ascii_bm25 = client.get("/search", params={"q": "plainascii", "mode": "bm25"}).text
+    assert "search-cjk-hint" not in ascii_bm25 and "cjk-hint" not in ascii_bm25

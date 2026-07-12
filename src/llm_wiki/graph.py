@@ -249,18 +249,51 @@ def _neighbors(conn: sqlite3.Connection, ids: list[int]) -> set[int]:
     return out
 
 
+def _doc_filter_clause(
+    folder: str | None, tags: list[str] | None,
+) -> tuple[str, list]:
+    """SQL fragment (AND …) + params restricting documents by folder subtree and tags."""
+    clauses: list[str] = []
+    params: list = []
+    if folder:
+        f = folder.strip("/")
+        if f:
+            clauses.append("(folder=? OR folder LIKE ?)")
+            params += [f, f + "/%"]
+    for t in tags or []:
+        if t:
+            clauses.append("id IN (SELECT doc_id FROM tags WHERE tag=?)")
+            params.append(t)
+    if not clauses:
+        return "", []
+    return " AND " + " AND ".join(clauses), params
+
+
 def build_graph(
     conn: sqlite3.Connection,
     root_path: str | None = None,
     depth: int = 1,
     limit: int = 500,
     include_unresolved: bool = True,
+    folder: str | None = None,
+    tag: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict:
     """Return {nodes, edges} for Cytoscape/D3. With a root, BFS outward over links
-    (both directions) up to ``depth``; otherwise the most-recent ``limit`` docs."""
+    (both directions) up to ``depth``; otherwise the most-recent ``limit`` docs.
+
+    Optional ``folder`` / ``tag`` / ``tags`` restrict the node set to matching
+    documents (folder = subtree; tags = AND). Unresolved ghost nodes are only
+    emitted when ``include_unresolved`` is true."""
     depth = max(1, min(depth, 3))
     limit = max(1, min(limit, 2000))
     root_norm = path_norm(normalize_rel_path(root_path)) if root_path else None
+    raw_tags = [t for t in ([tag] if tag else []) + list(tags or []) if t]
+    tag_list: list[str] = []
+    for t in raw_tags:
+        if t not in tag_list:
+            tag_list.append(t)
+    filt_sql, filt_params = _doc_filter_clause(folder, tag_list)
 
     if root_norm:
         root = conn.execute(
@@ -280,13 +313,34 @@ def build_graph(
             # an N+1 that dominated query count on wide graphs up to the 2000 cap).
             frontier = _neighbors(conn, list(frontier)) - visited
         visited |= frontier
+        # When folder/tag filters are active, keep only matching docs from the BFS set.
+        if filt_sql:
+            ph = ",".join("?" * len(visited)) if visited else "NULL"
+            if visited:
+                match_ids = {
+                    r[0]
+                    for r in conn.execute(
+                        f"SELECT id FROM documents WHERE id IN ({ph}) AND is_deleted=0{filt_sql}",
+                        list(visited) + filt_params,
+                    )
+                }
+            else:
+                match_ids = set()
+            # Always keep the root so a focused graph is not emptied by a narrow filter.
+            match_ids.add(root["id"])
+            visited = match_ids
         doc_ids = list(visited)[:limit]
         truncated = len(visited) > limit
     else:
         doc_ids = [r[0] for r in conn.execute(
-            "SELECT id FROM documents WHERE is_deleted=0 ORDER BY updated_at DESC LIMIT ?", (limit,)
+            f"SELECT id FROM documents WHERE is_deleted=0{filt_sql} "
+            "ORDER BY updated_at DESC LIMIT ?",
+            filt_params + [limit],
         )]
-        total = conn.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM documents WHERE is_deleted=0{filt_sql}",
+            filt_params,
+        ).fetchone()[0]
         truncated = total > limit
 
     id_set = set(doc_ids)

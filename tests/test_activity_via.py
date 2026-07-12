@@ -114,3 +114,44 @@ def test_audit_fields_are_defensively_bounded(ctx):
             "length(outcome),length(detail) FROM audit_log ORDER BY id DESC"
         ).fetchone()
     assert tuple(row) == (128, 32, 64, 4096, 32, 4096)
+
+
+def test_via_counts_summary_by_surface(ctx, principals):
+    docs = ctx.docs
+    docs.create(_p(principals, "mcp"), "a.md", "x")
+    docs.update(_p(principals, "mcp"), "a.md", 1, "x2")
+    docs.create(_p(principals, "web"), "b.md", "y")
+    docs.create(_p(principals, "cli"), "c.md", "z")
+
+    counts = audit.via_counts(ctx.db, actions=audit.DOC_ACTIONS)
+    assert counts.get("mcp", 0) >= 2
+    assert counts.get("web", 0) >= 1
+    assert counts.get("cli", 0) >= 1
+    assert sum(counts.values()) >= 4
+
+
+def test_activity_page_shows_via_summary_and_highlights_mcp(ctx, principals):
+    """Activity HTML surfaces via counts and marks agent-authored rows."""
+    import re
+
+    from starlette.testclient import TestClient
+
+    from llm_wiki.web import create_web_app
+
+    docs = ctx.docs
+    docs.create(_p(principals, "mcp"), "agent.md", "from agent")
+    docs.create(_p(principals, "web"), "human.md", "from human")
+
+    client = TestClient(create_web_app(ctx))
+    token = re.search(
+        r'name="csrf_token" value="([^"]+)"', client.get("/login").text
+    ).group(1)
+    client.post(
+        "/login",
+        data={"username": "alice", "password": "secret12", "csrf_token": token},
+    )
+    html = client.get("/activity").text
+    assert "via-summary" in html
+    assert "에이전트" in html and "사람" in html
+    assert "via-mcp-row" in html
+    assert 'class="via-mcp-row"' in html or "via-mcp-row" in html

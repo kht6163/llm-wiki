@@ -186,6 +186,19 @@ h1 { font-size: 1.6em; text-wrap: balance; }
   border-color: color-mix(in srgb, var(--accent) 46%, var(--line)); }
 .via-badge.via-cli { color: var(--warn); background: var(--warn-soft);
   border-color: color-mix(in srgb, var(--warn) 38%, transparent); }
+/* Agent-authored activity rows: soft accent wash so MCP edits stand out without
+   introducing a new brand colour (uses the same --accent-soft token as badges). */
+tr.via-mcp-row > td { background: var(--accent-soft); }
+.via-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+  margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--inset); font-size: 0.86em; }
+.via-summary-label { color: var(--fg-faint); font-weight: 600; letter-spacing: 0.03em;
+  text-transform: uppercase; font-size: 0.85em; }
+.via-summary-item { color: var(--fg-muted); }
+.via-summary-item .count { color: var(--fg); font-variant-numeric: tabular-nums; }
+.via-chips { display: flex; flex-wrap: wrap; gap: 5px; margin: -4px 0 14px; }
+.via-chips .filter-chip.is-active { color: var(--accent-hover); border-color: var(--accent);
+  background: var(--accent-soft); font-weight: 600; }
 .outcome-bad { color: var(--warn); font-family: var(--font-mono); }
 
 .layout { display: grid; grid-template-columns: 1fr 280px; gap: 28px; }
@@ -471,6 +484,11 @@ select {
 .filter-chip code { padding: 0; border: 0; background: transparent; color: inherit; font-size: 1em; }
 .filter-chip:hover { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
 .search-status { margin: 6px 0 2px; font-size: 0.79em; }
+/* Calm BM25+CJK nudge — inset surface, no alarm colour. */
+.search-cjk-hint { margin: 0 0 10px; padding: 8px 12px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--inset); color: var(--fg-muted);
+  font-size: 0.86em; line-height: 1.45; }
+.search-cjk-hint a { font-weight: 600; }
 
 /* Saved searches — localStorage only; progressive enhancement shell. */
 .saved-searches { margin: 0 0 10px; padding: 8px 0 2px; }
@@ -526,6 +544,9 @@ select {
    horizontal scroll in the narrow content column; let its label and the field shrink. */
 .graph-controls .g-root { display: inline-flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; }
 .graph-controls #root { flex: 1; min-width: 0; }
+.graph-controls .g-check { display: inline-flex; align-items: center; gap: 6px;
+  color: var(--fg-muted); font-size: 0.9em; user-select: none; }
+.graph-controls .g-check input { margin: 0; }
 #cy { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: 8px; background: var(--soft); }
 
 .list-head { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
