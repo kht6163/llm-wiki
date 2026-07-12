@@ -14,6 +14,7 @@ from starlette.applications import Starlette
 
 from llm_wiki import _cli_impl
 from llm_wiki.config import ConfigError, Settings
+from llm_wiki.process_lock import ProjectLock, ProjectLockError
 from llm_wiki.services.errors import WikiError
 
 
@@ -504,7 +505,7 @@ def test_restore_warns_recovers_and_reports_success(monkeypatch, tmp_path, capsy
     src.touch()
     settings = NS(db_path=tmp_path / "wiki.db", vault_path=tmp_path / "vault", embedding_model="configured")
     report = NS(backup_cleanup_warnings=[tmp_path / "saved.db"], embedding_model="snapshot-model",
-                schema_version=8, doc_count=12)
+                schema_version=8, doc_count=12, finalize=lambda: None)
     calls = []
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: calls.append((args, kwargs)) or report)
@@ -520,13 +521,67 @@ def test_restore_clean_success_has_no_optional_warnings(monkeypatch, tmp_path, c
     src = tmp_path / "wiki.tar"
     src.touch()
     settings = NS(db_path=tmp_path / "wiki.db", vault_path=tmp_path / "vault", embedding_model="same")
-    report = NS(backup_cleanup_warnings=[], embedding_model="same", schema_version=8, doc_count=0)
+    report = NS(backup_cleanup_warnings=[], embedding_model="same", schema_version=8,
+                doc_count=0, finalize=lambda: None)
     monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
     monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: NS(docs=NS(recover_pending=lambda: 0)))
     assert _cli_impl._restore(NS(in_=str(src), force=False)) == 0
     out = capsys.readouterr().out
     assert "WARNING" not in out and "re-projected" not in out
+
+
+def test_serve_holds_the_same_project_lock_used_by_restore(monkeypatch, tmp_path):
+    settings = NS(db_path=tmp_path / "data" / "wiki.db")
+    observed = []
+
+    def serve_locked(args, locked_settings):
+        assert locked_settings is settings
+        with pytest.raises(ProjectLockError, match="already active"):
+            ProjectLock(settings.db_path).acquire()
+        observed.append(True)
+        return 0
+
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "_apply_serve_overrides", lambda value, args: value)
+    monkeypatch.setattr(_cli_impl, "_serve_locked", serve_locked)
+
+    assert _cli_impl._serve(NS()) == 0
+    assert observed == [True]
+
+
+def test_restore_and_serve_report_project_lock_contention(monkeypatch, tmp_path, capsys):
+    src = tmp_path / "wiki.tar"
+    src.touch()
+    settings = NS(db_path=tmp_path / "data" / "wiki.db", vault_path=tmp_path / "vault")
+    error = ProjectLockError("already active")
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    assert _cli_impl._restore(NS(in_=str(src), force=True)) == 1
+
+    with ProjectLock(settings.db_path):
+        assert _cli_impl._serve(NS(host=None, gui_port=None, mcp_port=None)) == 1
+
+    assert capsys.readouterr().out.count("already active") == 2
+
+
+def test_restore_defensively_rejects_a_rollback_that_returns(monkeypatch, tmp_path):
+    src = tmp_path / "wiki.tar"
+    src.touch()
+    settings = NS(
+        db_path=tmp_path / "wiki.db",
+        vault_path=tmp_path / "vault",
+        embedding_model="same",
+    )
+    report = NS(embedding_model="same", rollback=lambda exc: None)
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl, "build_context", lambda **kwargs: (_ for _ in ()).throw(OSError("fail"))
+    )
+
+    with pytest.raises(AssertionError, match="unexpectedly returned"):
+        _cli_impl._restore(NS(in_=str(src), force=True))
 
 
 def _settings(**overrides):

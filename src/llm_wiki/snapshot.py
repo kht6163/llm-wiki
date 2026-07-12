@@ -16,12 +16,20 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO
 
+from filelock import FileLock
+
 from .db import SCHEMA_VERSION, Database, get_meta
+from .process_lock import ProjectLock
 from .util import now_iso
 
 SNAPSHOT_FORMAT = "llm-wiki-snapshot"
 _ATTACHMENT_ATTEMPTS = 3
 _COPY_CHUNK_SIZE = 1024 * 1024
+MAX_SNAPSHOT_ARCHIVE_BYTES = 20 * 1024 * 1024 * 1024
+MAX_SNAPSHOT_MEMBERS = 100_000
+MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_SNAPSHOT_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
+MAX_SNAPSHOT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -32,12 +40,27 @@ class SnapshotReport:
     embedding_model: str | None
 
 
-@dataclass(frozen=True)
+@dataclass
 class RestoreReport:
     schema_version: int | None
     doc_count: int
     embedding_model: str | None = None
     backup_cleanup_warnings: tuple[Path, ...] = ()
+    _journal: _RestoreJournal | None = None
+
+    def finalize(self) -> tuple[Path, ...]:
+        """Commit a pending restore by removing the retained original targets."""
+        if self._journal is not None:
+            self.backup_cleanup_warnings = self._journal.finalize()
+            self._journal = None
+        return self.backup_cleanup_warnings
+
+    def rollback(self, cause: BaseException) -> None:
+        """Restore every original target, then re-raise ``cause``."""
+        if self._journal is None:
+            raise RuntimeError("restore is no longer pending")
+        journal, self._journal = self._journal, None
+        journal.rollback(cause)
 
 
 class RestoreRollbackError(ValueError):
@@ -98,10 +121,17 @@ def _stage_attachment_once(path: Path, root: Path, staged: Path) -> tuple[int, s
     """Stage one stable regular-file generation without following a final symlink."""
     fd = -1
     try:
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        visible = os.lstat(path)
+        if not stat.S_ISREG(visible.st_mode):
+            return None
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
         fd = os.open(path, flags)
         before = os.fstat(fd)
-        visible = os.lstat(path)
         resolved = path.resolve()
         if (
             not stat.S_ISREG(before.st_mode)
@@ -157,6 +187,16 @@ def _add_staged_file(tar: tarfile.TarFile, file: _ArchiveFile) -> None:
     info.size = file.size
     with file.source.open("rb") as source:
         tar.addfile(info, source)
+
+
+def _file_metadata(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as source:
+        while chunk := source.read(_COPY_CHUNK_SIZE):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
 
 
 def _verify_archive(path: Path, files: list[_ArchiveFile]) -> None:
@@ -221,10 +261,17 @@ def _stage_attachment_files(
         rel_path = path.relative_to(vault)
         if rel_path.parts and rel_path.parts[0] == ".tmp":
             continue
-        if path.suffix.lower() == ".md" or path.is_dir():
+        visible = os.lstat(path)
+        if stat.S_ISDIR(visible.st_mode):
             continue
-        if path.is_symlink():
+        if stat.S_ISLNK(visible.st_mode):
             raise ValueError(f"unsafe vault path: {rel_path.as_posix()!r}")
+        if not stat.S_ISREG(visible.st_mode):
+            raise ValueError(
+                f"vault entry must be a regular file: {rel_path.as_posix()!r}"
+            )
+        if path.suffix.lower() == ".md":
+            continue
         resolved = path.resolve()
         if resolved == root or root not in resolved.parents:
             raise ValueError(f"unsafe vault path: {rel_path.as_posix()!r}")
@@ -248,55 +295,81 @@ def write_snapshot(
     """Atomically write a DB-consistent snapshot without trusting managed projections."""
     out = Path(out)
     vault = Path(vault)
-    if out.exists() and not force:
-        raise FileExistsError(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    temporary_out = Path(f"{out}.tmp")
-    temporary_out.unlink(missing_ok=True)
+    output_lock = FileLock(out.with_name(f".{out.name}.snapshot.lock"))
+    with output_lock:
+        if out.exists() and not force:
+            raise FileExistsError(out)
+        temporary_fd, temporary_raw = tempfile.mkstemp(
+            prefix=f".{out.name}.snapshot-tmp-", dir=out.parent
+        )
+        os.close(temporary_fd)
+        temporary_out = Path(temporary_raw)
 
-    try:
-        with tempfile.TemporaryDirectory() as directory:
-            staging = Path(directory)
-            cloned_db = staging / "wiki.db"
-            with db.reader() as conn:
-                conn.execute("VACUUM INTO ?", (str(cloned_db),))
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                staging = Path(directory)
+                cloned_db = staging / "wiki.db"
+                with db.reader() as conn:
+                    conn.execute("VACUUM INTO ?", (str(cloned_db),))
 
-            clone = sqlite3.connect(cloned_db)
-            clone.row_factory = sqlite3.Row
-            try:
-                managed, normalized = _stage_managed_files(clone, staging)
-                schema = get_meta(clone, "schema_version")
-                embedding_model = get_meta(clone, "embedding_model")
-                embedding_dim = get_meta(clone, "embedding_dim")
-            finally:
-                clone.close()
+                clone = sqlite3.connect(cloned_db)
+                clone.row_factory = sqlite3.Row
+                try:
+                    managed, normalized = _stage_managed_files(clone, staging)
+                    schema = get_meta(clone, "schema_version")
+                    embedding_model = get_meta(clone, "embedding_model")
+                    embedding_dim = get_meta(clone, "embedding_dim")
+                finally:
+                    clone.close()
 
-            attachments = _stage_attachment_files(vault, normalized, staging)
-            archive_files = managed + attachments
-            schema_version = int(schema) if schema else None
-            manifest = {
-                "format": SNAPSHOT_FORMAT,
-                "format_version": 1,
-                "schema_version": schema_version,
-                "embedding_model": embedding_model,
-                "embedding_dim": int(embedding_dim) if embedding_dim else None,
-                "doc_count": len(managed),
-                "created_at": now_iso(),
-                "files": [file.manifest_entry for file in archive_files],
-            }
-            with tarfile.open(temporary_out, "w") as tar:
-                tar.add(cloned_db, arcname="wiki.db")
-                for file in archive_files:
-                    _add_staged_file(tar, file)
-                manifest_data = json.dumps(
-                    manifest, ensure_ascii=False, indent=2
-                ).encode("utf-8")
-                _add_bytes(tar, "manifest.json", manifest_data)
-            _verify_archive(temporary_out, archive_files)
-        os.replace(temporary_out, out)
-    except BaseException:
-        temporary_out.unlink(missing_ok=True)
-        raise
+                attachments = _stage_attachment_files(vault, normalized, staging)
+                archive_files = managed + attachments
+                database_size, database_digest = _file_metadata(cloned_db)
+                schema_version = int(schema) if schema else None
+                manifest = {
+                    "format": SNAPSHOT_FORMAT,
+                    "format_version": 2,
+                    "schema_version": schema_version,
+                    "embedding_model": embedding_model,
+                    "embedding_dim": int(embedding_dim) if embedding_dim else None,
+                    "doc_count": len(managed),
+                    "created_at": now_iso(),
+                    "database": {
+                        "size": database_size,
+                        "sha256": database_digest,
+                    },
+                    "files": [file.manifest_entry for file in archive_files],
+                }
+                with tarfile.open(temporary_out, "w") as tar:
+                    tar.add(cloned_db, arcname="wiki.db")
+                    for file in archive_files:
+                        _add_staged_file(tar, file)
+                    manifest_data = json.dumps(
+                        manifest, ensure_ascii=False, indent=2
+                    ).encode("utf-8")
+                    _add_bytes(tar, "manifest.json", manifest_data)
+                _verify_archive(
+                    temporary_out,
+                    [
+                        _ArchiveFile(
+                            "wiki.db",
+                            "database",
+                            cloned_db,
+                            database_size,
+                            database_digest,
+                        ),
+                        *archive_files,
+                    ],
+                )
+            if force:
+                os.replace(temporary_out, out)
+            else:
+                os.link(temporary_out, out)
+                temporary_out.unlink()
+        except BaseException:
+            temporary_out.unlink(missing_ok=True)
+            raise
 
     return SnapshotReport(
         schema_version=schema_version,
@@ -324,6 +397,8 @@ def _copy_archive_file(source: IO[bytes], target: Path) -> tuple[int, str]:
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("wb") as output:
         while chunk := source.read(_COPY_CHUNK_SIZE):
+            if size + len(chunk) > MAX_SNAPSHOT_MEMBER_BYTES:
+                raise ValueError("snapshot member size limit exceeded")
             output.write(chunk)
             digest.update(chunk)
             size += len(chunk)
@@ -335,28 +410,42 @@ def _read_restore_manifest(
 ) -> tuple[dict[str, object], dict[str, tarfile.TarInfo]]:
     members: dict[str, tarfile.TarInfo] = {}
     identities: set[str] = set()
-    for member in archive.getmembers():
+    total_size = 0
+    for index, member in enumerate(archive, start=1):
+        if index > MAX_SNAPSHOT_MEMBERS:
+            raise ValueError("snapshot member count limit exceeded")
         name, identity = _safe_member_name(member.name)
         if identity in identities:
             raise ValueError("duplicate archive member")
         identities.add(identity)
         if not member.isfile():
             raise ValueError("archive members must be regular files")
+        if member.size < 0 or member.size > MAX_SNAPSHOT_MEMBER_BYTES:
+            raise ValueError("snapshot member size limit exceeded")
+        total_size += member.size
+        if total_size > MAX_SNAPSHOT_TOTAL_BYTES:
+            raise ValueError("snapshot total size limit exceeded")
         members[name] = member
 
     manifest_member = members.get("manifest.json")
     if manifest_member is None:
         raise ValueError("missing manifest.json")
+    if manifest_member.size > MAX_SNAPSHOT_MANIFEST_BYTES:
+        raise ValueError("snapshot manifest size limit exceeded")
     manifest_file = archive.extractfile(manifest_member)
     if manifest_file is None:
         raise ValueError("missing manifest.json")
     try:
-        manifest = json.load(manifest_file)
+        manifest_data = manifest_file.read(MAX_SNAPSHOT_MANIFEST_BYTES + 1)
+        if len(manifest_data) > MAX_SNAPSHOT_MANIFEST_BYTES:
+            raise ValueError("snapshot manifest size limit exceeded")
+        manifest = json.loads(manifest_data)
     except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid manifest.json") from exc
     if not isinstance(manifest, dict) or manifest.get("format") != SNAPSHOT_FORMAT:
         raise ValueError("invalid manifest.json")
-    if manifest.get("format_version") != 1:
+    format_version = manifest.get("format_version")
+    if format_version not in (1, 2):
         raise ValueError("unsupported snapshot format version")
     manifest_schema = manifest.get("schema_version")
     if (
@@ -367,6 +456,19 @@ def _read_restore_manifest(
         raise ValueError("unsupported snapshot schema version")
     if "wiki.db" not in members:
         raise ValueError("missing wiki.db")
+    if format_version == 2:
+        database = manifest.get("database")
+        if not isinstance(database, dict):
+            raise ValueError("invalid manifest database")
+        size, digest = database.get("size"), database.get("sha256")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("invalid manifest database size")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)
+        ):
+            raise ValueError("invalid manifest database hash")
     return manifest, members
 
 
@@ -415,6 +517,12 @@ def _validate_staged_database(
         )
         conn.row_factory = sqlite3.Row
         try:
+            try:
+                integrity = conn.execute("PRAGMA integrity_check").fetchall()
+            except sqlite3.Error as exc:
+                raise ValueError("snapshot database integrity check failed") from exc
+            if len(integrity) != 1 or integrity[0][0] != "ok":
+                raise ValueError("snapshot database integrity check failed")
             schema_raw = get_meta(conn, "schema_version")
             schema_version = int(schema_raw) if schema_raw is not None else None
             if schema_version is None or schema_version > SCHEMA_VERSION:
@@ -481,9 +589,56 @@ def _backup_name(path: Path) -> Path:
     return path.with_name(f".{path.name}.restore-backup-{uuid.uuid4().hex}")
 
 
+@dataclass
+class _RestoreJournal:
+    original_targets: list[tuple[Path, Path]]
+    published_targets: list[Path]
+    process_lock: ProjectLock
+
+    def rollback(self, cause: BaseException) -> None:
+        rollback_errors: list[OSError] = []
+        try:
+            for target in reversed(self.published_targets):
+                try:
+                    _remove_path(target)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+            for target, backup in reversed(self.original_targets):
+                try:
+                    os.replace(backup, target)
+                except OSError as exc:
+                    rollback_errors.append(exc)
+            if rollback_errors:
+                preserved = tuple(
+                    backup
+                    for _, backup in self.original_targets
+                    if backup.exists() or backup.is_symlink()
+                )
+                raise RestoreRollbackError(cause, rollback_errors, preserved) from cause
+            raise cause
+        finally:
+            self.process_lock.release()
+
+    def finalize(self) -> tuple[Path, ...]:
+        cleanup_warnings: list[Path] = []
+        try:
+            for _, backup in self.original_targets:
+                try:
+                    _remove_path(backup)
+                except OSError:
+                    cleanup_warnings.append(backup)
+        finally:
+            self.process_lock.release()
+        return tuple(cleanup_warnings)
+
+
 def _publish_restore(
-    staged_db: Path, staged_vault: Path, db_path: Path, vault: Path
-) -> tuple[Path, ...]:
+    staged_db: Path,
+    staged_vault: Path,
+    db_path: Path,
+    vault: Path,
+    process_lock: ProjectLock,
+) -> _RestoreJournal:
     targets = [db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm"), vault]
     journal: list[tuple[Path, Path]] = []
     published: list[Path] = []
@@ -498,34 +653,8 @@ def _publish_restore(
         os.replace(staged_vault, vault)
         published.append(vault)
     except BaseException as publish_error:
-        rollback_errors: list[OSError] = []
-        for target in reversed(published):
-            try:
-                _remove_path(target)
-            except OSError as exc:
-                rollback_errors.append(exc)
-        for target, backup in reversed(journal):
-            try:
-                os.replace(backup, target)
-            except OSError as exc:
-                rollback_errors.append(exc)
-        if rollback_errors:
-            preserved = tuple(
-                backup
-                for _, backup in journal
-                if backup.exists() or backup.is_symlink()
-            )
-            raise RestoreRollbackError(
-                publish_error, rollback_errors, preserved
-            ) from publish_error
-        raise
-    cleanup_warnings: list[Path] = []
-    for _, backup in journal:
-        try:
-            _remove_path(backup)
-        except OSError:
-            cleanup_warnings.append(backup)
-    return tuple(cleanup_warnings)
+        _RestoreJournal(journal, published, process_lock).rollback(publish_error)
+    return _RestoreJournal(journal, published, process_lock)
 
 
 def restore_snapshot(
@@ -537,22 +666,33 @@ def restore_snapshot(
 ) -> RestoreReport:
     """Validate a snapshot in sibling staging paths, then replace live targets."""
     src, db_path, vault = Path(src), Path(db_path), Path(vault)
-    db_nonempty = db_path.exists() and db_path.stat().st_size > 0
-    vault_nonempty = vault.exists() and any(vault.iterdir())
-    if (db_nonempty or vault_nonempty) and not force:
-        raise FileExistsError("target database or vault is not empty")
+    if src.stat().st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
+        raise ValueError("snapshot archive size limit exceeded")
+    process_lock = ProjectLock(db_path).acquire()
+    staged_db: Path | None = None
+    try:
+        db_nonempty = db_path.exists() and db_path.stat().st_size > 0
+        vault_nonempty = vault.exists() and any(vault.iterdir())
+        if (db_nonempty or vault_nonempty) and not force:
+            raise FileExistsError("target database or vault is not empty")
 
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    vault.parent.mkdir(parents=True, exist_ok=True)
-    db_fd, staged_db_raw = tempfile.mkstemp(
-        prefix=f".{db_path.name}.restore-stage-", dir=db_path.parent
-    )
-    os.close(db_fd)
-    staged_db = Path(staged_db_raw)
-    staged_vault = Path(
-        tempfile.mkdtemp(prefix=f".{vault.name}.restore-stage-", dir=vault.parent)
-    )
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        vault.parent.mkdir(parents=True, exist_ok=True)
+        db_fd, staged_db_raw = tempfile.mkstemp(
+            prefix=f".{db_path.name}.restore-stage-", dir=db_path.parent
+        )
+        os.close(db_fd)
+        staged_db = Path(staged_db_raw)
+        staged_vault = Path(
+            tempfile.mkdtemp(prefix=f".{vault.name}.restore-stage-", dir=vault.parent)
+        )
+    except BaseException:
+        if staged_db is not None:
+            staged_db.unlink(missing_ok=True)
+        process_lock.release()
+        raise
     primary_error: BaseException | None = None
+    published = False
     try:
         try:
             with tarfile.open(src, "r") as archive:
@@ -576,7 +716,15 @@ def restore_snapshot(
                         else staged_vault / path.removeprefix("vault/")
                     )
                     size, digest = _copy_archive_file(extracted, target)
-                    if path != "wiki.db":
+                    if path == "wiki.db" and manifest.get("format_version") == 2:
+                        database = manifest["database"]
+                        assert isinstance(database, dict)
+                        if size != database["size"] or digest != database["sha256"]:
+                            raise ValueError(
+                                "snapshot database verification failed: hash mismatch; "
+                                "invalid snapshot database"
+                            )
+                    elif path != "wiki.db":
                         entry = files[path]
                         if size != entry["size"] or digest != entry["sha256"]:
                             raise ValueError("manifest payload verification failed")
@@ -586,9 +734,10 @@ def restore_snapshot(
         schema_version, doc_count = _validate_staged_database(
             staged_db, staged_vault, manifest, files
         )
-        backup_cleanup_warnings = _publish_restore(
-            staged_db, staged_vault, db_path, vault
+        journal = _publish_restore(
+            staged_db, staged_vault, db_path, vault, process_lock
         )
+        published = True
     except BaseException as exc:
         primary_error = exc
         raise
@@ -602,12 +751,14 @@ def restore_snapshot(
         if isinstance(primary_error, RestoreRollbackError):
             primary_error.staging_cleanup_errors = tuple(staging_cleanup_errors)
         elif primary_error is None and staging_cleanup_errors:
-            raise staging_cleanup_errors[0]
+            journal.rollback(staging_cleanup_errors[0])
+        if primary_error is not None and not published:
+            process_lock.release()
 
     embedding_model = manifest.get("embedding_model")
     return RestoreReport(
         schema_version,
         doc_count,
         embedding_model=embedding_model if isinstance(embedding_model, str) else None,
-        backup_cleanup_warnings=backup_cleanup_warnings,
+        _journal=journal,
     )

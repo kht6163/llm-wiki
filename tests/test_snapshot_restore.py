@@ -2,6 +2,8 @@
 import hashlib
 import io
 import json
+import os
+import socket
 import sqlite3
 import tarfile
 import threading
@@ -13,6 +15,7 @@ import pytest
 from llm_wiki import _cli_impl
 from llm_wiki import snapshot as snapshot_writer
 from llm_wiki.config import Settings
+from llm_wiki.process_lock import ProjectLock, ProjectLockError
 from llm_wiki.runtime import build_context
 from llm_wiki.services.auth import Principal, create_user
 
@@ -131,6 +134,38 @@ def test_snapshot_refuses_overwrite_without_force(tmp_path, monkeypatch):
     assert _cli_impl._snapshot(SimpleNamespace(out=str(tar), force=True)) == 0
 
 
+def test_concurrent_snapshots_to_same_output_publish_once_without_clobber(tmp_path):
+    src = _seed(_settings(tmp_path, "same-output"))
+    out = tmp_path / "same-output.tar"
+    start = threading.Barrier(3)
+    results: list[str] = []
+
+    def write() -> None:
+        start.wait()
+        try:
+            snapshot_writer.write_snapshot(
+                src.db, src.settings.vault_path, out, force=False
+            )
+        except FileExistsError:
+            results.append("refused")
+        else:
+            results.append("published")
+
+    workers = [threading.Thread(target=write) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    start.wait()
+    for worker in workers:
+        worker.join(timeout=20)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert sorted(results) == ["published", "refused"]
+    with tarfile.open(out, "r") as archive:
+        assert archive.extractfile("wiki.db") is not None
+        assert archive.extractfile("manifest.json") is not None
+    assert not list(tmp_path.glob(f".{out.name}.snapshot-tmp-*"))
+
+
 def test_snapshot_retries_an_unstable_attachment(tmp_path, monkeypatch):
     src = _seed(_settings(tmp_path, "retry"))
     attachment = src.settings.vault_path / "asset.bin"
@@ -242,6 +277,48 @@ def test_snapshot_rejects_unsafe_attachment_symlink(tmp_path):
         snapshot_writer.write_snapshot(
             src.db, src.settings.vault_path, tmp_path / "unsafe.tar", force=False
         )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+def test_snapshot_rejects_fifo_without_opening_it(tmp_path, monkeypatch):
+    src = _seed(_settings(tmp_path, "fifo"))
+    fifo = src.settings.vault_path / "blocked.bin"
+    os.mkfifo(fifo)
+    real_open = snapshot_writer.os.open
+
+    def reject_fifo_open(path, flags, *args, **kwargs):
+        if Path(path) == fifo:
+            raise AssertionError("FIFO must be rejected before open")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot_writer.os, "open", reject_fifo_open)
+    with pytest.raises(ValueError, match="regular file"):
+        snapshot_writer.write_snapshot(
+            src.db, src.settings.vault_path, tmp_path / "fifo.tar", force=False
+        )
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="Unix sockets unavailable")
+def test_snapshot_rejects_unix_socket_without_opening_it(tmp_path, monkeypatch):
+    src = _seed(_settings(tmp_path, "socket"))
+    socket_path = src.settings.vault_path / "blocked.sock"
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(socket_path))
+    real_open = snapshot_writer.os.open
+
+    def reject_socket_open(path, flags, *args, **kwargs):
+        if Path(path) == socket_path:
+            raise AssertionError("socket must be rejected before open")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot_writer.os, "open", reject_socket_open)
+    try:
+        with pytest.raises(ValueError, match="regular file"):
+            snapshot_writer.write_snapshot(
+                src.db, src.settings.vault_path, tmp_path / "socket.tar", force=False
+            )
+    finally:
+        listener.close()
 
 
 @pytest.mark.parametrize("disable_nofollow", [False, True])
@@ -641,6 +718,94 @@ def test_restore_report_does_not_claim_recovery_before_cli_recovery(tmp_path):
     assert not hasattr(report, "recovered")
 
 
+@pytest.mark.parametrize("failure", ["build_context", "recover_pending"])
+def test_restore_cli_rolls_back_when_post_publication_validation_fails(
+    tmp_path, monkeypatch, capsys, failure
+):
+    archive = _snapshot_for_restore(tmp_path, f"post-publish-{failure}-source")
+    settings = _settings(tmp_path, f"post-publish-{failure}-target")
+    settings.db_path.parent.mkdir()
+    settings.db_path.write_bytes(b"original database")
+    settings.vault_path.mkdir()
+    (settings.vault_path / "original.txt").write_text("original")
+    original_build_context = build_context
+
+    def fail_after_publication(*args, **kwargs):
+        if failure == "build_context":
+            raise RuntimeError("post-publication context failure")
+        ctx = original_build_context(settings, full=False)
+
+        def fail_recovery():
+            raise RuntimeError("post-publication recovery failure")
+
+        ctx.docs.recover_pending = fail_recovery
+        return ctx
+
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "build_context", fail_after_publication)
+
+    assert _cli_impl._restore(SimpleNamespace(in_=str(archive), force=True)) == 1
+    assert settings.db_path.read_bytes() == b"original database"
+    assert (settings.vault_path / "original.txt").read_text() == "original"
+    assert not (settings.vault_path / "note.md").exists()
+    assert "restore failed:" in capsys.readouterr().out
+
+
+def test_restore_handle_rolls_back_and_reports_cleanup_failures(
+    tmp_path, monkeypatch
+):
+    archive = _snapshot_for_restore(tmp_path, "pending-rollback-source")
+    db_path = tmp_path / "pending-target" / "wiki.db"
+    vault = tmp_path / "pending-vault"
+    db_path.parent.mkdir()
+    db_path.write_bytes(b"original database")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+    pending = snapshot_writer.restore_snapshot(archive, db_path, vault, force=True)
+    real_remove = snapshot_writer._remove_path
+
+    def fail_replacement_cleanup(path):
+        if path == db_path:
+            real_remove(path)
+            raise OSError("replacement cleanup warning")
+        return real_remove(path)
+
+    monkeypatch.setattr(snapshot_writer, "_remove_path", fail_replacement_cleanup)
+    with pytest.raises(snapshot_writer.RestoreRollbackError) as caught:
+        pending.rollback(RuntimeError("post-publication failure"))
+
+    assert str(caught.value.publish_error) == "post-publication failure"
+    assert [str(error) for error in caught.value.rollback_errors] == [
+        "replacement cleanup warning"
+    ]
+    assert db_path.read_bytes() == b"original database"
+    assert (vault / "original.txt").read_text() == "original"
+
+
+def test_restore_refuses_while_application_lock_is_held(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "locked-restore-source")
+    db_path = tmp_path / "locked-target" / "wiki.db"
+    vault = tmp_path / "locked-vault"
+
+    with ProjectLock(db_path):
+        with pytest.raises(ProjectLockError, match="already active"):
+            snapshot_writer.restore_snapshot(archive, db_path, vault, force=False)
+
+
+def test_pending_restore_holds_application_lock_until_finalize(tmp_path):
+    archive = _snapshot_for_restore(tmp_path, "pending-lock-source")
+    db_path = tmp_path / "pending-lock-target" / "wiki.db"
+    vault = tmp_path / "pending-lock-vault"
+    pending = snapshot_writer.restore_snapshot(archive, db_path, vault, force=False)
+
+    with pytest.raises(ProjectLockError, match="already active"):
+        ProjectLock(db_path).acquire()
+
+    pending.finalize()
+    with ProjectLock(db_path):
+        pass
+
+
 def test_restore_cli_reports_preserved_backup_when_rollback_fails(
     tmp_path, monkeypatch, capsys
 ):
@@ -715,6 +880,7 @@ def test_restore_rejects_staged_database_projection_mismatch_without_live_change
     scratch_db = tmp_path / f"projection-{corruption}.db"
 
     def corrupt_projection(members):
+        tampered_database = b""
         result = []
         for member, data in members:
             if corruption == "database" and member.name == "wiki.db":
@@ -725,6 +891,14 @@ def test_restore_rejects_staged_database_projection_mismatch_without_live_change
                         ("# Note\n\ntampered database",),
                     )
                 data = scratch_db.read_bytes()
+                tampered_database = data
+            elif corruption == "database" and member.name == "manifest.json":
+                manifest = json.loads(data)
+                manifest["database"] = {
+                    "size": len(tampered_database),
+                    "sha256": hashlib.sha256(tampered_database).hexdigest(),
+                }
+                data = json.dumps(manifest).encode()
             elif corruption == "managed" and member.name == "vault/note.md":
                 data = b"# Note\n\ntampered projection"
             elif corruption == "managed" and member.name == "manifest.json":

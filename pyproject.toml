@@ -24,6 +24,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "prometheus-client>=0.20",
     "regex>=2024.11.6",
+    "filelock>=3.16",
 ]
 
 [project.scripts]

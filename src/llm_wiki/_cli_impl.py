@@ -17,6 +17,7 @@ from .config import ConfigError, get_settings
 from .db import SCHEMA_VERSION as DB_SCHEMA_VERSION
 from .db import get_meta
 from .mcp_server import create_mcp_server
+from .process_lock import ProjectLock, ProjectLockError
 from .runtime import build_context
 from .services import audit
 from .services import users as users_svc
@@ -484,20 +485,33 @@ def _restore(args) -> int:
     except FileExistsError:
         print("target database or vault is not empty; pass --force to overwrite.")
         return 1
+    except ProjectLockError as exc:
+        print(f"restore failed: {exc}")
+        return 1
     except (OSError, ValueError) as exc:
         print(f"restore failed: {exc}")
         return 1
 
+    try:
+        if report.embedding_model and report.embedding_model != settings.embedding_model:
+            print(f"WARNING: snapshot embedding_model '{report.embedding_model}' differs from "
+                  f"configured '{settings.embedding_model}'. Run 'llm-wiki reindex --reembed'.")
+        ctx = build_context(full=False)  # opens the restored DB and applies any migrations
+        recovered = ctx.docs.recover_pending()
+    except BaseException as exc:
+        try:
+            report.rollback(exc)
+        except (OSError, ValueError, RuntimeError) as rollback_exc:
+            print(f"restore failed: {rollback_exc}")
+            return 1
+        raise AssertionError("restore rollback unexpectedly returned") from exc
+
+    report.finalize()
     for backup in report.backup_cleanup_warnings:
         print(
             "WARNING: restored successfully but backup cleanup failed; "
             f"backup preserved at {backup}"
         )
-    if report.embedding_model and report.embedding_model != settings.embedding_model:
-        print(f"WARNING: snapshot embedding_model '{report.embedding_model}' differs from "
-              f"configured '{settings.embedding_model}'. Run 'llm-wiki reindex --reembed'.")
-    ctx = build_context(full=False)  # opens the restored DB and applies any migrations
-    recovered = ctx.docs.recover_pending()
     print(f"Restored from {src}: schema v{report.schema_version} · {report.doc_count} docs.")
     if recovered:
         print(f"  re-projected {recovered} pending document(s).")
@@ -555,6 +569,15 @@ def _create_mcp_http_app(ctx):
 
 def _serve(args) -> int:
     settings = _apply_serve_overrides(get_settings(), args)
+    try:
+        with ProjectLock(settings.db_path):
+            return _serve_locked(args, settings)
+    except ProjectLockError as exc:
+        print(f"serve failed: {exc}")
+        return 1
+
+
+def _serve_locked(args, settings) -> int:
 
     # Logging is already configured for all commands in _dispatch().
     print("Loading embedding model… (first run downloads it from HuggingFace)")

@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,6 +53,8 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
         relative = "." if path == root else path.relative_to(root).as_posix()
         if path.is_symlink():
             entries[relative] = ("symlink", os.readlink(path))
+        elif path.name == ".llm-wiki.lock":
+            continue
         elif path.is_dir():
             entries[relative] = ("directory", None)
         else:
@@ -283,7 +286,7 @@ def test_restore_rejects_descriptor_and_manifest_corruption(
             if case == "bad-format":
                 manifest["format"] = "another-format"
             elif case == "bad-version":
-                manifest["format_version"] = 2
+                manifest["format_version"] = 3
             elif case == "files-not-list":
                 manifest["files"] = {}
             elif case == "entry-not-dict":
@@ -327,11 +330,20 @@ def test_restore_rejects_unreadable_archive_members(
 
 def _mutate_database_member(members, scratch: Path, mutate) -> list:
     result = []
+    database = b""
     for member, data in members:
         if member.name == "wiki.db":
             scratch.write_bytes(data)
             mutate(scratch)
             data = scratch.read_bytes()
+            database = data
+        elif member.name == "manifest.json":
+            manifest = json.loads(data)
+            manifest["database"] = {
+                "size": len(database),
+                "sha256": hashlib.sha256(database).hexdigest(),
+            }
+            data = json.dumps(manifest).encode()
         result.append((member, data))
     return result
 
@@ -420,6 +432,270 @@ def test_restore_rejects_corrupt_tar_stream(tmp_path):
     _restore_rejects_without_live_changes(archive, tmp_path / "target", "invalid snapshot archive")
 
 
+def test_snapshot_v2_manifest_authenticates_database(snapshot_source):
+    _, archive = snapshot_source
+    with tarfile.open(archive, "r") as source:
+        manifest_file = source.extractfile("manifest.json")
+        database_file = source.extractfile("wiki.db")
+        assert manifest_file is not None and database_file is not None
+        manifest = json.load(manifest_file)
+        database = database_file.read()
+
+    assert manifest["format_version"] == 2
+    assert manifest["database"] == {
+        "size": len(database),
+        "sha256": hashlib.sha256(database).hexdigest(),
+    }
+
+
+def test_restore_rejects_database_digest_mismatch(snapshot_source, tmp_path):
+    _, valid = snapshot_source
+    damaged = tmp_path / "database-digest.tar"
+
+    def corrupt(members):
+        return [
+            (member, data[:-1] + bytes([data[-1] ^ 1]))
+            if member.name == "wiki.db" and data
+            else (member, data)
+            for member, data in members
+        ]
+
+    _rewrite(valid, damaged, corrupt)
+    _restore_rejects_without_live_changes(
+        damaged, tmp_path / "digest-target", "database verification failed"
+    )
+
+
+def test_restore_v1_compatibility_uses_integrity_and_semantic_checks(
+    snapshot_source, tmp_path
+):
+    _, valid = snapshot_source
+    legacy = tmp_path / "legacy-v1.tar"
+
+    def downgrade(members):
+        def edit(manifest):
+            manifest["format_version"] = 1
+            manifest.pop("database")
+
+        return _edit_manifest(members, edit)
+
+    _rewrite(valid, legacy, downgrade)
+    pending = snapshot.restore_snapshot(
+        legacy, tmp_path / "legacy.db", tmp_path / "legacy-vault", force=False
+    )
+    pending.finalize()
+
+    assert pending.doc_count == 1
+
+
+def test_restore_full_integrity_check_rejects_unrelated_page_corruption(
+    snapshot_source, tmp_path
+):
+    _, valid = snapshot_source
+    damaged = tmp_path / "unrelated-page-corruption.tar"
+    scratch = tmp_path / "unrelated.db"
+    corrupted_database = b""
+
+    def corrupt(members):
+        nonlocal corrupted_database
+        result = []
+        for member, data in members:
+            if member.name == "wiki.db":
+                scratch.write_bytes(data)
+                with sqlite3.connect(scratch) as conn:
+                    conn.execute("CREATE TABLE unrelated_payload(value BLOB)")
+                    conn.execute("INSERT INTO unrelated_payload VALUES (zeroblob(8000))")
+                    root_page = conn.execute(
+                        "SELECT rootpage FROM sqlite_master WHERE name='unrelated_payload'"
+                    ).fetchone()[0]
+                database = scratch.read_bytes()
+                page_size = int.from_bytes(database[16:18], "big") or 65536
+                offset = (root_page - 1) * page_size
+                corrupted_database = database[:offset] + b"\xff" + database[offset + 1:]
+                data = corrupted_database
+            elif member.name == "manifest.json":
+                manifest = json.loads(data)
+                manifest["database"] = {
+                    "size": len(corrupted_database),
+                    "sha256": hashlib.sha256(corrupted_database).hexdigest(),
+                }
+                data = json.dumps(manifest).encode()
+            result.append((member, data))
+        return result
+
+    _rewrite(valid, damaged, corrupt)
+    _restore_rejects_without_live_changes(
+        damaged, tmp_path / "integrity-target", "integrity check failed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("constant", "value", "message"),
+    [
+        ("MAX_SNAPSHOT_ARCHIVE_BYTES", 1, "archive size limit"),
+        ("MAX_SNAPSHOT_MEMBERS", 2, "member count limit"),
+        ("MAX_SNAPSHOT_MANIFEST_BYTES", 1, "manifest size limit"),
+        ("MAX_SNAPSHOT_MEMBER_BYTES", 1, "member size limit"),
+        ("MAX_SNAPSHOT_TOTAL_BYTES", 1, "total size limit"),
+    ],
+)
+def test_restore_enforces_archive_extraction_budgets(
+    snapshot_source, tmp_path, monkeypatch, constant, value, message
+):
+    _, archive = snapshot_source
+    monkeypatch.setattr(snapshot, constant, value)
+    _restore_rejects_without_live_changes(
+        archive, tmp_path / f"budget-{constant}", message
+    )
+
+
+def test_restore_report_rejects_actions_after_finalize(snapshot_source, tmp_path):
+    _, archive = snapshot_source
+    pending = snapshot.restore_snapshot(
+        archive, tmp_path / "once.db", tmp_path / "once-vault", force=False
+    )
+    pending.finalize()
+
+    assert pending.finalize() == ()
+    with pytest.raises(RuntimeError, match="no longer pending"):
+        pending.rollback(RuntimeError("too late"))
+
+
+def test_attachment_staging_handles_identity_and_open_failures(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "vault"
+    root.mkdir()
+    attachment = root / "asset.bin"
+    attachment.write_bytes(b"asset")
+    staged = tmp_path / "staged"
+    visible = os.lstat(attachment)
+    real_fstat = snapshot.os.fstat
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fstat",
+        lambda fd: SimpleNamespace(
+            st_mode=visible.st_mode,
+            st_dev=visible.st_dev,
+            st_ino=visible.st_ino + 1,
+            st_size=visible.st_size,
+            st_mtime_ns=visible.st_mtime_ns,
+            st_ctime_ns=visible.st_ctime_ns,
+        ),
+    )
+    assert snapshot._stage_attachment_once(attachment, root, staged) is None
+
+    monkeypatch.setattr(snapshot.os, "fstat", real_fstat)
+    monkeypatch.setattr(snapshot.os, "open", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("open")))
+    assert snapshot._stage_attachment_once(attachment, root, staged) is None
+
+
+def test_snapshot_walk_skips_real_directories(snapshot_source, tmp_path):
+    ctx, _ = snapshot_source
+    folder = ctx.settings.vault_path / "assets"
+    folder.mkdir()
+    (folder / "nested.bin").write_bytes(b"nested")
+    out = tmp_path / "nested.tar"
+
+    snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+
+    with tarfile.open(out) as archive:
+        assert "vault/assets/nested.bin" in archive.getnames()
+
+
+def test_copy_archive_file_enforces_streaming_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MEMBER_BYTES", 1)
+    with pytest.raises(ValueError, match="member size limit"):
+        snapshot._copy_archive_file(io.BytesIO(b"too large"), tmp_path / "payload")
+
+
+def test_manifest_stream_limit_defends_against_size_mismatch(monkeypatch):
+    member = tarfile.TarInfo("manifest.json")
+    member.size = 1
+
+    class Archive:
+        def __iter__(self):
+            return iter([member])
+
+        def extractfile(self, requested):
+            assert requested is member
+            return io.BytesIO(b"{}")
+
+    monkeypatch.setattr(snapshot, "MAX_SNAPSHOT_MANIFEST_BYTES", 1)
+    with pytest.raises(ValueError, match="manifest size limit"):
+        snapshot._read_restore_manifest(Archive())
+
+
+@pytest.mark.parametrize(
+    ("database", "message"),
+    [
+        (None, "invalid manifest database"),
+        ({"size": True, "sha256": "0" * 64}, "database size"),
+        ({"size": 1, "sha256": None}, "database hash"),
+        ({"size": 1, "sha256": "0" * 63}, "database hash"),
+        ({"size": 1, "sha256": "g" * 64}, "database hash"),
+    ],
+)
+def test_restore_rejects_invalid_v2_database_descriptor(
+    snapshot_source, tmp_path, database, message
+):
+    _, valid = snapshot_source
+    damaged = tmp_path / f"bad-database-{hash(str(database))}.tar"
+    _rewrite(
+        valid,
+        damaged,
+        lambda members: _edit_manifest(
+            members, lambda manifest: manifest.update(database=database)
+        ),
+    )
+    _restore_rejects_without_live_changes(damaged, tmp_path / damaged.stem, message)
+
+
+@pytest.mark.parametrize("mode", ["integrity", "schema"])
+def test_staged_database_reports_integrity_and_sql_errors(tmp_path, monkeypatch, mode):
+    class Result:
+        def fetchall(self):
+            return [("broken",)]
+
+    class Connection:
+        row_factory = None
+
+        def execute(self, sql, *args):
+            if sql == "PRAGMA integrity_check":
+                if mode == "integrity":
+                    return Result()
+                return SimpleNamespace(fetchall=lambda: [("ok",)])
+            raise sqlite3.OperationalError("schema read failed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(snapshot.sqlite3, "connect", lambda *args, **kwargs: Connection())
+    with pytest.raises(ValueError, match="integrity check|invalid snapshot database"):
+        snapshot._validate_staged_database(tmp_path / "db", tmp_path, {}, {})
+
+
+def test_restore_staging_setup_failure_cleans_database_and_releases_lock(
+    snapshot_source, tmp_path, monkeypatch
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "setup" / "wiki.db"
+    vault = tmp_path / "setup-vault"
+    monkeypatch.setattr(
+        snapshot.tempfile,
+        "mkdtemp",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("vault staging failed")),
+    )
+
+    with pytest.raises(OSError, match="vault staging failed"):
+        snapshot.restore_snapshot(archive, db_path, vault, force=False)
+
+    assert not list(db_path.parent.glob(f".{db_path.name}.restore-stage-*"))
+    with snapshot.ProjectLock(db_path):
+        pass
+
+
 def test_restore_reports_published_target_removal_failure_and_preserves_originals(
     snapshot_source, tmp_path, monkeypatch
 ):
@@ -491,7 +767,7 @@ def test_restore_surfaces_cleanup_failure_after_successful_publication(
 
     assert len(staged_databases) == 1
     assert not staged_databases[0].exists()
-    assert _tree_snapshot(actual_root) == _tree_snapshot(expected_root)
+    assert _tree_snapshot(actual_root) == {".": ("directory", None), "data": ("directory", None)}
     assert _restore_artifacts(db_path, vault) == set()
 
 
@@ -537,15 +813,11 @@ def test_restore_preserves_primary_error_when_exact_staging_tree_cleanup_fails(
     with pytest.raises(ValueError, match="invalid snapshot database") as caught:
         snapshot.restore_snapshot(damaged, db_path, vault, force=True)
 
-    assert str(caught.value) == "invalid snapshot database"
+    assert str(caught.value).endswith("invalid snapshot database")
     assert len(staged_vaults) == 1
     leftover = staged_vaults[0]
     assert leftover.exists()
-    assert _tree_snapshot(leftover) == {
-        ".": ("directory", None),
-        "asset.bin": ("file", b"asset"),
-        "note.md": ("file", b"# Snapshot\n\nbody"),
-    }
+    assert _tree_snapshot(leftover) == {".": ("directory", None)}
     assert _tree_snapshot(db_path.parent) == before_db
     assert _tree_snapshot(vault) == before_vault
     assert _restore_artifacts(db_path, vault) == {leftover}
