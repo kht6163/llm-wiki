@@ -147,10 +147,10 @@
     var menu = document.createElement("div");
     menu.className = "wiki-ac"; menu.hidden = true;
     document.body.appendChild(menu);
-    var items = [], index = 0, fromPos = -1, timer = null;
+    var items = [], index = 0, fromPos = -1, timer = null, requestSeq = 0;
 
     function isOpen() { return !menu.hidden; }
-    function close() { menu.hidden = true; items = []; index = 0; fromPos = -1; }
+    function close() { requestSeq++; menu.hidden = true; items = []; index = 0; fromPos = -1; }
 
     function paint(coords) {
       menu.innerHTML = "";
@@ -187,6 +187,7 @@
     }
 
     function scan() {
+      var requestId = ++requestSeq;
       var view = api.getView();
       if (!view) { close(); return; }
       var head = view.state.selection.main.head;
@@ -204,9 +205,10 @@
         fetch("/api/complete?q=" + encodeURIComponent(q), { credentials: "same-origin" })
           .then(function (r) { return r.json(); })
           .then(function (d) {
+            if (requestId !== requestSeq) return;
             if (!d || !d.ok || !d.items || !d.items.length) { close(); return; }
             items = d.items; index = 0; paint(coords);
-          }).catch(function () { close(); });
+          }).catch(function () { if (requestId === requestSeq) close(); });
       }, 100);
     }
 

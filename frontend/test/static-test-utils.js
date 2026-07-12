@@ -57,6 +57,9 @@ export function useStaticIsolation() {
     document.documentElement.removeAttribute("data-theme");
     delete window.WIKI;
     delete window.WikiLocalizeTime;
+    delete window.WikiMdEditor;
+    delete window.WikiPalette;
+    delete window.WikiShell;
   });
 }
 
@@ -64,9 +67,12 @@ export async function loadStatic(name) {
   vi.resetModules();
   const modules = {
     datetime: () => import("../../src/llm_wiki/web/static/datetime.js"),
+    editor: () => import("../../src/llm_wiki/web/static/editor.js"),
     outline: () => import("../../src/llm_wiki/web/static/outline.js"),
+    palette: () => import("../../src/llm_wiki/web/static/palette.js"),
     preview: () => import("../../src/llm_wiki/web/static/preview.js"),
     props: () => import("../../src/llm_wiki/web/static/props.js"),
+    realtime: () => import("../../src/llm_wiki/web/static/realtime.js"),
     related: () => import("../../src/llm_wiki/web/static/related.js"),
     tasks: () => import("../../src/llm_wiki/web/static/tasks.js"),
   };

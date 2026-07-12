@@ -9,7 +9,7 @@ export default defineConfig({
       allowExternal: true,
       include: [
         "src/**/*.{js,jsx}",
-        "../src/llm_wiki/web/static/{datetime,preview,props,related,tasks,outline}.js",
+        "../src/llm_wiki/web/static/{datetime,editor,palette,preview,props,realtime,related,tasks,outline}.js",
       ],
       exclude: ["node_modules/**", "coverage/**", "../src/llm_wiki/web/static/vendor/**"],
       reporter: ["text", "json-summary"],

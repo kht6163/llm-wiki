@@ -67,7 +67,7 @@
   function render(q) {
     if (mode === "commands") {
       items = COMMANDS.filter(function (c) { return (!c.keep || c.keep()); })
-        .filter(function (c) { return fuzzy(q, c.label + " " + (c.hint || "")); })
+        .filter(function (c) { return fuzzy(q, c.label + " " + c.hint); })
         .map(function (c) { return { label: c.label, sub: "", run: c.run }; });
       paint();
     } else {
