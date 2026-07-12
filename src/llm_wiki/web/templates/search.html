@@ -2,46 +2,167 @@
 {% from "_icons.html" import icon %}
 {% block title %}검색{% endblock %}
 {% block content %}
-<h1>검색</h1>
-{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
-<form action="/search" method="get" class="searchform" role="search">
-  <input type="search" name="q" value="{{ q }}" placeholder="검색어" aria-label="검색어" autofocus>
-  <select name="mode" aria-label="검색 방식">
-    <option value="hybrid" {{ 'selected' if mode=='hybrid' }}>하이브리드</option>
-    <option value="bm25" {{ 'selected' if mode=='bm25' }}>BM25(어휘)</option>
-    <option value="vector" {{ 'selected' if mode=='vector' }}>의미(벡터)</option>
-  </select>
-  <input type="text" name="folder" value="{{ folder }}" placeholder="폴더(선택)" aria-label="폴더 필터"
-         list="folders" autocomplete="off" size="14">
-  <datalist id="folders">{% for f in folders %}<option value="{{ f }}"></option>{% endfor %}</datalist>
-  <input type="text" name="tag" value="{{ tag }}" placeholder="태그(선택)" aria-label="태그 필터" size="10">
-  <select name="top_k" aria-label="결과 수">
-    {% for n in [10, 20, 50] %}<option value="{{ n }}" {{ 'selected' if top_k==n }}>{{ n }}개</option>{% endfor %}
-  </select>
-  <button class="primary">검색</button>
-</form>
-{% if q %}<p class="muted" role="status">{{ results|length }}건{% if truncated %} · 상위 {{ top_k }}개까지 표시(더 보려면 결과 수를 늘리세요){% endif %}</p>{% endif %}
-{% if results %}
-<ul class="results">
-  {% for r in results %}
+{% set active_tags = search_page.filters.tags if search_page else request.query_params.getlist('tag') %}
+{% set active_folder = search_page.filters.folder if search_page else folder %}
+{% set active_mode = search_page.filters.mode if search_page else mode %}
+{% if search_page %}
+  {% set active_per_page = search_page.per_page %}
+{% else %}
+  {% set requested_per_page = request.query_params.get('per_page') %}
+  {% set active_per_page = requested_per_page|int if requested_per_page else top_k %}
+  {% if active_per_page < 1 %}{% set active_per_page = 1 %}{% endif %}
+  {% if active_per_page > 50 %}{% set active_per_page = 50 %}{% endif %}
+{% endif %}
+<section class="search-workbench" id="search-workbench">
+  <header class="search-head">
+    <div>
+      <h1>검색</h1>
+      <p class="search-kicker">문서 본문과 메타데이터를 정밀하게 좁힙니다.</p>
+    </div>
+    <details class="search-help" id="search-help">
+      <summary>검색 연산자 도움말 <kbd>?</kbd></summary>
+      <dl>
+        <div><dt><code>title:</code></dt><dd><code>title:"API guide"</code> 제목 포함</dd></div>
+        <div><dt><code>path:</code></dt><dd><code>path:notes/*</code> 경로 또는 글롭</dd></div>
+        <div><dt><code>tag:</code></dt><dd><code>tag:release</code> 정확한 태그</dd></div>
+        <div><dt><code>has:</code></dt><dd><code>has:link</code> 링크·백링크·태그 보유</dd></div>
+      </dl>
+    </details>
+  </header>
+
+  {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+  <form action="/search" method="get" class="searchform" role="search">
+    <label class="search-query-field" for="search-query">
+      <span class="visually-hidden">검색어</span>
+      <input id="search-query" type="search" name="q" value="{{ q }}"
+             placeholder="검색어 또는 title: path: tag: has:" autofocus>
+    </label>
+    <label>
+      <span class="visually-hidden">검색 방식</span>
+      <select name="mode" aria-label="검색 방식">
+        <option value="hybrid" {{ 'selected' if active_mode=='hybrid' }}>하이브리드</option>
+        <option value="bm25" {{ 'selected' if active_mode=='bm25' }}>BM25(어휘)</option>
+        <option value="vector" {{ 'selected' if active_mode=='vector' }}>의미(벡터)</option>
+      </select>
+    </label>
+    <label>
+      <span class="visually-hidden">폴더 필터</span>
+      <input type="text" name="folder" value="{{ active_folder }}" placeholder="폴더"
+             aria-label="폴더 필터" list="folders" autocomplete="off">
+    </label>
+    <datalist id="folders">{% for f in folders %}<option value="{{ f }}"></option>{% endfor %}</datalist>
+    <div class="search-tag-fields" aria-label="요청 태그 필터">
+      {% for value in active_tags %}
+      <input type="text" name="tag" value="{{ value }}" aria-label="태그 필터 {{ loop.index }}">
+      {% else %}
+      <input type="text" name="tag" value="" placeholder="태그" aria-label="태그 필터">
+      {% endfor %}
+    </div>
+    <label>
+      <span class="visually-hidden">페이지당 결과 수</span>
+      <select name="per_page" aria-label="페이지당 결과 수">
+        {% if active_per_page not in [10, 20, 50] %}<option value="{{ active_per_page }}" selected>{{ active_per_page }}개</option>{% endif %}
+        {% for n in [10, 20, 50] %}<option value="{{ n }}" {{ 'selected' if active_per_page==n }}>{{ n }}개</option>{% endfor %}
+      </select>
+    </label>
+    <button class="primary" type="submit">검색</button>
+  </form>
+
+  {% if search_page and (search_page.filters.normalized or active_folder or active_tags) %}
+  <div class="search-filters" aria-label="적용된 검색 필터">
+    <span class="search-filters-label">필터</span>
+    {% for filter in search_page.filters.normalized %}
+    <button class="filter-chip" type="button" data-remove-filter="query"
+            data-filter-index="{{ loop.index0 }}"
+            data-filter-operator="{{ filter.operator }}" data-filter-value="{{ filter.value }}"
+            aria-label="필터 제거: {{ filter.operator }}:{{ filter.value }}">
+      <code>{{ filter.operator }}:{{ filter.value }}</code><span aria-hidden="true">×</span>
+    </button>
+    {% endfor %}
+    {% if active_folder %}
+    <button class="filter-chip" type="button" data-remove-filter="folder"
+            aria-label="필터 제거: folder:{{ active_folder }}">
+      <code>folder:{{ active_folder }}</code><span aria-hidden="true">×</span>
+    </button>
+    {% endif %}
+    {% for value in active_tags %}
+    <button class="filter-chip" type="button" data-remove-filter="tag"
+            data-request-tag="{{ value }}" data-filter-index="{{ loop.index0 }}"
+            aria-label="필터 제거: tag:{{ value }}">
+      <code>tag:{{ value }}</code><span aria-hidden="true">×</span>
+    </button>
+    {% endfor %}
+  </div>
+  <form action="/search" method="get" id="search-remove-form" hidden>
+    <input name="q" value="{{ search_page.filters.query }}">
+    <input name="mode" value="{{ active_mode }}">
+    {% if active_folder %}<input name="folder" value="{{ active_folder }}">{% endif %}
+    {% for value in active_tags %}<input name="tag" value="{{ value }}">{% endfor %}
+    <input name="page" value="{{ search_page.page }}">
+    <input name="per_page" value="{{ search_page.per_page }}">
+  </form>
+  {% endif %}
+
+  {% if q %}
+  <p class="search-status muted" role="status" aria-live="polite">
+    {% if search_page and search_page.bounded %}
+      600건 검색 범위 상한에 도달했습니다 · 정확한 전체 건수는 알 수 없습니다
+    {% elif search_page and search_page.total_or_more is not none %}
+      총 <span class="count">{{ search_page.total_or_more }}</span>건
+    {% elif search_page %}
+      이 페이지 <span class="count">{{ results|length }}</span>건 · 정확한 전체 건수는 알 수 없습니다
+    {% else %}
+      검색 결과를 표시할 수 없습니다
+    {% endif %}
+  </p>
+  {% endif %}
+
+  {% if results %}
+  <ul class="results">
+    {% for r in results %}
     <li>
-      {# Deep-link to the matched section when known (anchor mirrors outline.js). #}
-      <a class="title" href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.title }}</a>
-      <span class="score">{{ '%.4f'|format(r.score) }}</span>
-      <span class="path">{{ r.path }}</span>
+      <div class="result-head">
+        <a class="title" href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.title }}</a>
+        <span class="path">{{ r.path }}</span>
+      </div>
       <div class="snippet">{{ r.snippet|snippet|safe }}</div>
-      {% if r.heading_path or r.heading %}
-        <div class="muted">↳ <a href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.heading_path or r.heading }}</a></div>
+      {% if r.tags or r.updated_at or r.backlinks_count is not none or r.outlinks_count is not none or r.content_length is not none or r.heading_path or r.heading or r.char_start is not none or r.context_preview %}
+      <details class="result-metadata">
+        <summary>메타데이터</summary>
+        <dl class="result-metadata-grid">
+          {% if r.tags %}<div><dt>태그</dt><dd>{% for value in r.tags %}<span class="tag">#{{ value }}</span>{% endfor %}</dd></div>{% endif %}
+          {% if r.updated_at %}<div><dt>수정</dt><dd>{{ r.updated_at|dt }}</dd></div>{% endif %}
+          {% if r.backlinks_count is not none or r.outlinks_count is not none %}<div><dt>링크</dt><dd><span class="count">{{ r.backlinks_count|default(0, true) }}</span> 수신 · <span class="count">{{ r.outlinks_count|default(0, true) }}</span> 발신</dd></div>{% endif %}
+          {% if r.content_length is not none %}<div><dt>본문</dt><dd><span class="count">{{ r.content_length }}</span>자</dd></div>{% endif %}
+          {% if r.heading_path or r.heading or r.char_start is not none or r.context_preview %}
+          <div class="result-match"><dt>일치 위치</dt><dd>
+            {% if r.heading_path or r.heading %}<a href="/doc/{{ r.path|urlpath }}{% if r.anchor %}#{{ r.anchor }}{% endif %}">{{ r.heading_path or r.heading }}</a>{% endif %}
+            {% if r.char_start is not none %}<span class="result-range">문자 {{ r.char_start }}{% if r.char_end is not none %}–{{ r.char_end }}{% endif %}</span>{% endif %}
+            {% if r.context_preview %}<span class="result-context">{{ r.context_preview }}</span>{% endif %}
+          </dd></div>
+          {% endif %}
+        </dl>
+      </details>
       {% endif %}
     </li>
-  {% endfor %}
-</ul>
-{% elif q %}
-<div class="empty-state">
-  <span class="empty-icon">{{ icon("search-x") }}</span>
-  <p class="empty-title">검색 결과가 없습니다</p>
-  <p class="empty-text">‘{{ q }}’에 맞는 문서를 찾지 못했습니다. 다른 검색어를 쓰거나 검색 방식(하이브리드·BM25·벡터)을 바꿔 보세요.</p>
-</div>
-{% endif %}
+    {% endfor %}
+  </ul>
+  {% elif q and not error %}
+  <div class="empty-state">
+    <span class="empty-icon">{{ icon("search-x") }}</span>
+    <p class="empty-title">검색 결과가 없습니다</p>
+    <p class="empty-text">‘{{ q }}’에 맞는 문서를 찾지 못했습니다. 검색어나 필터를 조정해 보세요.</p>
+  </div>
+  {% endif %}
+
+  {% if search_page and (search_page.has_prev or search_page.has_next) %}
+  <nav class="pager" aria-label="검색 결과 페이지">
+    {% if search_page.prev_url %}<a rel="prev" href="{{ search_page.prev_url }}">← 이전</a>{% else %}<span aria-hidden="true"></span>{% endif %}
+    <span><span class="count">{{ search_page.page }}</span> 페이지</span>
+    {% if search_page.next_url %}<a rel="next" href="{{ search_page.next_url }}">다음 →</a>{% else %}<span aria-hidden="true"></span>{% endif %}
+  </nav>
+  {% endif %}
+</section>
 <script src="{{ static('preview.js') }}"></script>
+<script src="{{ static('search.js') }}"></script>
 {% endblock %}

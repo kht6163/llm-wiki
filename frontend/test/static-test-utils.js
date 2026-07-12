@@ -59,6 +59,7 @@ export function useStaticIsolation() {
     delete window.WikiLocalizeTime;
     delete window.WikiMdEditor;
     delete window.WikiPalette;
+    delete window.WikiSearch;
     delete window.WikiShell;
   });
 }
@@ -74,6 +75,7 @@ export async function loadStatic(name) {
     props: () => import("../../src/llm_wiki/web/static/props.js"),
     realtime: () => import("../../src/llm_wiki/web/static/realtime.js"),
     related: () => import("../../src/llm_wiki/web/static/related.js"),
+    search: () => import("../../src/llm_wiki/web/static/search.js"),
     shell: () => import("../../src/llm_wiki/web/static/shell.js"),
     tasks: () => import("../../src/llm_wiki/web/static/tasks.js"),
   };

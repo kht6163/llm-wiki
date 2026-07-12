@@ -395,14 +395,68 @@ select {
 .login label { display: flex; flex-direction: column; gap: 4px; }
 .login input { padding: 8px 10px; }
 
-.searchform { display: flex; gap: 8px; margin-bottom: 16px; }
-.searchform input[type=search] { flex: 1; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
-.results { list-style: none; padding: 0; }
-.results li { padding: 10px 0; border-bottom: 1px solid var(--line); }
-.results .title { font-weight: 600; }
-.results .score { color: var(--fg-muted); font-size: 0.76em; margin-left: 8px;
-  font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
-.results .snippet { font-size: 0.9em; color: var(--fg-muted); margin-top: 2px; }
+/* Search workbench. */
+.search-head { display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 18px; margin-bottom: 14px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.search-head h1 { margin: 0; }
+.search-kicker { margin: 1px 0 0; color: var(--fg-muted); font-size: 0.82em; }
+.search-help { position: relative; flex: 0 0 auto; font-size: 0.82em; }
+.search-help > summary, .result-metadata > summary { cursor: pointer; color: var(--fg-muted); }
+.search-help > summary { padding: 4px 8px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: transparent; }
+.search-help > summary:hover { color: var(--accent-hover); border-color: var(--accent); }
+.search-help > summary kbd { margin-left: 4px; }
+.search-help dl { position: absolute; z-index: var(--z-dropdown); right: 0; width: min(440px, 88vw);
+  margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--pop); box-shadow: var(--shadow-pop); }
+.search-help dl > div { display: grid; grid-template-columns: 5.5em 1fr; gap: 8px;
+  padding: 4px 0; border-bottom: 1px solid var(--line); }
+.search-help dl > div:last-child { border-bottom: 0; }
+.search-help dt, .search-help dd { margin: 0; }
+.search-help dd { color: var(--fg-muted); }
+
+.searchform { display: grid;
+  grid-template-columns: minmax(240px, 1fr) auto minmax(110px, 0.34fr) minmax(105px, 0.3fr) auto auto;
+  gap: 7px; align-items: start; margin-bottom: 10px; }
+.searchform label { min-width: 0; }
+.searchform input, .searchform select { width: 100%; min-width: 0; }
+.searchform input[type=search] { padding: 7px 10px; }
+.search-tag-fields { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.searchform button { white-space: nowrap; }
+.search-filters { display: flex; align-items: center; flex-wrap: wrap; gap: 5px;
+  min-height: 29px; margin-bottom: 6px; }
+.search-filters-label { color: var(--fg-muted); font-size: 0.76em; font-weight: 600;
+  letter-spacing: 0.03em; text-transform: uppercase; }
+.filter-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--inset);
+  color: var(--fg-muted); cursor: pointer; font-size: 0.78em; }
+.filter-chip code { padding: 0; border: 0; background: transparent; color: inherit; font-size: 1em; }
+.filter-chip:hover { color: var(--accent-hover); border-color: var(--accent); background: var(--accent-soft); }
+.search-status { margin: 6px 0 2px; font-size: 0.79em; }
+
+.results { list-style: none; padding: 0; margin-top: 4px; }
+.results > li { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.result-head { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.results .title { font-weight: 650; line-height: 1.35; }
+.result-head .path { margin-left: auto; min-width: 0; text-align: right; overflow-wrap: anywhere; }
+.results .snippet { color: var(--fg-muted); margin-top: 2px; font-size: 0.88em;
+  line-height: 1.5; overflow-wrap: anywhere; }
+.results .snippet mark { background: var(--warn-soft); color: var(--fg); border-radius: 2px; padding: 0 1px; }
+.result-metadata { margin-top: 4px; font-size: 0.78em; }
+.result-metadata > summary { width: max-content; font-family: var(--font-mono); }
+.result-metadata-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px 12px; margin-top: 5px; padding: 7px 9px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); background: var(--inset); }
+.result-metadata-grid > div { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px; }
+.result-metadata-grid dt { color: var(--fg-faint); font-weight: 600; }
+.result-metadata-grid dd { margin: 0; min-width: 0; font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.result-metadata-grid .tag { margin-right: 3px; background: var(--bg); }
+.result-metadata-grid .result-match { grid-column: 1 / -1; }
+.result-match dd { display: flex; align-items: baseline; flex-wrap: wrap; gap: 5px 10px; }
+.result-range { color: var(--fg-muted); font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums; }
+.result-context { display: block; flex-basis: 100%; color: var(--fg-muted); font-family: var(--font-sans); }
 
 .newkey { background: var(--success-soft); border: 1px solid color-mix(in srgb, var(--success) 38%, transparent);
   border-radius: var(--r-md); padding: 12px 14px; margin-bottom: 16px; }
@@ -472,6 +526,10 @@ kbd { background: var(--soft); border: 1px solid var(--line); border-bottom-widt
    column tables stop overflowing the content column. Each cell shows its column name
    from `data-label`, so meaning survives the loss of the header row. */
 @media (max-width: 860px) {
+  .search-head { align-items: stretch; flex-wrap: wrap; }
+  .searchform { grid-template-columns: 1fr; }
+  .searchform button { justify-self: start; }
+  .result-metadata-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .revtable, .revtable tbody, .revtable tr, .revtable td,
   .broken, .broken tbody, .broken tr, .broken td { display: block; width: 100%; }
   .revtable thead, .broken thead { display: none; }

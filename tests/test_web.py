@@ -3,12 +3,15 @@
 Authorization lives inline in each handler, so these route-level tests are the
 only thing that catches a missing guard."""
 import re
+from pathlib import Path
 from urllib.parse import quote
 
 import pytest
 from starlette.testclient import TestClient
 
 from llm_wiki.db import Database
+from llm_wiki.search import SearchResult
+from llm_wiki.services.documents import SearchFilters, SearchPage
 from llm_wiki.web import create_web_app
 
 
@@ -113,6 +116,159 @@ def test_search_accepts_repeated_tags_and_stable_page_two(client):
     ranked_paths = re.findall(r'<span class="path">([^<]+)</span>', all_results)
     assert re.findall(r'<span class="path">([^<]+)</span>', page_results) == ranked_paths[2:4]
     assert "excluded.md" not in page_results
+
+
+def test_search_workbench_renders_operator_help_repeated_chips_and_page_state(client):
+    login(client, "alice")
+    for index in range(3):
+        create_doc(
+            client,
+            f"notes/search-ui-{index}.md",
+            "---\ntags: [release, todo]\n---\n\n# Needle\n\nsearch ui needle",
+        )
+
+    response = client.get("/search", params=[
+        ("q", "search ui needle tag:release tag:release has:tag"),
+        ("mode", "bm25"),
+        ("folder", "notes"),
+        ("tag", "release"),
+        ("tag", "todo"),
+        ("tag", "release"),
+        ("page", "2"),
+        ("per_page", "1"),
+    ])
+
+    assert response.status_code == 200
+    body = response.text
+    assert '<details class="search-help"' in body
+    for operator in ("title:", "path:", "tag:", "has:"):
+        assert operator in body
+    assert body.count('data-filter-operator="tag" data-filter-value="release"') == 2
+    assert body.count('data-request-tag="release"') == 2
+    assert 'aria-label="필터 제거: tag:release"' in body
+    assert 'aria-label="검색 결과 페이지"' in body
+    assert "per_page=1" in body and "tag=release" in body and "tag=todo" in body
+    assert 'src="/static/search.js?' in body
+
+
+def test_search_result_keeps_primary_hierarchy_and_hides_optional_metadata(client):
+    login(client, "alice")
+    create_doc(
+        client,
+        "meta-result.md",
+        "---\ntags: [release]\n---\n\n# Search heading\n\nmetadata needle [[target]]",
+    )
+    create_doc(client, "target.md", "# Target\n\nmetadata target")
+
+    body = client.get("/search", params={"q": "metadata needle", "mode": "bm25"}).text
+    results = body.split('<ul class="results">')[1].split("</ul>")[0]
+    assert 'class="title"' in results
+    assert '<span class="path">meta-result.md</span>' in results
+    assert 'class="snippet"' in results
+    assert 'class="score"' not in results and "%" not in results
+    assert '<details class="result-metadata"' in results
+    assert '<dl class="result-metadata-grid">' in results
+    assert "태그" in results and "수정" in results and "링크" in results and "본문" in results
+    assert "일치 위치" in results
+
+    empty = client.get("/search", params={"q": "missing-search-metadata", "mode": "bm25"}).text
+    assert 'class="result-metadata"' not in empty
+    assert 'role="status"' in empty
+
+
+def test_search_result_omits_metadata_disclosure_when_no_optional_data_exists(
+    client, ctx, monkeypatch,
+):
+    login(client, "alice")
+    result = SearchResult(
+        path="plain.md",
+        title="Plain",
+        score=0.25,
+        snippet="plain needle",
+        heading=None,
+        version=1,
+    )
+    page = SearchPage(
+        items=(result,),
+        total_or_more=1,
+        page=1,
+        per_page=20,
+        has_prev=False,
+        has_next=False,
+        bounded=False,
+        filters=SearchFilters("plain needle", "bm25", "", (), ()),
+    )
+    monkeypatch.setattr(ctx.docs, "search_workbench_page", lambda *args, **kwargs: page)
+
+    body = client.get("/search", params={"q": "plain needle", "mode": "bm25"}).text
+    results = body.split('<ul class="results">')[1].split("</ul>")[0]
+    assert "plain.md" in results
+    assert 'class="result-metadata"' not in results
+
+
+def test_search_bounded_copy_never_claims_an_exact_total(client, ctx, monkeypatch):
+    login(client, "alice")
+    original = ctx.docs.search_workbench_page
+
+    def bounded(*args, **kwargs):
+        page = original(*args, **kwargs)
+        return type(page)(
+            items=page.items,
+            total_or_more=None,
+            page=page.page,
+            per_page=page.per_page,
+            has_prev=page.has_prev,
+            has_next=False,
+            bounded=True,
+            filters=page.filters,
+        )
+
+    monkeypatch.setattr(ctx.docs, "search_workbench_page", bounded)
+    body = client.get("/search", params={"q": "bounded-copy", "mode": "bm25"}).text
+    assert "600건 검색 범위 상한" in body
+    assert "정확한 전체 건수는 알 수 없습니다" in body
+    assert "총 600건" not in body
+
+
+def test_search_malformed_state_keeps_accessible_workbench_shell(client):
+    login(client, "alice")
+    response = client.get("/search", params=[
+        ("q", "needle has:unknown"),
+        ("mode", "bm25"),
+        ("folder", "notes"),
+        ("tag", "one"),
+        ("tag", "two"),
+        ("per_page", "10"),
+    ])
+
+    assert response.status_code == 400
+    assert 'role="alert"' in response.text
+    assert 'role="search"' in response.text
+    assert '<details class="search-help"' in response.text
+    assert 'aria-label="검색 방식"' in response.text
+    assert response.text.count('name="tag" value="one"') == 1
+    assert response.text.count('name="tag" value="two"') == 1
+    assert '<option value="10" selected>10개</option>' in response.text
+
+    custom_size = client.get("/search", params={
+        "q": "missing-custom-page-size",
+        "mode": "bm25",
+        "per_page": "17",
+    })
+    assert '<option value="17" selected>17개</option>' in custom_size.text
+
+
+def test_search_workbench_css_uses_tokens_and_860px_structural_mobile_rules():
+    css = (Path(__file__).parents[1] / "src/llm_wiki/web/static/style.css").read_text()
+    workbench = css.split("/* Search workbench. */", 1)[1]
+
+    assert "var(--inset)" in workbench
+    assert "var(--line)" in workbench
+    assert "var(--accent)" in workbench
+    assert "@media (max-width: 860px)" in workbench
+    assert ".searchform" in workbench and "grid-template-columns: 1fr" in workbench
+    assert ".result-head .path { margin-left: auto; min-width: 0;" in workbench
+    assert "prefers-reduced-motion" in css
 
 
 def test_view_renders_frontmatter_as_properties_panel(client):
