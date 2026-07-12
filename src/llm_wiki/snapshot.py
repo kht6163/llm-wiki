@@ -12,7 +12,7 @@ import tarfile
 import tempfile
 import unicodedata
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -33,7 +33,7 @@ MAX_SNAPSHOT_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SNAPSHOT_MEMBER_BYTES = 8 * 1024 * 1024 * 1024
 MAX_SNAPSHOT_TOTAL_BYTES = 16 * 1024 * 1024 * 1024
 _RESTORE_JOURNAL_FORMAT = "llm-wiki-restore-journal"
-_RESTORE_JOURNAL_VERSION = 1
+_RESTORE_JOURNAL_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -52,12 +52,10 @@ class RestoreReport:
     backup_cleanup_warnings: tuple[Path, ...] = ()
     _journal: _RestoreJournal | None = None
 
-    def finalize(self, *, release_lock: bool = True) -> tuple[Path, ...]:
+    def finalize(self) -> tuple[Path, ...]:
         """Commit a pending restore by removing the retained original targets."""
         if self._journal is not None:
-            self.backup_cleanup_warnings = self._journal.finalize(
-                release_lock=release_lock
-            )
+            self.backup_cleanup_warnings = self._journal.finalize()
             self._journal = None
         return self.backup_cleanup_warnings
 
@@ -75,7 +73,7 @@ class RestoreRollbackError(ValueError):
     def __init__(
         self,
         publish_error: BaseException,
-        rollback_errors: list[OSError],
+        rollback_errors: Sequence[BaseException],
         backup_paths: tuple[Path, ...],
     ) -> None:
         self.publish_error = publish_error
@@ -104,6 +102,20 @@ class RestorePreparationError(ValueError):
         locations = ", ".join(str(path) for path in staging_paths) or "unknown locations"
         super().__init__(
             f"{primary_error}; staging cleanup also failed; remnants preserved at {locations}"
+        )
+
+
+class SnapshotArchiveReadError(ValueError):
+    """Archive processing failed and descriptor finalization also failed."""
+
+    def __init__(
+        self, primary_error: BaseException, cleanup_errors: list[BaseException]
+    ) -> None:
+        self.primary_error = primary_error
+        self.cleanup_errors = tuple(cleanup_errors)
+        super().__init__(
+            f"{primary_error}; snapshot archive descriptor cleanup also failed: "
+            f"{cleanup_errors[0]}"
         )
 
 
@@ -230,12 +242,12 @@ def _verify_archive(path: Path, files: list[_ArchiveFile]) -> None:
             archived = tar.extractfile(file.path)
             if archived is None:
                 raise RuntimeError(f"snapshot file verification failed: {file.path}")
-            digest = hashlib.sha256()
+            file_digest = hashlib.sha256()
             size = 0
             while chunk := archived.read(_COPY_CHUNK_SIZE):
-                digest.update(chunk)
+                file_digest.update(chunk)
                 size += len(chunk)
-            if size != file.size or digest.hexdigest() != file.sha256:
+            if size != file.size or file_digest.hexdigest() != file.sha256:
                 raise RuntimeError(f"snapshot file verification failed: {file.path}")
 
 
@@ -365,13 +377,26 @@ def write_snapshot(
                     },
                     "files": [file.manifest_entry for file in archive_files],
                 }
+                manifest_data = json.dumps(
+                    manifest, ensure_ascii=False, indent=2
+                ).encode("utf-8")
+                if len(archive_files) + 2 > MAX_SNAPSHOT_MEMBERS:
+                    raise ValueError("snapshot member count limit exceeded")
+                if len(manifest_data) > MAX_SNAPSHOT_MANIFEST_BYTES:
+                    raise ValueError("snapshot manifest size limit exceeded")
+                member_sizes = [
+                    database_size,
+                    len(manifest_data),
+                    *(file.size for file in archive_files),
+                ]
+                if any(size > MAX_SNAPSHOT_MEMBER_BYTES for size in member_sizes):
+                    raise ValueError("snapshot member size limit exceeded")
+                if sum(member_sizes) > MAX_SNAPSHOT_TOTAL_BYTES:
+                    raise ValueError("snapshot total size limit exceeded")
                 with tarfile.open(temporary_out, "w") as tar:
                     tar.add(cloned_db, arcname="wiki.db")
                     for file in archive_files:
                         _add_staged_file(tar, file)
-                    manifest_data = json.dumps(
-                        manifest, ensure_ascii=False, indent=2
-                    ).encode("utf-8")
                     _add_bytes(tar, "manifest.json", manifest_data)
                 _verify_archive(
                     temporary_out,
@@ -386,6 +411,8 @@ def write_snapshot(
                         *archive_files,
                     ],
                 )
+                if temporary_out.stat().st_size > MAX_SNAPSHOT_ARCHIVE_BYTES:
+                    raise ValueError("snapshot archive size limit exceeded")
             if force:
                 os.replace(temporary_out, out)
             else:
@@ -433,7 +460,7 @@ def _copy_archive_file(source: IO[bytes], target: Path) -> tuple[int, str]:
 def _open_stable_snapshot_archive(path: Path) -> Iterator[IO[bytes]]:
     fd = -1
     source: IO[bytes] | None = None
-    primary_error = False
+    primary_error: BaseException | None = None
     try:
         visible = os.lstat(path)
         if not stat.S_ISREG(visible.st_mode) or stat.S_ISLNK(visible.st_mode):
@@ -456,21 +483,35 @@ def _open_stable_snapshot_archive(path: Path) -> Iterator[IO[bytes]]:
         fd = -1
         try:
             yield source
-        except BaseException:
-            primary_error = True
-            raise
-        finally:
+        except BaseException as exc:
+            primary_error = exc
+        cleanup_errors: list[BaseException] = []
+        try:
             after = os.fstat(source.fileno())
-            source.close()
-            if not primary_error and _stat_identity(before) != _stat_identity(after):
-                raise ValueError("snapshot archive changed while reading")
+            if _stat_identity(before) != _stat_identity(after):
+                cleanup_errors.append(
+                    ValueError("snapshot archive changed while reading")
+                )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        current_source, source = source, None
+        try:
+            current_source.close()
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if primary_error is not None:
+            if cleanup_errors:
+                raise SnapshotArchiveReadError(
+                    primary_error, cleanup_errors
+                ) from primary_error
+            raise primary_error
+        if cleanup_errors:
+            raise cleanup_errors[0]
     except OSError as exc:
-        if primary_error:
+        if primary_error is not None:
             raise
         raise ValueError("snapshot archive must be a stable regular file") from exc
     finally:
-        if source is not None and not source.closed:
-            source.close()
         if fd >= 0:
             os.close(fd)
 
@@ -715,6 +756,66 @@ def _fsync_staging(staged_db: Path, staged_vault: Path) -> None:
         _fsync_directory(directory)
 
 
+def _path_fingerprint(path: Path) -> tuple[int, int, int, int, str]:
+    """Return a stable identity/content proof, rejecting symlinks and special files."""
+    visible = os.lstat(path)
+    kind = stat.S_IFMT(visible.st_mode)
+    if stat.S_ISLNK(visible.st_mode):
+        raise ValueError(f"restore target must not be a symlink: {path}")
+    if stat.S_ISREG(visible.st_mode):
+        fd = -1
+        try:
+            fd = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+            )
+            before = os.fstat(fd)
+            if _stat_identity(visible) != _stat_identity(before):
+                raise ValueError(f"restore target identity changed: {path}")
+            file_digest = hashlib.sha256()
+            size = 0
+            while chunk := os.read(fd, _COPY_CHUNK_SIZE):
+                file_digest.update(chunk)
+                size += len(chunk)
+            after = os.fstat(fd)
+            if _stat_identity(before) != _stat_identity(after) or size != before.st_size:
+                raise ValueError(f"restore target changed while hashing: {path}")
+            return before.st_dev, before.st_ino, kind, size, file_digest.hexdigest()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    if not stat.S_ISDIR(visible.st_mode):
+        raise ValueError(f"restore target must be a regular file or directory: {path}")
+    entries: list[tuple[object, ...]] = []
+    for child in sorted(path.rglob("*"), key=lambda item: item.as_posix()):
+        relative = child.relative_to(path).as_posix()
+        child_visible = os.lstat(child)
+        if stat.S_ISDIR(child_visible.st_mode):
+            entries.append(
+                (
+                    relative,
+                    "directory",
+                    child_visible.st_dev,
+                    child_visible.st_ino,
+                )
+            )
+        elif stat.S_ISREG(child_visible.st_mode):
+            fingerprint = _path_fingerprint(child)
+            entries.append((relative, "file", *fingerprint))
+        else:
+            raise ValueError(f"restore vault contains a symlink or special file: {child}")
+    after = os.lstat(path)
+    if _stat_identity(visible) != _stat_identity(after):
+        raise ValueError(f"restore target changed while hashing: {path}")
+    tree_digest = hashlib.sha256(
+        json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return visible.st_dev, visible.st_ino, kind, len(entries), tree_digest
+
+
 @dataclass
 class _RestoreTarget:
     target: Path
@@ -722,6 +823,7 @@ class _RestoreTarget:
     had_original: bool
     backup_identity: tuple[int, int, int] | None = None
     target_identity: tuple[int, int, int] | None = None
+    original_fingerprint: tuple[int, int, int, int, str] | None = None
 
     @property
     def serialized(self) -> dict[str, object]:
@@ -734,6 +836,9 @@ class _RestoreTarget:
             else None,
             "target_identity": list(self.target_identity)
             if self.target_identity is not None
+            else None,
+            "original_fingerprint": list(self.original_fingerprint)
+            if self.original_fingerprint is not None
             else None,
         }
 
@@ -809,6 +914,30 @@ class _RestoreJournal:
             ):
                 raise ValueError(f"restore live target identity changed: {item.target}")
             visible_backup = self._visible(item.backup)
+            if item.had_original and item.original_fingerprint is None:
+                raise ValueError(f"restore original fingerprint is missing: {item.target}")
+            if self.state == "prepared" and item.had_original:
+                if visible_backup is not None and visible_target is not None:
+                    raise ValueError(
+                        f"restore prepared target and backup both exist: {item.target}"
+                    )
+                original_path = item.backup if visible_backup is not None else item.target
+                if self._visible(original_path) is None:
+                    raise ValueError(f"restore original target is missing: {item.target}")
+                if _path_fingerprint(original_path) != item.original_fingerprint:
+                    raise ValueError(
+                        f"restore original fingerprint changed: {original_path}"
+                    )
+            if (
+                self.state == "rolling_back"
+                and item.had_original
+                and visible_backup is None
+                and visible_target is not None
+                and _path_fingerprint(item.target) != item.original_fingerprint
+            ):
+                raise ValueError(
+                    f"restore original fingerprint changed: {item.target}"
+                )
             if visible_backup is None:
                 continue
             if stat.S_ISLNK(visible_backup.st_mode):
@@ -823,6 +952,11 @@ class _RestoreJournal:
             )
             if item.backup_identity is not None and identity != item.backup_identity:
                 raise ValueError(f"restore backup identity changed: {item.backup}")
+            if (
+                item.original_fingerprint is not None
+                and _path_fingerprint(item.backup) != item.original_fingerprint
+            ):
+                raise ValueError(f"restore backup fingerprint changed: {item.backup}")
 
     def _rollback_files(self) -> list[OSError]:
         rollback_errors: list[OSError] = []
@@ -885,7 +1019,11 @@ class _RestoreJournal:
 
     def rollback(self, cause: BaseException) -> None:
         try:
-            rollback_errors = self._rollback_files()
+            try:
+                file_errors = self._rollback_files()
+                rollback_errors: list[BaseException] = [*file_errors]
+            except ValueError as exc:
+                rollback_errors = [exc]
             if rollback_errors:
                 preserved = tuple(
                     item.backup
@@ -1007,6 +1145,18 @@ def _load_restore_journal(
             and all(isinstance(value, int) for value in raw_target_identity)
             else None
         )
+        raw_original_fingerprint = raw_target.get("original_fingerprint")
+        original_fingerprint = (
+            tuple(raw_original_fingerprint)
+            if isinstance(raw_original_fingerprint, list)
+            and len(raw_original_fingerprint) == 5
+            and all(
+                isinstance(value, int)
+                for value in raw_original_fingerprint[:4]
+            )
+            and isinstance(raw_original_fingerprint[4], str)
+            else None
+        )
         if (
             target != expected
             or backup.parent != expected.parent
@@ -1014,6 +1164,11 @@ def _load_restore_journal(
             or not isinstance(had_original, bool)
             or (raw_identity is not None and backup_identity is None)
             or (raw_target_identity is not None and target_identity is None)
+            or (had_original and original_fingerprint is None)
+            or (
+                raw_original_fingerprint is not None
+                and original_fingerprint is None
+            )
         ):
             raise ValueError(f"invalid restore journal: {path}")
         targets.append(
@@ -1023,6 +1178,7 @@ def _load_restore_journal(
                 had_original,
                 backup_identity,
                 target_identity,
+                original_fingerprint,
             )
         )
     return _RestoreJournal(
@@ -1081,10 +1237,26 @@ def _publish_restore(
         Path(f"{db_path.absolute()}-shm"),
         vault.absolute(),
     )
-    records = tuple(
-        _RestoreTarget(target, _backup_name(target), target.exists() or target.is_symlink())
-        for target in targets
-    )
+    records_list: list[_RestoreTarget] = []
+    for index, target in enumerate(targets):
+        try:
+            visible = os.lstat(target)
+        except FileNotFoundError:
+            records_list.append(_RestoreTarget(target, _backup_name(target), False))
+            continue
+        if index == 3 and not stat.S_ISDIR(visible.st_mode):
+            raise ValueError(f"restore vault target must be a directory: {target}")
+        if index != 3 and not stat.S_ISREG(visible.st_mode):
+            raise ValueError(f"restore database target must be a regular file: {target}")
+        records_list.append(
+            _RestoreTarget(
+                target,
+                _backup_name(target),
+                True,
+                original_fingerprint=_path_fingerprint(target),
+            )
+        )
+    records = tuple(records_list)
     for record, staged in ((records[0], staged_db), (records[3], staged_vault)):
         visible = os.lstat(staged)
         record.target_identity = (
@@ -1110,6 +1282,10 @@ def _publish_restore(
                     visible.st_ino,
                     stat.S_IFMT(visible.st_mode),
                 )
+                if _path_fingerprint(item.backup) != item.original_fingerprint:
+                    raise ValueError(
+                        f"restore backup fingerprint changed during rename: {item.backup}"
+                    )
         for parent in {item.target.parent for item in records}:
             _fsync_directory(parent)
         restore_journal.persist("publishing")

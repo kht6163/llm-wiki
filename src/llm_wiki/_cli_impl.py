@@ -523,7 +523,14 @@ def _restore(args) -> int:
             return 1
         raise AssertionError("restore rollback unexpectedly returned") from post_error
 
-    report.finalize()
+    try:
+        report.finalize()
+    except (OSError, ValueError) as exc:
+        print(
+            f"restore finalization failed: {exc}; "
+            "restart serve or rerun restore to recover the durable journal"
+        )
+        return 1
     for backup in report.backup_cleanup_warnings:
         print(
             "WARNING: restored successfully but backup cleanup failed; "

@@ -594,13 +594,46 @@ def test_serve_reports_startup_recovery_io_failure(monkeypatch, tmp_path, capsys
     assert "serve failed: journal fsync failed" in capsys.readouterr().out
 
 
-def test_restore_report_finalize_forwards_lock_release_choice():
+def test_restore_report_finalize_keeps_lock_release_internal():
     observed = []
     journal = NS(finalize=lambda **kwargs: observed.append(kwargs) or ())
     report = snapshot_writer.RestoreReport(1, 0, _journal=journal)
 
-    assert report.finalize(release_lock=False) == ()
-    assert observed == [{"release_lock": False}]
+    with pytest.raises(TypeError):
+        report.finalize(release_lock=False)
+    assert observed == []
+    assert report.finalize() == ()
+    assert observed == [{}]
+
+
+def test_restore_reports_durable_finalize_failure_without_traceback(
+    monkeypatch, tmp_path, capsys
+):
+    src = tmp_path / "wiki.tar"
+    src.touch()
+    settings = NS(
+        db_path=tmp_path / "wiki.db",
+        vault_path=tmp_path / "vault",
+        embedding_model="same",
+    )
+    report = NS(
+        embedding_model="same",
+        finalize=lambda: (_ for _ in ()).throw(OSError("finalize fsync failed")),
+    )
+    monkeypatch.setattr(_cli_impl, "get_settings", lambda: settings)
+    monkeypatch.setattr(_cli_impl, "restore_snapshot", lambda *args, **kwargs: report)
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda **kwargs: NS(
+            db=NS(close=lambda: None), docs=NS(recover_pending=lambda: 0)
+        ),
+    )
+
+    assert _cli_impl._restore(NS(in_=str(src), force=True)) == 1
+    output = capsys.readouterr().out
+    assert "restore finalization failed: finalize fsync failed" in output
+    assert "restart serve or rerun restore" in output
 
 
 def test_restore_and_serve_report_project_lock_contention(monkeypatch, tmp_path, capsys):

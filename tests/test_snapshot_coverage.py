@@ -555,6 +555,63 @@ def test_restore_rejects_archive_changed_during_read(snapshot_source, tmp_path, 
         )
 
 
+def test_archive_primary_error_is_preserved_when_final_stat_also_fails(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_fstat = snapshot.os.fstat
+    calls = 0
+
+    def fail_final_stat(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("archive final stat failed")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(snapshot.os, "fstat", fail_final_stat)
+    with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise OSError("payload extraction failed")
+
+    assert str(caught.value.primary_error) == "payload extraction failed"
+    assert [str(error) for error in caught.value.cleanup_errors] == [
+        "archive final stat failed"
+    ]
+
+
+def test_archive_primary_error_is_preserved_when_close_also_fails(
+    tmp_path, monkeypatch
+):
+    archive = tmp_path / "archive.tar"
+    archive.write_bytes(b"archive")
+    real_fdopen = snapshot.os.fdopen
+
+    class CloseFailure:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def fileno(self):
+            return self.wrapped.fileno()
+
+        def close(self):
+            self.wrapped.close()
+            raise OSError("archive close failed")
+
+    monkeypatch.setattr(
+        snapshot.os, "fdopen", lambda *args, **kwargs: CloseFailure(real_fdopen(*args, **kwargs))
+    )
+    with pytest.raises(snapshot.SnapshotArchiveReadError) as caught:
+        with snapshot._open_stable_snapshot_archive(archive):
+            raise OSError("primary failed")
+
+    assert str(caught.value.primary_error) == "primary failed"
+    assert [str(error) for error in caught.value.cleanup_errors] == [
+        "archive close failed"
+    ]
+
+
 def test_snapshot_v2_manifest_authenticates_database(snapshot_source):
     _, archive = snapshot_source
     with tarfile.open(archive, "r") as source:
@@ -670,6 +727,30 @@ def test_restore_enforces_archive_extraction_budgets(
     _restore_rejects_without_live_changes(
         archive, tmp_path / f"budget-{constant}", message
     )
+
+
+@pytest.mark.parametrize(
+    ("constant", "message"),
+    [
+        ("MAX_SNAPSHOT_ARCHIVE_BYTES", "archive size limit"),
+        ("MAX_SNAPSHOT_MEMBERS", "member count limit"),
+        ("MAX_SNAPSHOT_MANIFEST_BYTES", "manifest size limit"),
+        ("MAX_SNAPSHOT_MEMBER_BYTES", "member size limit"),
+        ("MAX_SNAPSHOT_TOTAL_BYTES", "total size limit"),
+    ],
+)
+def test_snapshot_writer_enforces_restore_compatible_budgets(
+    snapshot_source, tmp_path, monkeypatch, constant, message
+):
+    ctx, _ = snapshot_source
+    out = tmp_path / f"writer-budget-{constant}.tar"
+    monkeypatch.setattr(snapshot, constant, 1)
+
+    with pytest.raises(ValueError, match=message):
+        snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
+
+    assert not out.exists()
+    assert not list(tmp_path.glob(f".{out.name}.snapshot-tmp-*"))
 
 
 def test_restore_report_rejects_actions_after_finalize(snapshot_source, tmp_path):
@@ -1127,6 +1208,88 @@ def test_recovery_rejects_live_target_identity_change_without_deleting_it(
     assert snapshot.restore_journal_path(db_path).exists()
 
 
+def test_prepared_recovery_rejects_backup_inode_and_content_swap(
+    snapshot_source, tmp_path
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "prepared-swap" / "wiki.db"
+    vault = tmp_path / "prepared-swap-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"trusted original database")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    record = next(item for item in pending._journal.targets if item.target == db_path)
+    snapshot._remove_path(db_path)
+    snapshot._remove_path(vault)
+    record.backup.unlink()
+    record.backup.write_bytes(b"attacker prepared backup")
+    record.backup_identity = None
+    pending._journal.persist("prepared")
+    pending._journal.process_lock.release()
+
+    with pytest.raises(ValueError, match="fingerprint|identity"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+    assert not db_path.exists()
+    assert record.backup.read_bytes() == b"attacker prepared backup"
+    assert snapshot.restore_journal_path(db_path).exists()
+
+
+def test_rolling_back_recovery_rejects_restored_target_inode_and_content_swap(
+    snapshot_source, tmp_path
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "rolling-swap" / "wiki.db"
+    vault = tmp_path / "rolling-swap-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"trusted original database")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    record = next(item for item in pending._journal.targets if item.target == db_path)
+    pending._journal.persist("rolling_back")
+    db_path.unlink()
+    os.replace(record.backup, db_path)
+    db_path.unlink()
+    db_path.write_bytes(b"attacker rolling target")
+    pending._journal.process_lock.release()
+
+    with pytest.raises(ValueError, match="fingerprint|identity"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+    assert db_path.read_bytes() == b"attacker rolling target"
+    assert snapshot.restore_journal_path(db_path).exists()
+
+
+@pytest.mark.parametrize("target_kind", ["database", "vault", "sidecar"])
+def test_restore_rejects_live_symlink_targets_before_publication(
+    snapshot_source, tmp_path, target_kind
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / target_kind / "wiki.db"
+    vault = tmp_path / f"{target_kind}-vault"
+    db_path.parent.mkdir(parents=True)
+    vault.mkdir()
+    external = tmp_path / f"external-{target_kind}"
+    if target_kind == "vault":
+        vault.rmdir()
+        external.mkdir()
+        (external / "sentinel").write_text("external")
+        vault.symlink_to(external, target_is_directory=True)
+    else:
+        external.write_bytes(b"external")
+        link = db_path if target_kind == "database" else Path(f"{db_path}-wal")
+        link.symlink_to(external)
+
+    with pytest.raises(ValueError, match="symlink|regular|directory"):
+        snapshot.restore_snapshot(archive, db_path, vault, force=True)
+
+    assert not snapshot.restore_journal_path(db_path).exists()
+    if external.is_file():
+        assert external.read_bytes() == b"external"
+    else:
+        assert (external / "sentinel").read_text() == "external"
+
+
 def test_recovery_preserves_journal_when_rolling_back_target_and_backup_are_missing(
     snapshot_source, tmp_path
 ):
@@ -1183,6 +1346,7 @@ def test_rolling_back_with_restored_target_and_missing_backup_can_finish(tmp_pat
     record.had_original = True
     record.target.parent.mkdir(parents=True, exist_ok=True)
     record.target.write_bytes(b"already restored")
+    record.original_fingerprint = snapshot._path_fingerprint(record.target)
 
     assert journal._rollback_files() == []
     assert not journal.path.exists()
@@ -1263,6 +1427,177 @@ def test_stable_journal_descriptor_identity_size_mutation_and_open_failures(
     )
     with pytest.raises(ValueError, match="stable regular file"):
         snapshot._read_restore_journal(journal)
+
+
+def test_path_fingerprint_rejects_races_symlinks_and_special_files(
+    tmp_path, monkeypatch
+):
+    regular = tmp_path / "regular"
+    regular.write_bytes(b"content")
+    visible = os.lstat(regular)
+    real_fstat = snapshot.os.fstat
+
+    monkeypatch.setattr(
+        snapshot.os,
+        "fstat",
+        lambda fd: SimpleNamespace(
+            st_mode=visible.st_mode,
+            st_dev=visible.st_dev,
+            st_ino=visible.st_ino + 1,
+            st_size=visible.st_size,
+            st_mtime_ns=visible.st_mtime_ns,
+            st_ctime_ns=visible.st_ctime_ns,
+        ),
+    )
+    with pytest.raises(ValueError, match="identity changed"):
+        snapshot._path_fingerprint(regular)
+
+    calls = 0
+
+    def change_after_hash(fd):
+        nonlocal calls
+        calls += 1
+        result = real_fstat(fd)
+        if calls == 2:
+            return SimpleNamespace(
+                st_mode=result.st_mode,
+                st_dev=result.st_dev,
+                st_ino=result.st_ino,
+                st_size=result.st_size + 1,
+                st_mtime_ns=result.st_mtime_ns,
+                st_ctime_ns=result.st_ctime_ns,
+            )
+        return result
+
+    monkeypatch.setattr(snapshot.os, "fstat", change_after_hash)
+    with pytest.raises(ValueError, match="changed while hashing"):
+        snapshot._path_fingerprint(regular)
+
+    monkeypatch.setattr(snapshot.os, "fstat", real_fstat)
+    link = tmp_path / "link"
+    link.symlink_to(regular)
+    with pytest.raises(ValueError, match="symlink"):
+        snapshot._path_fingerprint(link)
+
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular file or directory"):
+        snapshot._path_fingerprint(fifo)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "escape").symlink_to(regular)
+    with pytest.raises(ValueError, match="symlink or special"):
+        snapshot._path_fingerprint(vault)
+
+
+def test_directory_fingerprint_rejects_root_mutation(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    visible = os.lstat(vault)
+    real_lstat = snapshot.os.lstat
+    calls = 0
+
+    def mutate_root(path):
+        nonlocal calls
+        result = real_lstat(path)
+        if Path(path) == vault:
+            calls += 1
+            if calls == 2:
+                return SimpleNamespace(
+                    st_mode=result.st_mode,
+                    st_dev=result.st_dev,
+                    st_ino=result.st_ino,
+                    st_size=result.st_size,
+                    st_mtime_ns=result.st_mtime_ns,
+                    st_ctime_ns=visible.st_ctime_ns + 1,
+                )
+        return result
+
+    monkeypatch.setattr(snapshot.os, "lstat", mutate_root)
+    with pytest.raises(ValueError, match="changed while hashing"):
+        snapshot._path_fingerprint(vault)
+
+
+def test_restore_journal_requires_original_fingerprint_and_unambiguous_prepared_state(
+    tmp_path,
+):
+    missing_fingerprint = _coverage_restore_journal(tmp_path / "missing-fingerprint")
+    record = missing_fingerprint.targets[0]
+    record.had_original = True
+    record.target.parent.mkdir(parents=True, exist_ok=True)
+    record.target.write_bytes(b"original")
+    with pytest.raises(ValueError, match="fingerprint is missing"):
+        missing_fingerprint._validate_paths()
+    missing_fingerprint.process_lock.release()
+
+    both = _coverage_restore_journal(tmp_path / "both")
+    record = both.targets[0]
+    record.had_original = True
+    record.target.parent.mkdir(parents=True, exist_ok=True)
+    record.target.write_bytes(b"original")
+    record.backup.write_bytes(b"original")
+    record.original_fingerprint = snapshot._path_fingerprint(record.target)
+    with pytest.raises(ValueError, match="both exist"):
+        both._validate_paths()
+    both.process_lock.release()
+
+    neither = _coverage_restore_journal(tmp_path / "neither")
+    record = neither.targets[0]
+    record.had_original = True
+    record.original_fingerprint = (1, 1, stat.S_IFREG, 1, "0" * 64)
+    with pytest.raises(ValueError, match="original target is missing"):
+        neither._validate_paths()
+    neither.process_lock.release()
+
+    valid = _coverage_restore_journal(tmp_path / "valid")
+    record = valid.targets[0]
+    record.had_original = True
+    record.target.parent.mkdir(parents=True, exist_ok=True)
+    record.target.write_bytes(b"original")
+    record.original_fingerprint = snapshot._path_fingerprint(record.target)
+    valid._validate_paths()
+    valid.process_lock.release()
+
+
+def test_recovery_rejects_backup_content_changed_in_place(snapshot_source, tmp_path):
+    _, archive = snapshot_source
+    db_path = tmp_path / "backup-content" / "wiki.db"
+    vault = tmp_path / "backup-content-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original")
+    pending = snapshot.restore_snapshot(archive, db_path, vault, force=True)
+    assert pending._journal is not None
+    backup = next(item.backup for item in pending._journal.targets if item.had_original)
+    backup.write_bytes(b"changed in same inode")
+    pending._journal.process_lock.release()
+
+    with pytest.raises(ValueError, match="fingerprint changed"):
+        snapshot.recover_pending_restore(db_path, vault)
+
+
+def test_restore_detects_backup_change_during_original_rename(
+    snapshot_source, tmp_path, monkeypatch
+):
+    _, archive = snapshot_source
+    db_path = tmp_path / "rename-race" / "wiki.db"
+    vault = tmp_path / "rename-race-vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original")
+    real_fingerprint = snapshot._path_fingerprint
+
+    def change_backup_fingerprint(path):
+        fingerprint = real_fingerprint(path)
+        if ".restore-backup-" in Path(path).name:
+            return (*fingerprint[:3], fingerprint[3] + 1, fingerprint[4])
+        return fingerprint
+
+    monkeypatch.setattr(snapshot, "_path_fingerprint", change_backup_fingerprint)
+    with pytest.raises(snapshot.RestoreRollbackError) as caught:
+        snapshot.restore_snapshot(archive, db_path, vault, force=True)
+
+    assert "fingerprint changed during rename" in str(caught.value.publish_error)
+    assert "original fingerprint changed" in str(caught.value.rollback_errors[0])
 
 
 def test_restore_reports_published_target_removal_failure_and_preserves_originals(
