@@ -3,13 +3,13 @@
 // adds token <span>s in the browser (no effect on stored/sanitized HTML).
 import hljs from "highlight.js/lib/common";
 
-function highlight(root) {
-  (root || document).querySelectorAll(".rendered pre code:not([data-highlighted])").forEach(function (el) {
+function highlight() {
+  document.querySelectorAll(".rendered pre code:not([data-highlighted])").forEach(function (el) {
     try { hljs.highlightElement(el); } catch (e) { /* unknown language etc. — leave plain */ }
   });
 }
 
-function run() { highlight(document); }
+function run() { highlight(); }
 
 if (document.readyState !== "loading") run();
 else document.addEventListener("DOMContentLoaded", run);

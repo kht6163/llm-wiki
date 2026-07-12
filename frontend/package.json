@@ -2,9 +2,15 @@
   "name": "llm-wiki-frontend",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "packageManager": "npm@11.6.2",
   "description": "Dev-time build for the vendored markdown editor bundle. The built artifact (web/static/vendor/md-editor.bundle.{js,css}) is committed, so the Python runtime needs no Node at all — this only runs when the editor is changed.",
   "scripts": {
-    "build": "node build.mjs"
+    "build": "node build.mjs",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage"
   },
   "dependencies": {
     "cropperjs": "^1.6.2",
@@ -14,6 +20,10 @@
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "@vitest/coverage-v8": "4.1.10",
+    "esbuild": "^0.25.0",
+    "jsdom": "29.1.1",
+    "markdown-it": "14.3.0",
+    "vitest": "4.1.10"
   }
 }
