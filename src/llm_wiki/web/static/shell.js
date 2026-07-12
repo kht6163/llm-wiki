@@ -278,7 +278,6 @@
   // the parent ("" = vault root, rendered at the top of the tree); `opts.leaf` shows
   // a leaf twisty so a new doc lines up with sibling documents.
   function inlineInput(placeholder, onConfirm, opts) {
-    opts = opts || {};
     var tree = document.getElementById("file-tree");
     if (!tree) return;
     var container = tree, anchor = tree.firstChild, prefix = "";
@@ -376,7 +375,7 @@
     var w = menuEl.offsetWidth, h = menuEl.offsetHeight;
     menuEl.style.left = Math.min(x, window.innerWidth - w - 8) + "px";
     menuEl.style.top = Math.min(y, window.innerHeight - h - 8) + "px";
-    if (focusFirst) { var f = menuEl.querySelector("button"); if (f) f.focus(); }
+    if (focusFirst) menuEl.querySelector("button").focus();
   }
   document.addEventListener("click", closeMenu);
   document.addEventListener("scroll", closeMenu, true);
@@ -442,7 +441,8 @@
     var tree = document.getElementById("file-tree");
     if (!tree || !W.canWrite) return;
     tree.addEventListener("contextmenu", function (e) {
-      if (openTreeMenuFor(e.target, e.clientX, e.clientY, false)) e.preventDefault();
+      openTreeMenuFor(e.target, e.clientX, e.clientY, false);
+      e.preventDefault();
     });
     // Keyboard parity (WCAG 2.1.1): the ContextMenu key or Shift+F10 opens the menu at
     // the focused row, so rename/delete don't require a mouse. Focus returns to the row
@@ -453,8 +453,8 @@
       if (!row) return;
       var r = row.getBoundingClientRect();
       e.preventDefault();
-      menuReturnFocus = row;
       openTreeMenuFor(e.target, r.left + 8, r.bottom, true);
+      menuReturnFocus = row;
     });
   }
 

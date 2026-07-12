@@ -74,6 +74,7 @@ export async function loadStatic(name) {
     props: () => import("../../src/llm_wiki/web/static/props.js"),
     realtime: () => import("../../src/llm_wiki/web/static/realtime.js"),
     related: () => import("../../src/llm_wiki/web/static/related.js"),
+    shell: () => import("../../src/llm_wiki/web/static/shell.js"),
     tasks: () => import("../../src/llm_wiki/web/static/tasks.js"),
   };
   await modules[name]();
