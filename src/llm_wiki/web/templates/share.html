@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ doc.title or doc.path }} · 공유{% endblock %}
+{% block content %}
+<article class="share-doc">
+  <header class="doc-meta">
+    <h1>{{ doc.title or doc.path }}</h1>
+    <p class="muted path">{{ doc.path }} · 읽기 전용 공유</p>
+  </header>
+  <div class="rendered">{{ html|safe }}</div>
+</article>
+{% endblock %}

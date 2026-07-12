@@ -14,18 +14,24 @@
 <form method="post" action="/settings/keys" class="inline">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="name" placeholder="키 이름 (예: my-agent)" required>
+  <label class="visually-hidden" for="key-scope">권한</label>
+  <select id="key-scope" name="scope">
+    <option value="readwrite" selected>읽기·쓰기</option>
+    <option value="read">읽기 전용</option>
+  </select>
   <button class="primary">새 키 발급</button>
 </form>
 {% if keys %}
 <table class="revtable">
-  <thead><tr><th scope="col">이름</th><th scope="col">prefix</th><th scope="col">생성</th><th scope="col">마지막 사용</th><th scope="col">상태</th><th scope="col"></th></tr></thead>
+  <thead><tr><th scope="col">이름</th><th scope="col">prefix</th><th scope="col">권한</th><th scope="col">생성</th><th scope="col">마지막 사용</th><th scope="col">상태</th><th scope="col"></th></tr></thead>
   <tbody>
   {% for k in keys %}
-    <tr>
+    <tr{% if k.unused and not k.revoked_at %} class="key-unused"{% endif %}>
       <td data-label="이름">{{ k.name }}</td>
       <td data-label="prefix"><code>{{ k.key_prefix }}…</code></td>
+      <td data-label="권한"><code class="version">{{ k.scope or 'readwrite' }}</code></td>
       <td data-label="생성">{{ k.created_at|dt }}</td>
-      <td data-label="마지막 사용">{% if k.last_used_at %}{{ k.last_used_at|dt }}{% else %}—{% endif %}</td>
+      <td data-label="마지막 사용">{% if k.last_used_at %}{{ k.last_used_at|dt }}{% else %}—{% endif %}{% if k.unused and not k.revoked_at %} <span class="muted">(미사용)</span>{% endif %}</td>
       <td data-label="상태">{% if k.revoked_at %}<span class="muted">폐기됨</span>{% else %}활성{% endif %}</td>
       <td data-label="작업">{% if not k.revoked_at %}
         <form method="post" action="/settings/keys/{{ k.id }}/revoke" class="inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger">폐기</button></form>

@@ -36,6 +36,9 @@ class Settings(BaseSettings):
 
     # Embeddings (local HuggingFace sentence-transformers model)
     embedding_model: str = "intfloat/multilingual-e5-base"
+    # When false: skip model load / vector index init; BM25 search still works.
+    # Related/RAG/vector mode return empty or structured unavailable.
+    embedding_enabled: bool = True
 
     # Display name for the knowledge base — used as the H1 of the llms.txt /
     # llms-full.txt corpus exports (the agent-facing "what is this vault" line).

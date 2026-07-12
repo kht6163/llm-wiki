@@ -94,6 +94,13 @@ PENDING_FILES = Gauge("llmwiki_pending_files", "Documents whose .md projection i
 BROKEN_LINKS = Gauge("llmwiki_broken_links", "Unresolved (dangling) links from live documents.")
 SCHEMA_VERSION = Gauge("llmwiki_schema_version", "Applied database schema version.")
 BUILD_INFO = Info("llmwiki_build", "Static build/runtime info (model, dimension, version).")
+# Internal failures that were swallowed into structured envelopes (MCP/web). Useful
+# for spotting regression spikes without scraping application logs.
+INTERNAL_ERRORS = Counter(
+    "llmwiki_internal_errors_total",
+    "Unhandled exceptions converted to structured internal errors.",
+    ["surface"],
+)
 
 
 def collect_index_gauges(db) -> dict:

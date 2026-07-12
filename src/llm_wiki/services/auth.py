@@ -19,12 +19,15 @@ from .errors import NotFoundError, ValidationError
 
 ROLES = ("admin", "editor", "viewer")
 ROLE_RANK = {"viewer": 0, "editor": 1, "admin": 2}
+API_KEY_SCOPES = ("read", "readwrite")
 SESSION_TTL_DAYS = 14
 API_KEY_PREFIX_LEN = 12
 MIN_PASSWORD_LEN = 8
 MAX_USERNAME_LEN = 128
 MAX_PASSWORD_LEN = 1024
 MAX_API_KEY_NAME_LEN = 128
+# Keys with no last_used_at, or last_used older than this many days, surface as unused.
+DEFAULT_UNUSED_AFTER_DAYS = 30
 
 _ph = PasswordHasher()
 
@@ -42,10 +45,23 @@ class Principal:
     role: str
     via: str = "?"  # surface that resolved this identity: web | mcp | cli
     credential_version: int = 1
+    # MCP API key scope only (web sessions leave this as "readwrite").
+    key_scope: str = "readwrite"
 
     @property
     def can_write(self) -> bool:
-        return ROLE_RANK.get(self.role, 0) >= ROLE_RANK["editor"]
+        """Editor+ role, and for MCP keys the key scope must allow write."""
+        if ROLE_RANK.get(self.role, 0) < ROLE_RANK["editor"]:
+            return False
+        # Read-only MCP keys keep the editor role for display but cannot write.
+        if self.via == "mcp" and self.key_scope == "read":
+            return False
+        return True
+
+    @property
+    def can_write_via_key(self) -> bool:
+        """Alias of can_write (includes key-scope gate for MCP principals)."""
+        return self.can_write
 
     @property
     def can_admin(self) -> bool:
@@ -268,6 +284,7 @@ def create_api_key(
     principal: Principal,
     name: str,
     *,
+    scope: str = "readwrite",
     audit_actor: str | None = None,
     audit_via: str | None = None,
     audit_detail: str | None = None,
@@ -280,6 +297,11 @@ def create_api_key(
         raise ValidationError(
             f"API key name must be at most {MAX_API_KEY_NAME_LEN} characters"
         )
+    key_scope = (scope or "readwrite").strip().lower()
+    if key_scope not in API_KEY_SCOPES:
+        raise ValidationError(
+            f"API key scope must be one of {API_KEY_SCOPES} (got {scope!r})"
+        )
     with db.writer() as conn:
         # Same generation fence as session minting: a key requested from a stale web
         # session cannot recreate access after password-change revocation commits.
@@ -289,9 +311,9 @@ def create_api_key(
         ).fetchone():
             raise ValidationError("the authenticated user is no longer eligible for an API key")
         conn.execute(
-            "INSERT INTO api_keys(user_id, name, key_prefix, key_hash, created_at) "
-            "VALUES(?,?,?,?,?)",
-            (principal.user_id, key_name, prefix, _hash_token(token), now_iso()),
+            "INSERT INTO api_keys(user_id, name, key_prefix, key_hash, created_at, scope) "
+            "VALUES(?,?,?,?,?,?)",
+            (principal.user_id, key_name, prefix, _hash_token(token), now_iso(), key_scope),
         )
         _record_success(
             conn,
@@ -310,7 +332,7 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
     prefix = raw[:API_KEY_PREFIX_LEN]
     with db.reader() as conn:
         row = conn.execute(
-            "SELECT k.id, k.key_hash, u.id AS uid, u.username, u.role, "
+            "SELECT k.id, k.key_hash, k.scope, u.id AS uid, u.username, u.role, "
             "u.credential_version "
             "FROM api_keys k JOIN users u ON u.id=k.user_id "
             "WHERE k.key_prefix=? AND k.revoked_at IS NULL AND u.is_active=1",
@@ -324,23 +346,49 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
                 "UPDATE api_keys SET last_used_at=? WHERE id=? AND revoked_at IS NULL",
                 (now_iso(), row["id"]),
             )
+    scope = row["scope"] if row["scope"] in API_KEY_SCOPES else "readwrite"
     return Principal(
         row["uid"],
         row["username"],
         row["role"],
         via="mcp",
         credential_version=row["credential_version"],
+        key_scope=scope,
     )
 
 
-def list_api_keys(db: Database, user_id: int) -> list[dict]:
+def list_api_keys(
+    db: Database,
+    user_id: int,
+    *,
+    unused_after_days: int = DEFAULT_UNUSED_AFTER_DAYS,
+) -> list[dict]:
     with db.reader() as conn:
         rows = conn.execute(
-            "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at "
+            "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at, scope "
             "FROM api_keys WHERE user_id=? ORDER BY created_at DESC",
             (user_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, int(unused_after_days)))
+    out: list[dict] = []
+    for r in rows:
+        item = dict(r)
+        scope = item.get("scope") or "readwrite"
+        item["scope"] = scope if scope in API_KEY_SCOPES else "readwrite"
+        last = item.get("last_used_at")
+        if not last:
+            item["unused"] = True
+        else:
+            try:
+                # Accept trailing Z
+                ts = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                item["unused"] = ts < cutoff
+            except ValueError:
+                item["unused"] = True
+        out.append(item)
+    return out
 
 
 def revoke_api_key(

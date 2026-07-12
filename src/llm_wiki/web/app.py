@@ -502,6 +502,33 @@ def create_web_app(app: AppContext) -> FastAPI:
         request.session.clear()
         return login_redirect()
 
+    @web.get("/share/{token}", response_class=HTMLResponse)
+    def public_share(token: str, request: Request):
+        """Unauthenticated read-only view of a single document via signed token."""
+        from ..services import share as share_svc
+
+        try:
+            path = share_svc.verify_share_token(secret, token)
+            doc = docs.get(path)
+        except ValidationError as e:
+            return render("error.html", request, status=400, message=e.message)
+        except NotFoundError as e:
+            return render("error.html", request, status=404, message=e.message)
+        html = render_markdown(
+            doc["content"], doc["path"], resolve_embed=embed_resolver(doc["path"])
+        )
+        return render("share.html", request, status=200, doc=doc, html=html)
+
+    @web.post("/api/doc/{path:path}/share")
+    def mint_share_link(path: str, request: Request, p: Principal = Depends(require_user)):
+        from ..services import share as share_svc
+
+        if not p.can_write:
+            raise ForbiddenError("Only editors can mint share links.")
+        docs.get(path)
+        token = share_svc.mint_share_token(secret, path)
+        url = str(request.base_url).rstrip("/") + "/share/" + token
+        return JSONResponse({"ok": True, "path": path, "token": token, "url": url})
     @web.get("/healthz")
     def healthz():
         # Liveness: cheap, always ok if the process is up.
@@ -515,22 +542,29 @@ def create_web_app(app: AppContext) -> FastAPI:
         # (embedding backlog / pending writes / broken links) for at-a-glance ops.
         details: dict = {}
         binding_current = False
+        embedding_on = bool(getattr(app.settings, "embedding_enabled", True))
         try:
             details = collect_index_gauges(db)
-            binding_current = db.embedding_binding_is_current()
-            ready = embedder.is_loaded and binding_current
+            if embedding_on:
+                binding_current = db.embedding_binding_is_current()
+                ready = embedder.is_loaded and binding_current
+            else:
+                binding_current = True
+                ready = True  # BM25-only mode: DB up is enough
         except Exception:
             ready = False
         code = 200 if ready else 503
         body = {
             "ok": ready, "ready": ready, "model_loaded": embedder.is_loaded,
             "binding_current": binding_current,
+            "embedding_enabled": embedding_on,
             "embedding_model": embedder.model_name, **details,
         }
         # Surface background-embedding-worker health (running / consecutive failures /
         # last error / backlog) so a silently stalled worker is visible at a glance.
         if app.embed_worker is not None:
             body["embed_worker"] = app.embed_worker.status()
+        body["embedding_status"] = docs.embedding_status()
         return JSONResponse(body, status_code=code)
 
     @web.get("/metrics")
@@ -1046,6 +1080,7 @@ def create_web_app(app: AppContext) -> FastAPI:
 
     @web.post("/settings/keys", response_class=HTMLResponse)
     def settings_create_key(request: Request, name: str = Form("key"),
+                            scope: str = Form("readwrite"),
                             p: Principal = Depends(require_user)):
         # Throttle minting per user (a hijacked session shouldn't be able to spray keys).
         key_key = f"user:{p.user_id}"
@@ -1056,13 +1091,23 @@ def create_web_app(app: AppContext) -> FastAPI:
         key_limiter.record_failure(key_key)  # count this mint toward the window
         # Render the freshly-minted key directly in the response instead of
         # round-tripping it through the (signed-but-not-encrypted) session cookie.
-        token = create_api_key(
-            db,
-            p,
-            name,
-            audit_actor=p.username,
-            audit_via="web",
-        )
+        try:
+            token = create_api_key(
+                db,
+                p,
+                name,
+                scope=scope,
+                audit_actor=p.username,
+                audit_via="web",
+            )
+        except WikiError as e:
+            return render(
+                "settings.html",
+                request,
+                keys=list_api_keys(db, p.user_id),
+                new_key=None,
+                error=e.message,
+            )
         return render("settings.html", request, keys=list_api_keys(db, p.user_id), new_key=token)
 
     @web.post("/settings/keys/{key_id}/revoke")

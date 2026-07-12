@@ -18,7 +18,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .logconf import bind_request_id, new_request_id
-from .metrics import MCP_CALLS, MCP_LATENCY
+from .metrics import INTERNAL_ERRORS, MCP_CALLS, MCP_LATENCY
 from .ratelimit import RateLimiter
 from .runtime import AppContext
 from .services import audit
@@ -285,6 +285,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                 # envelope (not a raw protocol error), and the metric must reflect it.
                 # Log the traceback server-side; never leak internals to the client.
                 outcome = "internal"
+                INTERNAL_ERRORS.labels("mcp").inc()
                 log.exception("tool=%s actor=%s crashed", tool, actor)
                 return {"ok": False,
                         "error": {"code": "internal", "message": "Internal server error.",
@@ -540,8 +541,15 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "documents before attempting a write that would be rejected.")
     async def whoami(ctx: Context) -> dict:
         def fn(p: Principal) -> dict:
-            return {"ok": True, "username": p.username, "role": p.role,
-                    "can_read": True, "can_write": p.can_write, "can_admin": p.can_admin}
+            return {
+                "ok": True,
+                "username": p.username,
+                "role": p.role,
+                "key_scope": p.key_scope,
+                "can_read": True,
+                "can_write": p.can_write,
+                "can_admin": p.can_admin,
+            }
         return await _call(ctx, fn, "whoami")
 
     @mcp.tool(description="Export the whole vault as one block of text for context-stuffing. "

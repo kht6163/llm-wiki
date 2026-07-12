@@ -24,7 +24,7 @@ from .embedding_contract import (
     EmbeddingBindingChanged,
 )
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -53,7 +53,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   key_hash     TEXT NOT NULL,
   created_at   TEXT NOT NULL,
   last_used_at TEXT,
-  revoked_at   TEXT
+  revoked_at   TEXT,
+  scope        TEXT NOT NULL DEFAULT 'readwrite'
+    CHECK(scope IN ('read', 'readwrite'))
 );
 CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id);
 
@@ -297,6 +299,8 @@ MIGRATIONS: list[tuple[int, str]] = [
     # deactivation.  Those revocation boundaries increment this generation; a
     # Principal resolved before the change can no longer create a late session/key.
     (13, "ALTER TABLE users ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1"),
+    # v14: optional read-only MCP API keys (agents that must not write).
+    (14, "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'readwrite'"),
 ]
 
 

@@ -419,6 +419,8 @@ class DocumentService:
         flag-and-notify only — ``vector_dirty`` was already set in the write txn — so the
         slow forward pass is off the request path; without one (tests/CLI), embed inline
         so the write is immediately visible to vector search."""
+        if not self.embedding_enabled():
+            return
         if self.embed_worker is not None:
             self.embed_worker.notify()
         else:
@@ -2256,9 +2258,42 @@ class DocumentService:
             filters=filters,
         )
 
+    def embedding_enabled(self) -> bool:
+        return bool(getattr(self.embedder, "enabled", True))
+
+    def embedding_status(self) -> dict:
+        """Ops snapshot: whether embeddings are on and how large the backlog is."""
+        with self.db.reader() as conn:
+            dirty = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE vector_dirty=1 AND is_deleted=0"
+            ).fetchone()[0]
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE file_state='pending' AND is_deleted=0"
+            ).fetchone()[0]
+            docs = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE is_deleted=0"
+            ).fetchone()[0]
+        worker = None
+        if self.embed_worker is not None:
+            worker = self.embed_worker.status()
+        return {
+            "enabled": self.embedding_enabled(),
+            "model": getattr(self.embedder, "model_name", None),
+            "model_loaded": bool(getattr(self.embedder, "is_loaded", False)),
+            "documents": int(docs),
+            "vector_dirty": int(dirty),
+            "pending_projection": int(pending),
+            "embed_worker": worker,
+        }
+
     def related(self, path: str, limit: int = 8) -> dict:
         """Documents semantically similar to this one (via the shared chunk-vector
         index). Empty list when the document has no embeddings yet."""
+        if not self.embedding_enabled():
+            rel = normalize_rel_path(path)
+            if not self.exists(rel):
+                raise NotFoundError("No document at this path.", path=rel)
+            return {"path": rel, "related": [], "embedding_enabled": False}
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         try:
