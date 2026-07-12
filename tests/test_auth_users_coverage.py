@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+import json
+from contextlib import contextmanager
+
 import pytest
 
-from llm_wiki.services import auth
+from llm_wiki.config import Settings
+from llm_wiki.runtime import build_context
+from llm_wiki.services import audit, auth
 from llm_wiki.services import users as users_svc
 from llm_wiki.services.errors import NotFoundError, ValidationError
+
+
+@contextmanager
+def _isolated_last_used_marks():
+    original = auth._last_used_marks
+    original_values = dict(original)
+    auth._last_used_marks = dict(original_values)
+    try:
+        yield
+    finally:
+        auth._last_used_marks = original
+        original.clear()
+        original.update(original_values)
 
 
 def test_password_hash_failures_and_user_validation_leave_no_rows(ctx):
@@ -40,23 +58,42 @@ def test_password_hash_failures_and_user_validation_leave_no_rows(ctx):
     assert [row["username"] for row in rows] == ["duplicate"]
 
 
-def test_key_throttle_name_limit_and_update_race_preserve_active_key(ctx, principals, monkeypatch):
-    monkeypatch.setattr(auth.time, "monotonic", lambda: 10**12)
+def test_key_throttle_name_limit_and_update_race_preserve_active_key(
+    ctx, principals, monkeypatch, tmp_path
+):
     principal = principals["editor"]
     token = auth.create_api_key(ctx.db, principal, "bounded")
     key = auth.list_api_keys(ctx.db, principal.user_id)[0]
+    future_mark = 10**12
 
-    assert auth.principal_from_api_key(ctx.db, token) == auth.Principal(
-        principal.user_id,
-        principal.username,
-        principal.role,
-        via="mcp",
-        credential_version=principal.credential_version,
+    with _isolated_last_used_marks():
+        monkeypatch.setattr(auth.time, "monotonic", lambda: future_mark)
+        assert auth.principal_from_api_key(ctx.db, token) == auth.Principal(
+            principal.user_id,
+            principal.username,
+            principal.role,
+            via="mcp",
+            credential_version=principal.credential_version,
+        )
+        first_used = auth.list_api_keys(ctx.db, principal.user_id)[0]["last_used_at"]
+        assert first_used is not None
+        assert auth.principal_from_api_key(ctx.db, token) is not None
+        assert auth.list_api_keys(ctx.db, principal.user_id)[0]["last_used_at"] == first_used
+
+    fresh_settings = Settings(
+        vault_path=tmp_path / "fresh-vault",
+        db_path=tmp_path / "fresh-data" / "wiki.db",
+        embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+        gui_port=8280,
+        mcp_port=8281,
+        session_secret="test-secret",
     )
-    first_used = auth.list_api_keys(ctx.db, principal.user_id)[0]["last_used_at"]
-    assert first_used is not None
-    assert auth.principal_from_api_key(ctx.db, token) is not None
-    assert auth.list_api_keys(ctx.db, principal.user_id)[0]["last_used_at"] == first_used
+    fresh_ctx = build_context(fresh_settings, full=True)
+    fresh_user_id = auth.create_user(fresh_ctx.db, "fresh", "secret12")
+    auth.create_api_key(fresh_ctx.db, auth.Principal(fresh_user_id, "fresh", "editor"), "fresh")
+    fresh_key_id = auth.list_api_keys(fresh_ctx.db, fresh_user_id)[0]["id"]
+    assert fresh_key_id == key["id"]
+    assert auth._last_used_marks.get(fresh_key_id) != future_mark
 
     with pytest.raises(ValidationError, match="at most 128"):
         auth.create_api_key(ctx.db, principal, "n" * 129)
@@ -73,6 +110,52 @@ def test_key_throttle_name_limit_and_update_race_preserve_active_key(ctx, princi
 
     assert auth.principal_from_api_key(ctx.db, token) is not None
     assert auth.list_api_keys(ctx.db, principal.user_id)[0]["revoked_at"] is None
+
+
+def test_auth_faults_never_persist_or_expose_raw_credentials(ctx, principals, monkeypatch, caplog):
+    principal = principals["editor"]
+    raw_token = auth.create_api_key(ctx.db, principal, "redaction-check")
+    raw_password = "never-store-or-report-this-password"
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(audit, "record", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable") as password_error:
+        users_svc.set_password(
+            ctx.db,
+            principal.user_id,
+            raw_password,
+            audit_actor="admin",
+            audit_via="web",
+        )
+
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "CREATE TRIGGER redact_revoke BEFORE UPDATE OF revoked_at ON api_keys "
+            "BEGIN SELECT RAISE(IGNORE); END"
+        )
+    key_id = auth.list_api_keys(ctx.db, principal.user_id)[0]["id"]
+    with pytest.raises(NotFoundError, match="active API key not found") as token_error:
+        auth.revoke_api_key(ctx.db, principal, key_id)
+
+    with ctx.db.reader() as conn:
+        persisted = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
+            for table in ("users", "api_keys", "sessions", "audit_log")
+        }
+    serialized_rows = json.dumps(persisted, ensure_ascii=False, default=str)
+    serialized_errors = json.dumps(
+        {"password": str(password_error.value), "token": str(token_error.value)}
+    )
+    for secret in (raw_token, raw_password):
+        assert secret not in serialized_rows
+        assert secret not in serialized_errors
+        assert secret not in caplog.text
+
+    assert auth.authenticate(ctx.db, principal.username, "secret12") is not None
+    assert auth.authenticate(ctx.db, principal.username, raw_password) is None
+    assert auth.principal_from_api_key(ctx.db, raw_token) is not None
 
 
 def test_session_secret_is_generated_once_and_persisted(ctx):

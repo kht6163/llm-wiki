@@ -20,9 +20,9 @@ from llm_wiki.services.auth import Principal, create_user
 TEST_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-@pytest.fixture(scope="module")
-def snapshot_source(tmp_path_factory):
-    root = tmp_path_factory.mktemp("snapshot-coverage-source")
+@pytest.fixture
+def snapshot_source(tmp_path):
+    root = tmp_path / "snapshot-source"
     settings = Settings(
         vault_path=root / "vault",
         db_path=root / "data" / "wiki.db",
@@ -42,6 +42,40 @@ def snapshot_source(tmp_path_factory):
     archive = root / "valid.tar"
     snapshot.write_snapshot(ctx.db, settings.vault_path, archive, force=False)
     return ctx, archive
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, bytes | str | None]]:
+    if not root.exists() and not root.is_symlink():
+        return {}
+    entries: dict[str, tuple[str, bytes | str | None]] = {}
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: item.as_posix())]:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if path.is_symlink():
+            entries[relative] = ("symlink", os.readlink(path))
+        elif path.is_dir():
+            entries[relative] = ("directory", None)
+        else:
+            entries[relative] = ("file", path.read_bytes())
+    return entries
+
+
+def _restore_artifacts(db_path: Path, vault: Path) -> set[Path]:
+    patterns = (
+        f".{db_path.name}.restore-stage-*",
+        f".{db_path.name}.restore-backup-*",
+        f".{vault.name}.restore-stage-*",
+        f".{vault.name}.restore-backup-*",
+    )
+    return {
+        path
+        for parent, pattern in (
+            (db_path.parent, patterns[0]),
+            (db_path.parent, patterns[1]),
+            (vault.parent, patterns[2]),
+            (vault.parent, patterns[3]),
+        )
+        for path in parent.glob(pattern)
+    }
 
 
 def _read_members(archive: Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
@@ -85,10 +119,11 @@ def _restore_rejects_without_live_changes(archive: Path, root: Path, match: str)
     db_path.write_bytes(b"original database")
     vault.mkdir()
     (vault / "original.txt").write_text("original")
+    before = _tree_snapshot(root)
     with pytest.raises(ValueError, match=match):
         snapshot.restore_snapshot(archive, db_path, vault, force=True)
-    assert db_path.read_bytes() == b"original database"
-    assert (vault / "original.txt").read_text() == "original"
+    assert _tree_snapshot(root) == before
+    assert _restore_artifacts(db_path, vault) == set()
 
 
 def test_write_rejects_unsafe_and_inconsistent_source_generations(
@@ -150,7 +185,6 @@ def test_write_detects_attachment_replacement_after_streaming(
     out = tmp_path / "changed.tar"
     with pytest.raises(RuntimeError, match="attachment changed"):
         snapshot.write_snapshot(ctx.db, ctx.settings.vault_path, out, force=False)
-    assert swaps == snapshot._ATTACHMENT_ATTEMPTS
     assert not out.exists()
     assert not Path(f"{out}.tmp").exists()
 
@@ -396,21 +430,22 @@ def test_restore_reports_published_target_removal_failure_and_preserves_original
     db_path.write_bytes(b"original db")
     vault.mkdir()
     (vault / "original.txt").write_text("original")
+    before = _tree_snapshot(tmp_path)
     real_replace = snapshot.os.replace
-    real_remove = snapshot._remove_path
+    real_unlink = Path.unlink
 
     def fail_vault_publish(source, destination):
         if Path(destination) == vault and ".restore-stage-" in Path(source).name:
             raise OSError("vault publish failed")
         return real_replace(source, destination)
 
-    def fail_published_db_removal(path):
+    def fail_published_db_removal(path, *args, **kwargs):
         if path == db_path:
             raise OSError("published database removal failed")
-        return real_remove(path)
+        return real_unlink(path, *args, **kwargs)
 
     monkeypatch.setattr(snapshot.os, "replace", fail_vault_publish)
-    monkeypatch.setattr(snapshot, "_remove_path", fail_published_db_removal)
+    monkeypatch.setattr(Path, "unlink", fail_published_db_removal)
     with pytest.raises(snapshot.RestoreRollbackError) as caught:
         snapshot.restore_snapshot(archive, db_path, vault, force=True)
 
@@ -418,27 +453,102 @@ def test_restore_reports_published_target_removal_failure_and_preserves_original
     assert [str(error) for error in caught.value.rollback_errors] == [
         "published database removal failed"
     ]
-    assert db_path.read_bytes() == b"original db"
-    assert (vault / "original.txt").read_text() == "original"
+    assert caught.value.backup_paths == ()
+    assert _tree_snapshot(tmp_path) == before
+    assert _restore_artifacts(db_path, vault) == set()
 
 
 def test_restore_surfaces_cleanup_failure_after_successful_publication(
     snapshot_source, tmp_path, monkeypatch
 ):
     _, archive = snapshot_source
-    db_path = tmp_path / "cleanup" / "wiki.db"
-    vault = tmp_path / "cleanup-vault"
-    real_remove = snapshot._remove_path
+    expected_root = tmp_path / "expected"
+    expected_db = expected_root / "data" / "wiki.db"
+    expected_vault = expected_root / "vault"
+    snapshot.restore_snapshot(archive, expected_db, expected_vault, force=False)
 
-    def fail_stage_cleanup(path):
-        if ".restore-stage-" in path.name:
+    actual_root = tmp_path / "actual"
+    db_path = actual_root / "data" / "wiki.db"
+    vault = actual_root / "vault"
+    real_mkstemp = snapshot.tempfile.mkstemp
+    real_unlink = Path.unlink
+    staged_databases: list[Path] = []
+
+    def capture_staged_database(*args, **kwargs):
+        fd, raw_path = real_mkstemp(*args, **kwargs)
+        staged_databases.append(Path(raw_path))
+        return fd, raw_path
+
+    def fail_stage_cleanup(path, *args, **kwargs):
+        if staged_databases and path == staged_databases[0]:
             raise OSError("stage cleanup failed")
-        return real_remove(path)
+        return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(snapshot, "_remove_path", fail_stage_cleanup)
+    monkeypatch.setattr(snapshot.tempfile, "mkstemp", capture_staged_database)
+    monkeypatch.setattr(Path, "unlink", fail_stage_cleanup)
     with pytest.raises(OSError, match="stage cleanup failed"):
         snapshot.restore_snapshot(archive, db_path, vault, force=False)
 
-    with sqlite3.connect(db_path) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0] == 1
-    assert (vault / "note.md").read_text() == "# Snapshot\n\nbody"
+    assert len(staged_databases) == 1
+    assert not staged_databases[0].exists()
+    assert _tree_snapshot(actual_root) == _tree_snapshot(expected_root)
+    assert _restore_artifacts(db_path, vault) == set()
+
+
+def test_restore_preserves_primary_error_when_exact_staging_tree_cleanup_fails(
+    snapshot_source, tmp_path, monkeypatch
+):
+    _, valid = snapshot_source
+    damaged = tmp_path / "invalid-database.tar"
+    _rewrite(
+        valid,
+        damaged,
+        lambda members: [
+            (member, b"not sqlite" if member.name == "wiki.db" else data)
+            for member, data in members
+        ],
+    )
+    root = tmp_path / "live"
+    db_path = root / "data" / "wiki.db"
+    vault = root / "vault"
+    db_path.parent.mkdir(parents=True)
+    db_path.write_bytes(b"original database")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+    before_db = _tree_snapshot(db_path.parent)
+    before_vault = _tree_snapshot(vault)
+
+    real_mkdtemp = snapshot.tempfile.mkdtemp
+    real_rmtree = snapshot.shutil.rmtree
+    staged_vaults: list[Path] = []
+
+    def capture_staged_vault(*args, **kwargs):
+        raw_path = real_mkdtemp(*args, **kwargs)
+        staged_vaults.append(Path(raw_path))
+        return raw_path
+
+    def fail_exact_staged_vault(path, *args, **kwargs):
+        if staged_vaults and Path(path) == staged_vaults[0]:
+            raise OSError("staged vault cleanup failed")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(snapshot.tempfile, "mkdtemp", capture_staged_vault)
+    monkeypatch.setattr(snapshot.shutil, "rmtree", fail_exact_staged_vault)
+    with pytest.raises(ValueError, match="invalid snapshot database") as caught:
+        snapshot.restore_snapshot(damaged, db_path, vault, force=True)
+
+    assert str(caught.value) == "invalid snapshot database"
+    assert len(staged_vaults) == 1
+    leftover = staged_vaults[0]
+    assert leftover.exists()
+    assert _tree_snapshot(leftover) == {
+        ".": ("directory", None),
+        "asset.bin": ("file", b"asset"),
+        "note.md": ("file", b"# Snapshot\n\nbody"),
+    }
+    assert _tree_snapshot(db_path.parent) == before_db
+    assert _tree_snapshot(vault) == before_vault
+    assert _restore_artifacts(db_path, vault) == {leftover}
+
+    real_rmtree(leftover)
+    assert _restore_artifacts(db_path, vault) == set()
