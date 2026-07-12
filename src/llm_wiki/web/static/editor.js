@@ -150,7 +150,10 @@
     var items = [], index = 0, fromPos = -1, timer = null, requestSeq = 0;
 
     function isOpen() { return !menu.hidden; }
-    function close() { requestSeq++; menu.hidden = true; items = []; index = 0; fromPos = -1; }
+    function close() {
+      requestSeq++; clearTimeout(timer); timer = null;
+      menu.hidden = true; items = []; index = 0; fromPos = -1;
+    }
 
     function paint(coords) {
       menu.innerHTML = "";
@@ -214,7 +217,7 @@
 
     // Intercept nav keys before CodeMirror sees them (capture phase).
     mountEl.addEventListener("keydown", function (e) {
-      if (!isOpen()) return;
+      if (!isOpen()) { if (e.key === "Escape") close(); return; }
       if (e.key === "ArrowDown") { index = Math.min(items.length - 1, index + 1); highlight(); e.preventDefault(); e.stopPropagation(); }
       else if (e.key === "ArrowUp") { index = Math.max(0, index - 1); highlight(); e.preventDefault(); e.stopPropagation(); }
       else if (e.key === "Enter" || e.key === "Tab") { pick(index); e.preventDefault(); e.stopPropagation(); }

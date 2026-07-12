@@ -384,4 +384,23 @@ describe("editor.js", () => {
     await flush();
     expect(document.querySelector(".wiki-ac-title").textContent).toBe("Newest");
   });
+
+  test("cancels pending autocomplete before fetch on escape or outside pointer", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({ json: () => Promise.resolve({ ok: true, items: [] }) })));
+    await boot();
+    view = makeView("[[escape");
+    api.getView.mockReturnValue(view);
+    const mount = document.querySelector("#md-editor-mount");
+    event(mount, "input");
+    event(mount, "keydown", { key: "Escape" });
+    vi.advanceTimersByTime(100);
+    expect(fetch).not.toHaveBeenCalled();
+
+    view = makeView("[[outside");
+    api.getView.mockReturnValue(view);
+    event(mount, "input");
+    document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    vi.advanceTimersByTime(100);
+    expect(fetch).not.toHaveBeenCalled();
+  });
 });

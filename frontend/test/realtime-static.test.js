@@ -208,4 +208,73 @@ describe("realtime.js", () => {
     vi.runAllTimers();
     expect(sockets).toHaveLength(1);
   });
+
+  test("cancels a scheduled reconnect on unload", async () => {
+    const ws = await boot();
+    ws.onclose();
+    window.dispatchEvent(new Event("beforeunload"));
+    vi.runAllTimers();
+    expect(sockets).toHaveLength(1);
+  });
+
+  test("keeps late handlers from an old socket isolated from the current socket", async () => {
+    const oldSocket = await boot();
+    oldSocket.onclose();
+    vi.advanceTimersByTime(1000);
+    const currentSocket = sockets.at(-1);
+    oldSocket.onerror();
+    expect(oldSocket.close).toHaveBeenCalledOnce();
+    expect(currentSocket.close).not.toHaveBeenCalled();
+    oldSocket.onopen();
+    message(oldSocket, { type: "doc_changed", path: "folder/a b.md", op: "delete" });
+    oldSocket.onclose();
+    expect(document.querySelector("#rt-banner")).toBeNull();
+    vi.runAllTimers();
+    expect(sockets).toHaveLength(2);
+  });
+
+  test("refuses a reconnect callback that races after unload", async () => {
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+    const ws = await boot();
+    ws.onclose();
+    const reconnect = timerSpy.mock.calls.at(-1)[0];
+    window.dispatchEvent(new Event("beforeunload"));
+    reconnect();
+    expect(sockets).toHaveLength(1);
+  });
+
+  test("does not let an older viewer response regress a newer rendered version", async () => {
+    const pending = [];
+    vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve, reject) => pending.push({ resolve, reject }))));
+    const ws = await boot();
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 3 });
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 4 });
+    pending[1].resolve({ json: () => Promise.resolve({ ok: true, html: "<p>v4</p>", version: 4 }) });
+    await flush();
+    pending[0].resolve({ json: () => Promise.resolve({ ok: true, html: "<p>v3</p>", version: 3 }) });
+    await flush();
+    expect(document.querySelector(".rendered").innerHTML).toBe("<p>v4</p>");
+    expect(document.querySelector("#rt-meta").getAttribute("data-version")).toBe("4");
+
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 5 });
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 6 });
+    pending[3].resolve({ json: () => Promise.resolve({ ok: true, html: "<p>v6</p>", version: 6 }) });
+    await flush();
+    pending[2].reject(new Error("late failure"));
+    await flush();
+    expect(document.querySelector(".rendered").innerHTML).toBe("<p>v6</p>");
+    expect(document.querySelector("#rt-meta").getAttribute("data-version")).toBe("6");
+
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 7 });
+    pending[4].resolve({ json: () => Promise.resolve({ ok: true, html: "<p>old payload</p>", version: 5 }) });
+    await flush();
+    expect(document.querySelector(".rendered").innerHTML).toBe("<p>v6</p>");
+    expect(document.querySelector("#rt-meta").getAttribute("data-version")).toBe("6");
+
+    message(ws, { type: "doc_changed", path: "folder/a b.md", op: "update", version: 8 });
+    pending[5].resolve({ json: () => Promise.resolve({ ok: true, html: "<p>missing version</p>" }) });
+    await flush();
+    expect(document.querySelector(".rendered").innerHTML).toBe("<p>v6</p>");
+    expect(document.querySelector("#rt-meta").getAttribute("data-version")).toBe("6");
+  });
 });

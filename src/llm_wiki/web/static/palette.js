@@ -32,9 +32,13 @@
   var items = [];        // current rendered items: {label, sub, run}
   var index = 0;
   var searchTimer = null;
+  var requestSeq = 0;
 
   var previousFocus = null;   // element to restore focus to when the palette closes
   function open(m) {
+    requestSeq++;
+    clearTimeout(searchTimer);
+    searchTimer = null;
     mode = m;
     previousFocus = document.activeElement;   // remember where focus was (WCAG 2.4.3)
     overlay.hidden = false;
@@ -45,6 +49,9 @@
     setTimeout(function () { input.focus(); }, 0);
   }
   function close() {
+    requestSeq++;
+    clearTimeout(searchTimer);
+    searchTimer = null;
     overlay.hidden = true; items = []; index = 0;
     input.setAttribute("aria-expanded", "false");
     input.removeAttribute("aria-activedescendant");
@@ -72,6 +79,7 @@
       paint();
     } else {
       clearTimeout(searchTimer);
+      var requestId = ++requestSeq;
       var query = q.trim();
       if (!query) { items = []; paint(); return; }
       paintLoading();   // immediate feedback over the debounce + network round-trip
@@ -79,7 +87,7 @@
         fetch("/api/complete?q=" + encodeURIComponent(query), { credentials: "same-origin" })
           .then(function (r) { return r.json(); })
           .then(function (d) {
-            if (input.value.trim() !== query) return;   // a newer keystroke owns the list
+            if (requestId !== requestSeq || input.value.trim() !== query) return;   // a newer keystroke owns the list
             var found = (d && d.ok ? d.items : []).map(function (it) {
               return { label: it.title, sub: it.path, run: function () { location.href = "/doc/" + enc(it.path); } };
             });
@@ -88,7 +96,7 @@
             }
             items = found; paint();
           }).catch(function () {
-            if (input.value.trim() === query) { items = []; paint(); }
+            if (requestId === requestSeq && input.value.trim() === query) { items = []; paint(); }
           });
       }, 130);
     }

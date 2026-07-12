@@ -56,6 +56,19 @@ function chooseLabel(list, label, event = "mousedown") {
 }
 
 describe("palette.js", () => {
+  test.each([
+    ["새 문서 만들기", "create"], ["문서 목록", "home list"], ["그래프 보기", "graph"],
+    ["활동 피드", "activity feed"], ["태그 보기", "tags"], ["깨진 링크", "broken links"],
+    ["검색 페이지", "search"], ["API 키 / 설정", "settings keys"], ["사용자 관리", "admin users"],
+    ["좌측 사이드바 토글", "left sidebar"], ["우측 패널 토글", "right panel"],
+    ["라이트/다크 테마 전환", "theme dark"], ["로그아웃", "logout"],
+  ])("finds %s through its non-empty hint", async (label, query) => {
+    const { input, list } = await boot({ canWrite: true, canAdmin: true });
+    window.WikiPalette.openCommands();
+    type(input, query);
+    expect([...list.querySelectorAll(".cmd-label")].map((el) => el.textContent)).toContain(label);
+  });
+
   test("requires the complete palette DOM", async () => {
     await loadStatic("palette");
     document.body.innerHTML = '<div id="cmd-overlay"></div>';
@@ -227,5 +240,40 @@ describe("palette.js", () => {
     requests[2].reject(new Error("offline"));
     await flush();
     expect(list.textContent).toBe("검색 중…");
+  });
+
+  test("keeps the newest same-query response and invalidates requests across reopen", async () => {
+    const { input, list } = await boot();
+    window.WikiPalette.openSwitcher();
+    type(input, "foo");
+    vi.advanceTimersByTime(130);
+    type(input, "foo");
+    vi.advanceTimersByTime(130);
+    requests[1].resolve({ json: () => Promise.resolve({ ok: true, items: [{ title: "B", path: "b.md" }] }) });
+    await flush();
+    requests[0].resolve({ json: () => Promise.resolve({ ok: true, items: [{ title: "A", path: "a.md" }] }) });
+    await flush();
+    expect(list.querySelector(".cmd-label").textContent).toBe("B");
+
+    type(input, "foo");
+    vi.advanceTimersByTime(130);
+    key(input, "Escape");
+    window.WikiPalette.openSwitcher();
+    type(input, "foo");
+    vi.advanceTimersByTime(130);
+    requests[3].resolve({ json: () => Promise.resolve({ ok: true, items: [{ title: "reopened", path: "new.md" }] }) });
+    await flush();
+    requests[2].resolve({ json: () => Promise.resolve({ ok: true, items: [{ title: "closed", path: "old.md" }] }) });
+    await flush();
+    expect(list.querySelector(".cmd-label").textContent).toBe("reopened");
+  });
+
+  test("cancels a pending switcher debounce when closed", async () => {
+    const { input } = await boot();
+    window.WikiPalette.openSwitcher();
+    type(input, "pending");
+    key(input, "Escape");
+    vi.advanceTimersByTime(130);
+    expect(fetch).not.toHaveBeenCalled();
   });
 });

@@ -64,10 +64,11 @@
   }
 
   function refreshRendered(ev) {
+    var requestId = ++refreshSeq;
     fetch("/api/doc/" + encPath(path) + "/rendered", { credentials: "same-origin" })
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        if (!d || !d.ok) return;
+        if (requestId !== refreshSeq || !d || !d.ok || !(d.version >= version)) return;
         var rendered = document.querySelector(".rendered");
         if (rendered) rendered.innerHTML = d.html;
         version = d.version;
@@ -114,25 +115,30 @@
     }
   }
 
-  var ws = null, backoff = 1000, closed = false;
+  var ws = null, backoff = 1000, closed = false, reconnectTimer = null, refreshSeq = 0;
   function connect() {
+    if (closed) return;
     var proto = location.protocol === "https:" ? "wss:" : "ws:";
+    var socket;
     try {
-      ws = new WebSocket(proto + "//" + location.host + "/ws");
+      socket = new WebSocket(proto + "//" + location.host + "/ws");
+      ws = socket;
     } catch (e) { return; }
-    ws.onopen = function () { backoff = 1000; };
-    ws.onmessage = function (m) {
+    socket.onopen = function () { if (socket === ws) backoff = 1000; };
+    socket.onmessage = function (m) {
+      if (socket !== ws) return;
       try { onEvent(JSON.parse(m.data)); } catch (e) { /* ignore malformed */ }
     };
-    ws.onerror = function () { try { ws.close(); } catch (e) {} };
-    ws.onclose = function () {
-      if (closed) return;
-      setTimeout(connect, backoff);
+    socket.onerror = function () { try { socket.close(); } catch (e) {} };
+    socket.onclose = function () {
+      if (closed || socket !== ws) return;
+      reconnectTimer = setTimeout(function () { reconnectTimer = null; connect(); }, backoff);
       backoff = Math.min(backoff * 2, 30000); // exponential backoff, capped
     };
   }
   window.addEventListener("beforeunload", function () {
     closed = true;
+    if (reconnectTimer !== null) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     if (ws) { try { ws.close(); } catch (e) {} }
   });
   connect();
