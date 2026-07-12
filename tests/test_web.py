@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 from llm_wiki.db import Database
 from llm_wiki.search import SearchResult
 from llm_wiki.services.documents import SearchFilters, SearchPage
+from llm_wiki.services.errors import NotFoundError
 from llm_wiki.web import create_web_app
 
 
@@ -482,6 +483,178 @@ def test_optimistic_conflict_page(client):
     assert r.status_code == 409 and "충돌" in r.text
     # C3: the conflict page offers a one-click "load current version" recovery affordance.
     assert 'id="load-current"' in r.text and 'id="server-current"' in r.text
+
+
+def test_stale_edit_renders_semantic_merge_preview_without_saving(client, ctx, principals):
+    login(client, "admin")
+    base = "one\ntwo\nthree\n"
+    mine = "one\n<script>alert(1)</script>\nthree\n"
+    current = "one\n<strong>server</strong>\nthree\n"
+    ctx.docs.create(principals["admin"], "semantic.md", base)
+    ctx.docs.update(principals["admin"], "semantic.md", 1, current)
+
+    response = client.post(
+        "/doc/semantic.md/edit",
+        data={
+            "content": mine,
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/semantic.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert '<input type="hidden" name="base_version" value="2">' in response.text
+    assert '<fieldset class="merge-conflict"' in response.text
+    assert "<legend>2번째 줄 충돌</legend>" in response.text
+    assert 'name="conflict-0"' in response.text
+    assert "기준 버전" in response.text and "내 편집" in response.text and "서버 현재" in response.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "&lt;strong&gt;server&lt;/strong&gt;" in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert ctx.docs.get("semantic.md")["content"] == current
+    assert ctx.docs.get("semantic.md")["version"] == 2
+
+
+def test_stale_edit_with_pruned_base_keeps_mine_and_manual_recovery(client, ctx, principals):
+    login(client, "admin")
+    ctx.docs.create(principals["admin"], "manual.md", "base")
+    ctx.docs.update(principals["admin"], "manual.md", 1, "current")
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "DELETE FROM revisions WHERE doc_id=(SELECT id FROM documents WHERE path_norm=?) "
+            "AND version=1",
+            ("manual.md",),
+        )
+
+    response = client.post(
+        "/doc/manual.md/edit",
+        data={
+            "content": "irreplaceable mine",
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/manual.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert "자동 병합할 수 없어 수동 복구가 필요합니다" in response.text
+    assert "irreplaceable mine" in response.text
+    assert '<fieldset class="merge-conflict"' not in response.text
+    assert ctx.docs.get("manual.md")["content"] == "current"
+
+
+def test_disjoint_stale_edit_only_proposes_auto_merge(client, ctx, principals):
+    login(client, "admin")
+    base = "one\ntwo\nthree\n"
+    mine = "ONE\ntwo\nthree\n"
+    current = "one\ntwo\nTHREE\n"
+    ctx.docs.create(principals["admin"], "proposal.md", base)
+    ctx.docs.update(principals["admin"], "proposal.md", 1, current)
+
+    response = client.post(
+        "/doc/proposal.md/edit",
+        data={
+            "content": mine,
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/proposal.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert "자동 병합 제안 보기 (아직 저장되지 않음)" in response.text
+    assert "ONE\ntwo\nTHREE" in response.text
+    assert ctx.docs.get("proposal.md")["content"] == current
+    assert ctx.docs.get("proposal.md")["version"] == 2
+
+
+def test_merge_preview_submission_still_uses_cas_after_another_change(client, ctx, principals):
+    login(client, "admin")
+    ctx.docs.create(principals["admin"], "race.md", "base")
+    ctx.docs.update(principals["admin"], "race.md", 1, "current two")
+    first = client.post(
+        "/doc/race.md/edit",
+        data={
+            "content": "mine one",
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/race.md/edit"),
+        },
+    )
+    assert first.status_code == 409
+
+    ctx.docs.update(principals["admin"], "race.md", 2, "current three")
+    second = client.post(
+        "/doc/race.md/edit",
+        data={
+            "content": "proposed merge",
+            "base_version": "2",
+            "csrf_token": _token(client, "/doc/race.md/edit"),
+        },
+    )
+
+    assert second.status_code == 409
+    assert '<input type="hidden" name="base_version" value="3">' in second.text
+    assert ctx.docs.get("race.md")["content"] == "current three"
+    assert ctx.docs.get("race.md")["version"] == 3
+
+
+def test_conflict_page_uses_the_preview_snapshot_if_current_changes_during_response(
+    client, ctx, principals, monkeypatch
+):
+    login(client, "admin")
+    ctx.docs.create(principals["admin"], "response-race.md", "base")
+    ctx.docs.update(principals["admin"], "response-race.md", 1, "current two")
+    real_preview = ctx.docs.merge_preview
+
+    def raced_preview(principal, path, base_version, mine):
+        ctx.docs.update(principals["editor"], path, 2, "current three")
+        return real_preview(principal, path, base_version, mine)
+
+    monkeypatch.setattr(ctx.docs, "merge_preview", raced_preview)
+    response = client.post(
+        "/doc/response-race.md/edit",
+        data={
+            "content": "mine",
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/response-race.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert "현재 <b>v3</b>" in response.text
+    assert "현재 <b>v3</b>, alice" in response.text
+    assert '<pre id="server-current">current three</pre>' in response.text
+    assert '<input type="hidden" name="base_version" value="3">' in response.text
+
+
+def test_conflict_page_preserves_manual_recovery_if_document_is_deleted_before_preview(
+    client, ctx, principals, monkeypatch
+):
+    login(client, "admin")
+    ctx.docs.create(principals["admin"], "vanished.md", "base")
+    ctx.docs.update(principals["admin"], "vanished.md", 1, "current")
+
+    real_preview = ctx.docs.merge_preview
+
+    def deleted_preview(principal, path, base_version, mine):
+        ctx.docs.delete(principals["admin"], path, 2)
+        return real_preview(principal, path, base_version, mine)
+
+    monkeypatch.setattr(ctx.docs, "merge_preview", deleted_preview)
+    response = client.post(
+        "/doc/vanished.md/edit",
+        data={
+            "content": "irreplaceable mine",
+            "base_version": "1",
+            "csrf_token": _token(client, "/doc/vanished.md/edit"),
+        },
+    )
+
+    assert response.status_code == 409
+    assert "자동 병합할 수 없어 수동 복구가 필요합니다" in response.text
+    assert "irreplaceable mine" in response.text
+    assert '<pre id="server-current">current</pre>' in response.text
+    assert '<input type="hidden" name="base_version" value="2">' in response.text
+    with pytest.raises(NotFoundError):
+        ctx.docs.get("vanished.md")
 
 
 def test_new_post_invalid_path_stays_on_form(client):

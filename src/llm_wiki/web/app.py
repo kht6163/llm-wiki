@@ -876,10 +876,35 @@ def create_web_app(app: AppContext) -> FastAPI:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
             )
+            try:
+                merge_preview = docs.merge_preview(p, path, base_version, content)
+            except (WikiError, RuntimeError):
+                merge_preview = {
+                    "base_version": base_version,
+                    "current_version": e.extra.get("current_version"),
+                    "updated_by": e.extra.get("updated_by"),
+                    "updated_at": e.extra.get("updated_at"),
+                    "current_via": e.extra.get("current_via"),
+                    "base": None,
+                    "mine": content,
+                    "current": e.extra.get("current_content") or "",
+                    "merged": None,
+                    "conflicts": [],
+                    "manual_only": True,
+                }
+            conflict = {
+                **e.extra,
+                "current_version": merge_preview["current_version"],
+                "current_content": merge_preview["current"],
+                "updated_by": merge_preview["updated_by"],
+                "updated_at": merge_preview["updated_at"],
+                "current_via": merge_preview["current_via"],
+            }
             return render("edit.html", request, status=409, is_new=False, path=path, title=title,
-                          content=content, base_version=e.extra.get("current_version"),
-                          conflict=e.extra, error=None, can_write=p.can_write,
-                          conflict_diff=_diff_lines(content, e.extra.get("current_content") or ""))
+                          content=content, base_version=merge_preview["current_version"],
+                          conflict=conflict, error=None, can_write=p.can_write,
+                          merge_preview=merge_preview,
+                          conflict_diff=_diff_lines(content, merge_preview["current"]))
         except PathError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path

@@ -10,6 +10,38 @@
   <strong>{{ icon("alert-triangle") }} 충돌로 거부됨.</strong>
   다른 변경(현재 <b>v{{ conflict.current_version }}</b>{% if conflict.updated_by %}, {{ conflict.updated_by }}{% endif %})이 먼저 적용되었습니다.
   아래 차이를 확인해 병합한 뒤 다시 저장하세요. (base_version은 v{{ conflict.current_version }}로 갱신됨)
+  {% if merge_preview.manual_only %}
+  <p><strong>자동 병합할 수 없어 수동 복구가 필요합니다.</strong>
+    요청한 기준 v{{ merge_preview.base_version }} 리비전이 없어 현재 내용과 내 편집을 직접 비교해야 합니다.</p>
+  {% elif merge_preview.conflicts %}
+  <section aria-label="병합 충돌 선택지">
+    {% for hunk in merge_preview.conflicts %}
+    <fieldset class="merge-conflict" data-start-line="{{ hunk.start_line }}">
+      <legend>{{ hunk.start_line }}번째 줄 충돌</legend>
+      <label>
+        <input type="radio" name="conflict-{{ loop.index0 }}" value="mine" checked>
+        내 편집
+        <pre>{{ hunk.mine }}</pre>
+      </label>
+      <label>
+        <input type="radio" name="conflict-{{ loop.index0 }}" value="current">
+        서버 현재
+        <pre>{{ hunk.current }}</pre>
+      </label>
+      <label>
+        <input type="radio" name="conflict-{{ loop.index0 }}" value="base">
+        기준 버전
+        <pre>{{ hunk.base }}</pre>
+      </label>
+    </fieldset>
+    {% endfor %}
+  </section>
+  {% else %}
+  <details open>
+    <summary>자동 병합 제안 보기 (아직 저장되지 않음)</summary>
+    <pre>{{ merge_preview.merged }}</pre>
+  </details>
+  {% endif %}
   {% if conflict_diff %}
   <details open>
     <summary>내 편집(−) ↔ 서버 현재(+) 차이</summary>

@@ -49,6 +49,7 @@ from ..markdown_utils import (
     set_frontmatter_property,
     set_frontmatter_tags,
 )
+from ..merge import three_way_merge
 from ..metrics import DOC_WRITES
 from ..util import (
     PathError,
@@ -1512,6 +1513,68 @@ class DocumentService:
                 "updated_by": self._username(conn, d["updated_by"]),
                 "last_via": lv["via"] if lv else None,
             }
+
+    def merge_preview(
+        self, principal: Principal, path: str, base_version: int, mine: str
+    ) -> dict:
+        """Build a non-persisting three-way merge proposal from an exact revision."""
+        if not principal.can_write:
+            raise ForbiddenError(
+                f"Role '{principal.role}' cannot modify documents (read/search only)."
+            )
+        rel = normalize_rel_path(path)
+        fp.managed_path(self.vault, rel, namespace="live")
+        norm = path_norm(rel)
+        requested_version = int(base_version)
+        with self.db.reader() as conn:
+            row = conn.execute(
+                "SELECT d.id,d.version,d.is_deleted,d.updated_at,u.username AS updated_by,"
+                "current.body AS current_body,current.via AS current_via,base.body AS base_body "
+                "FROM documents d "
+                "LEFT JOIN revisions current "
+                "ON current.doc_id=d.id AND current.version=d.version "
+                "LEFT JOIN revisions base "
+                "ON base.doc_id=d.id AND base.version=? "
+                "LEFT JOIN users u ON u.id=d.updated_by WHERE d.path_norm=?",
+                (requested_version, norm),
+            ).fetchone()
+            if row is None or row["is_deleted"]:
+                raise NotFoundError("No document at this path.", path=rel)
+            if row["current_body"] is None:
+                raise RuntimeError("current document revision is missing or corrupt")
+            current = str(row["current_body"])
+            current_version = int(row["version"])
+            base = row["base_body"]
+
+        preview = {
+            "base_version": requested_version,
+            "current_version": current_version,
+            "updated_by": row["updated_by"],
+            "updated_at": row["updated_at"],
+            "current_via": row["current_via"],
+            "base": base,
+            "mine": mine,
+            "current": current,
+            "merged": None,
+            "conflicts": [],
+            "manual_only": base is None,
+        }
+        if base is None:
+            return preview
+
+        result = three_way_merge(str(base), mine, current)
+        preview["merged"] = result.text
+        preview["conflicts"] = [
+            {
+                "start_line": hunk.start_line,
+                "base": hunk.base,
+                "mine": hunk.mine,
+                "current": hunk.current,
+                "resolved": hunk.resolved,
+            }
+            for hunk in result.conflicts
+        ]
+        return preview
 
     def info(self, path: str) -> dict:
         """Document metadata WITHOUT the body — a cheap poll for an agent to check
