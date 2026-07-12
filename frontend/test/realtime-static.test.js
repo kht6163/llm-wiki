@@ -243,6 +243,59 @@ describe("realtime.js", () => {
     expect(sockets).toHaveLength(1);
   });
 
+  test("soft-refreshes on focus/visibility when server version is newer", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
+      json: () => Promise.resolve({
+        ok: true, html: "<h1>soft</h1>", version: 5, updated_by: "server", last_via: "mcp",
+      }),
+    })));
+    await boot({ version: "2" });
+    // Debounce: first tick within 2s should not fetch yet.
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(fetch).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2000);
+    await flush();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/doc/folder/a%20b.md/rendered",
+      { credentials: "same-origin" },
+    );
+    expect(document.querySelector(".rendered").innerHTML).toBe("<h1>soft</h1>");
+    expect(document.querySelector("#rt-meta").getAttribute("data-version")).toBe("5");
+  });
+
+  test("soft-refresh shows editor banner without replacing body", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
+      json: () => Promise.resolve({
+        ok: true, html: "<p>ignored</p>", version: 9, updated_by: "bob", last_via: "web",
+      }),
+    })));
+    await boot({ mode: "edit", version: "3", rendered: false });
+    window.dispatchEvent(new Event("focus"));
+    vi.advanceTimersByTime(2000);
+    await flush();
+    const banner = document.querySelector("#rt-banner");
+    expect(banner).not.toBeNull();
+    expect(banner.textContent).toContain("다른 곳에서");
+    expect(banner.textContent).toContain("v9");
+  });
+
+  test("soft-refresh debounces and skips when version is not newer", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
+      json: () => Promise.resolve({ ok: true, html: "same", version: 2 }),
+    })));
+    await boot({ version: "2" });
+    window.dispatchEvent(new Event("focus"));
+    window.dispatchEvent(new Event("focus"));
+    document.dispatchEvent(new Event("visibilitychange"));
+    vi.advanceTimersByTime(2000);
+    await flush();
+    // One coalesced check after debounce, no DOM refresh for non-newer version.
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(document.querySelector(".rendered").textContent).toBe("old");
+    expect(document.querySelector("#rt-banner")).toBeNull();
+  });
+
   test("does not let an older viewer response regress a newer rendered version", async () => {
     const pending = [];
     vi.stubGlobal("fetch", vi.fn(() => new Promise((resolve, reject) => pending.push({ resolve, reject }))));

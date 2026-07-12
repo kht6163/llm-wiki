@@ -5,6 +5,9 @@
 <div class="graph-controls">
   <label class="g-root">중심 문서 <input id="root" type="text" value="{{ root }}" placeholder="(비우면 전체)" size="36"></label>
   <label>깊이 <input id="depth" type="number" value="1" min="1" max="3"></label>
+  <label>폴더 <input id="folder" type="text" value="" placeholder="(전체)" size="16" autocomplete="off"></label>
+  <label>태그 <input id="tag" type="text" value="" placeholder="(전체)" size="12" autocomplete="off"></label>
+  <label class="g-check"><input id="include-unresolved" type="checkbox" checked> 미해결 링크</label>
   <button class="primary" id="graph-apply" type="button">적용</button>
   <span id="ginfo" class="muted" role="status" aria-live="polite"></span>
 </div>
@@ -40,12 +43,18 @@ function graphStyle() {
 async function reloadGraph() {
   const root = document.getElementById('root').value.trim();
   const depth = document.getElementById('depth').value;
+  const folder = document.getElementById('folder').value.trim();
+  const tag = document.getElementById('tag').value.trim();
+  const includeUnresolved = document.getElementById('include-unresolved').checked;
   const info = document.getElementById('ginfo');
   const empty = document.getElementById('gempty');
   info.textContent = '불러오는 중…';
   info.classList.add('is-loading'); info.setAttribute('aria-busy', 'true');
-  let url = '/api/graph?depth=' + encodeURIComponent(depth) + '&limit=500';
+  let url = '/api/graph?depth=' + encodeURIComponent(depth) + '&limit=500'
+    + '&include_unresolved=' + (includeUnresolved ? 'true' : 'false');
   if (root) url += '&root=' + encodeURIComponent(root);
+  if (folder) url += '&folder=' + encodeURIComponent(folder);
+  if (tag) url += '&tag=' + encodeURIComponent(tag);
   let data;
   try {
     data = await (await fetch(url)).json();
@@ -166,9 +175,9 @@ document.getElementById('cy').addEventListener('keydown', function (e) {
   }
 });
 
-// Apply button + Enter in the root/depth fields apply the graph (keyboard parity).
+// Apply button + Enter in the filter fields apply the graph (keyboard parity).
 document.getElementById('graph-apply').addEventListener('click', reloadGraph);
-['root', 'depth'].forEach(function (id) {
+['root', 'depth', 'folder', 'tag'].forEach(function (id) {
   document.getElementById(id).addEventListener('keydown', function (e) {
     if (e.key === 'Enter') { e.preventDefault(); reloadGraph(); }
   });

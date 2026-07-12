@@ -106,6 +106,36 @@ def recent(db: Database, *, limit: int = 100, since: str | None = None,
     return [dict(r) for r in rows]
 
 
+def via_counts(
+    db: Database,
+    *,
+    since: str | None = None,
+    until: str | None = None,
+    actions: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, int]:
+    """Count audit rows per ``via`` for the given window/scope (same filters as
+    ``recent`` minus limit/via/actor). Used by the activity page summary chips."""
+    clauses: list[str] = []
+    params: list = []
+    if since:
+        clauses.append("ts >= ?")
+        params.append(since)
+    if until:
+        clauses.append("ts <= ?")
+        params.append(until)
+    if actions:
+        ph = ",".join("?" * len(actions))
+        clauses.append(f"action IN ({ph})")
+        params.extend(actions)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    with db.reader() as conn:
+        rows = conn.execute(
+            f"SELECT via, COUNT(*) AS n FROM audit_log{where} GROUP BY via",
+            params,
+        ).fetchall()
+    return {str(r["via"] or ""): int(r["n"]) for r in rows if r["via"]}
+
+
 def prune(db: Database, *, older_than_days: int, apply: bool) -> dict:
     """Delete audit_log rows older than ``older_than_days`` (0 = keep all). Returns a
     report; ``apply=False`` counts without deleting. Used by the ``prune`` CLI to bound

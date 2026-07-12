@@ -2152,9 +2152,27 @@ class DocumentService:
                 raise NotFoundError("No document at this path.", path=rel)
             return {"path": rel, "links": graph.get_outgoing(conn, d["id"])}
 
-    def graph(self, root=None, depth=1, limit=500, include_unresolved=True) -> dict:
+    def graph(
+        self,
+        root=None,
+        depth=1,
+        limit=500,
+        include_unresolved=True,
+        folder=None,
+        tag=None,
+        tags=None,
+    ) -> dict:
         with self.db.reader() as conn:
-            return graph.build_graph(conn, root, depth, limit, include_unresolved)
+            return graph.build_graph(
+                conn,
+                root,
+                depth,
+                limit,
+                include_unresolved,
+                folder=folder,
+                tag=tag,
+                tags=tags,
+            )
 
     def search_page(
         self,

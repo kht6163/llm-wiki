@@ -40,6 +40,12 @@ _CJK_RE = re.compile(
     "[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7a3\uf900-\ufaff]")
 
 
+def contains_cjk(text: str | None) -> bool:
+    """True when ``text`` contains Hangul, CJK ideographs, or kana (BM25 alone
+    can miss unspaced compounds; hybrid mode is the usual suggestion)."""
+    return bool(text and _CJK_RE.search(text))
+
+
 def word_count(text: str) -> dict:
     """Word and character counts for the status bar. CJK (한중일) is counted per
     character (no spaces between words); the remainder is counted by whitespace

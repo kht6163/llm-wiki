@@ -20,15 +20,27 @@
   {% if is_admin %}관리자에게는 인증·계정 이벤트까지 표시됩니다.{% else %}문서·첨부 활동을 표시합니다.{% endif %}
 </p>
 
-<form class="listsort" method="get" action="/activity">
+{% set via_summary = via_summary or {} %}
+{% set via_total = (via_summary.get('web', 0) + via_summary.get('mcp', 0) + via_summary.get('cli', 0)) %}
+{% if via_summary %}
+<div class="via-summary" aria-label="출처별 활동 요약">
+  <span class="via-summary-label">현재 기간</span>
+  <span class="via-summary-item">전체 <strong class="count">{{ via_total }}</strong></span>
+  <span class="via-summary-item">사람 <strong class="count">{{ via_summary.get('web', 0) }}</strong></span>
+  <span class="via-summary-item">에이전트 <strong class="count">{{ via_summary.get('mcp', 0) }}</strong></span>
+  <span class="via-summary-item">CLI <strong class="count">{{ via_summary.get('cli', 0) }}</strong></span>
+</div>
+{% endif %}
+
+<form class="listsort" method="get" action="/activity" id="activity-filter">
   <label>기간
-    <select name="window">
+    <select name="window" id="activity-window">
       {% set wlabel = {"today": "오늘", "24h": "최근 24시간", "7d": "최근 7일", "30d": "최근 30일", "all": "전체"} %}
       {% for w in windows %}<option value="{{ w }}" {{ 'selected' if window==w }}>{{ wlabel[w] }}</option>{% endfor %}
     </select>
   </label>
   <label>출처
-    <select name="via">
+    <select name="via" id="activity-via">
       <option value="" {{ 'selected' if not via }}>전체</option>
       <option value="web" {{ 'selected' if via=='web' }}>사람</option>
       <option value="mcp" {{ 'selected' if via=='mcp' }}>에이전트</option>
@@ -36,8 +48,32 @@
     </select>
   </label>
   {% if action %}<input type="hidden" name="action" value="{{ action }}">{% endif %}
-  <button class="ghost">적용</button>
+  <button class="ghost" type="submit">적용</button>
 </form>
+{# Chip buttons set the via select without auto-submitting (WCAG 3.2.2). #}
+<div class="via-chips" role="group" aria-label="출처 빠른 선택">
+  <button type="button" class="filter-chip{{ ' is-active' if not via }}" data-via="" aria-pressed="{{ 'true' if not via else 'false' }}">전체</button>
+  <button type="button" class="filter-chip{{ ' is-active' if via=='web' }}" data-via="web" aria-pressed="{{ 'true' if via=='web' else 'false' }}">사람</button>
+  <button type="button" class="filter-chip{{ ' is-active' if via=='mcp' }}" data-via="mcp" aria-pressed="{{ 'true' if via=='mcp' else 'false' }}">에이전트</button>
+  <button type="button" class="filter-chip{{ ' is-active' if via=='cli' }}" data-via="cli" aria-pressed="{{ 'true' if via=='cli' else 'false' }}">CLI</button>
+</div>
+<script nonce="{{ csp_nonce }}">
+(function () {
+  var form = document.getElementById("activity-filter");
+  var viaSel = document.getElementById("activity-via");
+  if (!form || !viaSel) return;
+  document.querySelectorAll(".via-chips [data-via]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      viaSel.value = btn.getAttribute("data-via") || "";
+      document.querySelectorAll(".via-chips [data-via]").forEach(function (b) {
+        var on = b === btn;
+        b.classList.toggle("is-active", on);
+        b.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+    });
+  });
+})();
+</script>
 
 {% if not events %}
   <div class="empty-state">
@@ -50,7 +86,7 @@
   <thead><tr><th scope="col">시각</th><th scope="col">출처</th><th scope="col">동작</th><th scope="col">행위자</th><th scope="col">대상</th><th scope="col">결과</th></tr></thead>
   <tbody>
   {% for e in events %}
-    <tr>
+    <tr{% if e.via == 'mcp' %} class="via-mcp-row"{% endif %}>
       <td data-label="시각">{{ e.ts|dt }}</td>
       <td data-label="출처">{{ via_badge(e.via) }}</td>
       <td data-label="동작">{{ action_labels.get(e.action, e.action) }}{% if e.detail %} <span class="muted">{{ e.detail }}</span>{% endif %}</td>

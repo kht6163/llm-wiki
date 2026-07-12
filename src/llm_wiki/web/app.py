@@ -71,6 +71,7 @@ from ..services.errors import (
 from ..util import (
     PathError,
     clamp_int,
+    contains_cjk,
     content_disposition_attachment,
     normalize_client_ip,
     word_count,
@@ -220,6 +221,7 @@ def create_web_app(app: AppContext) -> FastAPI:
         return f"/static/{rel}?v={ver}"
 
     templates.env.globals["static"] = _static_url
+    templates.env.globals["contains_cjk"] = contains_cjk
 
     # A global dependency enforces CSRF (same-origin + per-session token) on every
     # unsafe method; safe methods pass through. Forms carry the token via a hidden
@@ -701,16 +703,38 @@ def create_web_app(app: AppContext) -> FastAPI:
         window = window if window in _ACTIVITY_WINDOWS else "7d"
         via_f = via if via in ("web", "mcp", "cli") else None
         scope = None if p.can_admin else audit.DOC_ACTIONS
-        events = audit.recent(db, limit=300, since=_window_since(window),
+        since = _window_since(window)
+        events = audit.recent(db, limit=300, since=since,
                               via=via_f, action=(action or None), actions=scope)
+        # Summary counts for the window (unfiltered by via so chips show full split).
+        via_summary = audit.via_counts(db, since=since, actions=scope)
         return render("activity.html", request, events=events, window=window,
                       windows=_ACTIVITY_WINDOWS, via=via_f or "", action=action or "",
-                      is_admin=p.can_admin, doc_actions=audit.DOC_ACTIONS)
+                      is_admin=p.can_admin, doc_actions=audit.DOC_ACTIONS,
+                      via_summary=via_summary)
 
     @web.get("/api/graph")
-    def api_graph(request: Request, root: str | None = None, depth: int = 1, limit: int = 500,
-                  _p: Principal = Depends(require_user)):
-        return JSONResponse(docs.graph(root=root or None, depth=depth, limit=limit))
+    def api_graph(
+        request: Request,
+        root: str | None = None,
+        depth: int = 1,
+        limit: int = 500,
+        folder: str | None = None,
+        tag: list[str] = Query(default=[]),
+        include_unresolved: bool = True,
+        _p: Principal = Depends(require_user),
+    ):
+        tags = [value for value in tag if value and value.strip()]
+        return JSONResponse(
+            docs.graph(
+                root=root or None,
+                depth=depth,
+                limit=limit,
+                folder=folder or None,
+                tags=tags or None,
+                include_unresolved=include_unresolved,
+            )
+        )
 
     @web.get("/api/complete")
     def api_complete(request: Request, q: str = "", _p: Principal = Depends(require_user)):

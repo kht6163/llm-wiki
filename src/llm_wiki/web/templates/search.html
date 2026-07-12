@@ -31,6 +31,12 @@
   </header>
 
   {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+  {% if q and active_mode == 'bm25' and contains_cjk(q) %}
+  <div class="search-cjk-hint" role="status">
+    한국어·CJK 검색어는 BM25만으로는 띄어쓰지 않은 합성어를 놓칠 수 있습니다.
+    <a href="/search?q={{ q|urlencode }}&amp;mode=hybrid{% if active_folder %}&amp;folder={{ active_folder|urlencode }}{% endif %}{% for value in active_tags %}&amp;tag={{ value|urlencode }}{% endfor %}{% if active_per_page %}&amp;per_page={{ active_per_page }}{% endif %}">하이브리드 모드로 다시 검색</a>
+  </div>
+  {% endif %}
   <form action="/search" method="get" class="searchform" role="search">
     <label class="search-query-field" for="search-query">
       <span class="visually-hidden">검색어</span>
