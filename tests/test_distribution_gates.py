@@ -54,6 +54,8 @@ def test_distribution_smoke_accepts_exact_wheel_asset_tree(tmp_path: Path):
         "llm_wiki-0.31.1/frontend/node_modules/pkg/index.js",
         "llm_wiki-0.31.1/data/llm_wiki.db",
         "llm_wiki-0.31.1/native/addon.node",
+        "llm_wiki-0.31.1/secrets/token.txt",
+        "llm_wiki-0.31.1/config/signing.key",
     ],
 )
 def test_sdist_smoke_rejects_forbidden_members(tmp_path: Path, member: str):
@@ -77,6 +79,19 @@ def test_sdist_smoke_rejects_oversized_archive(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="exceeds size limit"):
         verify_sdist(archive, max_bytes=10)
+
+
+def test_sdist_smoke_requires_env_example(tmp_path: Path):
+    from scripts.distribution_smoke import verify_sdist
+
+    archive = tmp_path / "package.tar.gz"
+    payload = tmp_path / "payload"
+    payload.write_bytes(b"readme")
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(payload, arcname="llm_wiki-0.31.1/README.md")
+
+    with pytest.raises(RuntimeError, match=r"missing required sdist files:.*\.env\.example"):
+        verify_sdist(archive)
 
 
 def test_distribution_smoke_keeps_cli_in_virtual_environment():

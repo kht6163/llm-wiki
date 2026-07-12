@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 ASSET_ROOTS = ("web/templates", "web/static")
 MAX_SDIST_BYTES = 10 * 1024 * 1024
+REQUIRED_SDIST_FILES = {".env.example"}
 FORBIDDEN_SDIST_PREFIXES = (
     ".venv/",
     ".worktrees/",
@@ -26,10 +27,12 @@ FORBIDDEN_SDIST_PREFIXES = (
     "frontend/node_modules/",
     "htmlcov/",
     "models/",
+    "secrets/",
     "vault/",
 )
 FORBIDDEN_SDIST_SUFFIXES = (
-    ".db", ".dll", ".dylib", ".node", ".pem", ".pyc", ".pyo", ".so", ".sqlite", ".sqlite3"
+    ".db", ".dll", ".dylib", ".key", ".node", ".pem", ".pyc", ".pyo", ".so",
+    ".sqlite", ".sqlite3",
 )
 
 
@@ -90,6 +93,7 @@ def verify_sdist(archive: Path, *, max_bytes: int = MAX_SDIST_BYTES) -> None:
     size = archive.stat().st_size
     if size > max_bytes:
         raise RuntimeError(f"sdist size {size} exceeds size limit {max_bytes}")
+    seen: set[str] = set()
     with tarfile.open(archive, "r:gz") as tar:
         for member in tar.getmembers():
             full = PurePosixPath(member.name)
@@ -100,6 +104,11 @@ def verify_sdist(archive: Path, *, max_bytes: int = MAX_SDIST_BYTES) -> None:
                 raise RuntimeError(f"forbidden sdist member: {member.name}")
             if not (member.isfile() or member.isdir()):
                 raise RuntimeError(f"non-regular sdist member: {member.name}")
+            if member.isfile():
+                seen.add(relative.as_posix())
+    missing = sorted(REQUIRED_SDIST_FILES - seen)
+    if missing:
+        raise RuntimeError(f"missing required sdist files: {missing}")
 
 
 def cli_path(python_executable: str) -> Path:

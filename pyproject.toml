@@ -69,6 +69,7 @@ exclude = [
     "/coverage.xml",
     "/.env",
     "/.env.*",
+    "!/.env.example",
     "/**/__pycache__",
     "/**/*.db",
     "/**/*.db-*",
