@@ -74,6 +74,7 @@ def test_key_throttle_name_limit_and_update_race_preserve_active_key(
             principal.role,
             via="mcp",
             credential_version=principal.credential_version,
+            api_key_id=key["id"],
         )
         first_used = auth.list_api_keys(ctx.db, principal.user_id)[0]["last_used_at"]
         assert first_used is not None

@@ -15,8 +15,10 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import llm_wiki.web.app as web_mod
+from llm_wiki import file_projection as fp
 from llm_wiki.services import users as users_svc
 from llm_wiki.services.auth import create_api_key
+from llm_wiki.services.documents import ProjectionPendingError
 from llm_wiki.services.errors import ConflictError, NotFoundError, ValidationError
 from llm_wiki.util import PathError
 from llm_wiki.web import create_web_app
@@ -33,6 +35,11 @@ def _login(client: TestClient, username: str = "alice") -> None:
         "/login",
         data={"username": username, "password": "secret12", "csrf_token": _token(client)},
     )
+    assert response.status_code == 200
+
+
+def _logout(client: TestClient) -> None:
+    response = client.post("/logout", data={"csrf_token": _token(client, "/")})
     assert response.status_code == 200
 
 
@@ -154,10 +161,12 @@ def test_page_permission_and_service_failures_are_visible(ctx, principals, monke
     _login(client, "bob")
     assert client.get("/trash").status_code == 403
     assert client.get("/activity").status_code == 403
-    daily = client.get("/daily", follow_redirects=False)
+    daily = client.post(
+        "/daily", data={"csrf_token": _token(client, "/")}, follow_redirects=False
+    )
     assert daily.status_code == 303 and daily.headers["location"] == "/"
 
-    client.get("/logout")
+    _logout(client)
     _login(client)
     monkeypatch.setattr(ctx.docs, "broken_links", lambda **kw: {"count": 0, "links": []})
     assert client.get("/graph?root=x.md").status_code == 200
@@ -237,6 +246,144 @@ def test_route_specific_failures_preserve_redirect_flash_and_audit(ctx, principa
             "SELECT action FROM audit_log WHERE actor='alice' AND outcome != 'ok'"
         )]
     assert {"doc_delete", "doc_restore", "doc_purge"} <= set(actions)
+
+
+def test_committed_projection_delays_are_successful_web_writes_without_rejection_audit(
+    ctx, principals, monkeypatch
+):
+    client = _client(ctx, principals)
+    _login(client)
+    csrf = _token(client, "/")
+
+    def pending(path: str) -> ProjectionPendingError:
+        return ProjectionPendingError(
+            fp.ProjectionResult(7, path, False, False, "target_changed", attempts=3)
+        )
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "create",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("queued.md")),
+    )
+    created = client.post(
+        "/broken-links/create",
+        data={"target": "queued", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+    assert created.headers["location"] == "/doc/queued.md/edit"
+    assert "문서는 저장됐지만 파일 반영이 지연" in client.get("/").text
+
+    created_from_form = client.post(
+        "/new",
+        data={"path": "queued.md", "content": "body", "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert created_from_form.status_code == 303
+    assert created_from_form.headers["location"] == "/doc/queued.md"
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "update",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("edited.md")),
+    )
+    edited = client.post(
+        "/doc/edited.md/edit",
+        data={"content": "new", "base_version": 1, "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert edited.status_code == 303 and edited.headers["location"] == "/doc/edited.md"
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "delete",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("deleted.md")),
+    )
+    deleted = client.post(
+        "/doc/deleted.md/delete",
+        data={"base_version": 1, "csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert deleted.status_code == 303 and deleted.headers["location"] == "/"
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "restore_revision",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("revision.md")),
+    )
+    revision = client.post(
+        "/doc/revision.md/rev/1/restore",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert revision.status_code == 303
+    assert revision.headers["location"] == "/doc/revision.md"
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "restore",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("restored.md")),
+    )
+    restored = client.post(
+        "/trash/restored.md/restore",
+        data={"csrf_token": csrf},
+        follow_redirects=False,
+    )
+    assert restored.status_code == 303 and restored.headers["location"] == "/trash"
+    assert "복원은 저장됐지만 파일 반영이 지연" in client.get("/").text
+
+    monkeypatch.setattr(
+        ctx.docs,
+        "daily_note",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending("daily/2026-07-13.md")),
+    )
+    daily = client.post(
+        "/daily", data={"csrf_token": csrf}, follow_redirects=False
+    )
+    assert daily.status_code == 303
+    assert daily.headers["location"] == "/doc/daily/2026-07-13.md"
+    assert "오늘 노트는 저장됐지만 파일 반영이 지연" in client.get("/").text
+
+    with ctx.db.reader() as conn:
+        rejected = conn.execute(
+            "SELECT action,target FROM audit_log WHERE actor='alice' AND outcome != 'ok' "
+            "AND target IN ('queued.md','restored.md','daily/2026-07-13.md')"
+        ).fetchall()
+    assert rejected == []
+
+
+def test_uncommitted_projection_precondition_is_audited_as_rejected_write(
+    ctx, principals, monkeypatch
+):
+    client = _client(ctx, principals)
+    _login(client)
+    csrf = _token(client, "/")
+    pending = ProjectionPendingError(
+        fp.ProjectionResult(7, "blocked.md", False, False, "io_error", attempts=1),
+        committed=False,
+    )
+    monkeypatch.setattr(
+        ctx.docs,
+        "create_folder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(pending),
+    )
+
+    response = client.post(
+        "/api/folders", data={"path": "blocked", "csrf_token": csrf}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["committed"] is False
+    with ctx.db.reader() as conn:
+        row = conn.execute(
+            "SELECT action,outcome,detail FROM audit_log WHERE actor='alice' "
+            "AND target='/api/folders' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert dict(row) == {
+        "action": "write_rejected",
+        "outcome": "error",
+        "detail": "code=projection_pending",
+    }
 
 
 def test_diff_restore_and_edit_failure_branches(ctx, principals, monkeypatch):
@@ -581,7 +728,7 @@ def test_html_path_error_and_unsafe_anonymous_wiki_error(ctx, principals, monkey
     response = client.get("/")
     assert response.status_code == 400 and "잘못된 경로" in response.text
 
-    client.get("/logout")
+    _logout(client)
     import llm_wiki.web.routes.auth_pages as auth_mod
 
     monkeypatch.setattr(auth_mod, "authenticate", lambda *a: (_ for _ in ()).throw(PathError("bad login")))
@@ -605,7 +752,9 @@ def test_remaining_page_success_and_empty_branches(ctx, principals):
     _login(client)
     assert client.get("/login", follow_redirects=False).status_code == 303
     assert client.get("/search").status_code == 200
-    daily = client.get("/daily", follow_redirects=False)
+    daily = client.post(
+        "/daily", data={"csrf_token": _token(client, "/")}, follow_redirects=False
+    )
     assert daily.status_code == 303 and daily.headers["location"].startswith("/doc/")
     ready = client.get("/readyz")
     assert ready.json()["embed_worker"] == {"running": True}
@@ -630,7 +779,7 @@ def test_remaining_page_success_and_empty_branches(ctx, principals):
     purged = client.post("/trash/gone.md/purge", data={"csrf_token": csrf}, follow_redirects=False)
     assert purged.status_code == 303
 
-    client.get("/logout")
+    _logout(client)
     _login(client, "admin")
     admin_csrf = _token(client, "/new")
     client.post("/new", data={"path": "purge.md", "content": "x", "csrf_token": admin_csrf})

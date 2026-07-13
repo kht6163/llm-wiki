@@ -7,18 +7,23 @@ the activity feed.
 import pytest
 
 from llm_wiki.services import audit
-from llm_wiki.services.auth import Principal
+from llm_wiki.services.auth import Principal, create_api_key, principal_from_api_key
 from llm_wiki.services.errors import ConflictError, NotFoundError
 
 
-def _p(principals, via: str) -> Principal:
+def _p(ctx, principals, via: str) -> Principal:
     e = principals["editor"]
+    if via == "mcp":
+        token = create_api_key(ctx.db, e, "activity-via")
+        principal = principal_from_api_key(ctx.db, token)
+        assert principal is not None
+        return principal
     return Principal(e.user_id, e.username, e.role, via=via)
 
 
 def test_info_is_body_free_metadata(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "meta.md", "# Meta\n\nthe body text")
+    docs.create(_p(ctx, principals, "mcp"), "meta.md", "# Meta\n\nthe body text")
     info = docs.info("meta.md")
     assert info["version"] == 1 and info["last_via"] == "mcp" and info["title"] == "Meta"
     assert "content" not in info  # the whole point: no body load
@@ -28,18 +33,18 @@ def test_info_is_body_free_metadata(ctx, principals):
 
 def test_conflict_envelope_carries_competing_surface(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "race.md", "v1")        # competing edit over web…
-    docs.update(_p(principals, "web"), "race.md", 1, "v2")
+    docs.create(_p(ctx, principals, "mcp"), "race.md", "v1")        # competing edit over web…
+    docs.update(_p(ctx, principals, "web"), "race.md", 1, "v2")
     with pytest.raises(ConflictError) as ei:                   # …agent retries on stale base
-        docs.update(_p(principals, "mcp"), "race.md", 1, "v2-from-agent")
+        docs.update(_p(ctx, principals, "mcp"), "race.md", 1, "v2-from-agent")
     assert ei.value.extra["current_via"] == "web"             # so it knows a human edited
     assert ei.value.extra["current_version"] == 2
 
 
 def test_revision_records_authoring_surface(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "n.md", "# N\n\nv1")
-    docs.update(_p(principals, "web"), "n.md", 1, "# N\n\nv2")
+    docs.create(_p(ctx, principals, "mcp"), "n.md", "# N\n\nv1")
+    docs.update(_p(ctx, principals, "web"), "n.md", 1, "# N\n\nv2")
 
     by_ver = {r["version"]: r["via"] for r in docs.revisions("n.md")["revisions"]}
     assert by_ver == {1: "mcp", 2: "web"}
@@ -51,8 +56,8 @@ def test_revision_records_authoring_surface(ctx, principals):
 
 def test_list_docs_exposes_last_via(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "byagent.md", "x")
-    docs.create(_p(principals, "web"), "byhuman.md", "y")
+    docs.create(_p(ctx, principals, "mcp"), "byagent.md", "x")
+    docs.create(_p(ctx, principals, "web"), "byhuman.md", "y")
     last = {d["path"]: d["last_via"] for d in docs.list_docs()}
     assert last["byagent.md"] == "mcp"
     assert last["byhuman.md"] == "web"
@@ -71,9 +76,9 @@ def test_external_reconcile_marks_cli(ctx, principals):
 
 def test_audit_recent_filters(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "a.md", "x")       # doc_create  via=mcp
-    docs.update(_p(principals, "mcp"), "a.md", 1, "x2")   # doc_update  via=mcp
-    docs.create(_p(principals, "web"), "b.md", "y")       # doc_create  via=web
+    docs.create(_p(ctx, principals, "mcp"), "a.md", "x")       # doc_create  via=mcp
+    docs.update(_p(ctx, principals, "mcp"), "a.md", 1, "x2")   # doc_update  via=mcp
+    docs.create(_p(ctx, principals, "web"), "b.md", "y")       # doc_create  via=web
 
     mcp_only = audit.recent(ctx.db, via="mcp")
     assert mcp_only and all(e["via"] == "mcp" for e in mcp_only)
@@ -91,7 +96,7 @@ def test_audit_recent_excludes_security_events_from_doc_scope(ctx, principals):
     audit.record_tx(ctx.db, actor="mallory", via="web", action="login_failed",
                     outcome="error")
     docs = ctx.docs
-    docs.create(_p(principals, "web"), "c.md", "z")
+    docs.create(_p(ctx, principals, "web"), "c.md", "z")
     scoped = audit.recent(ctx.db, actions=audit.DOC_ACTIONS)
     assert all(e["action"] != "login_failed" for e in scoped)
     # …but the unfiltered feed (admin view) still has it.
@@ -118,10 +123,10 @@ def test_audit_fields_are_defensively_bounded(ctx):
 
 def test_via_counts_summary_by_surface(ctx, principals):
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "a.md", "x")
-    docs.update(_p(principals, "mcp"), "a.md", 1, "x2")
-    docs.create(_p(principals, "web"), "b.md", "y")
-    docs.create(_p(principals, "cli"), "c.md", "z")
+    docs.create(_p(ctx, principals, "mcp"), "a.md", "x")
+    docs.update(_p(ctx, principals, "mcp"), "a.md", 1, "x2")
+    docs.create(_p(ctx, principals, "web"), "b.md", "y")
+    docs.create(_p(ctx, principals, "cli"), "c.md", "z")
 
     counts = audit.via_counts(ctx.db, actions=audit.DOC_ACTIONS)
     assert counts.get("mcp", 0) >= 2
@@ -139,8 +144,8 @@ def test_activity_page_shows_via_summary_and_highlights_mcp(ctx, principals):
     from llm_wiki.web import create_web_app
 
     docs = ctx.docs
-    docs.create(_p(principals, "mcp"), "agent.md", "from agent")
-    docs.create(_p(principals, "web"), "human.md", "from human")
+    docs.create(_p(ctx, principals, "mcp"), "agent.md", "from agent")
+    docs.create(_p(ctx, principals, "web"), "human.md", "from human")
 
     client = TestClient(create_web_app(ctx))
     token = re.search(

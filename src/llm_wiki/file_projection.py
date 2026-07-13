@@ -334,6 +334,102 @@ def _open_target_parent(
         yield root, candidate, parent_fd, parts[-1], parent_path
 
 
+def read_confined_bytes(
+    vault: Path | str,
+    relative_path: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[Path, bytes]:
+    """Read one regular file through a vault-anchored, no-follow descriptor chain."""
+    root, target, parts = _target_components(vault, relative_path)
+    with _open_directory_chain(root, parts[:-1], create=False) as (parent_fd, _parent):
+        before = _stat_at_signature(parent_fd, parts[-1], target)
+        if before is None:  # missing_ok=False above; narrows the helper's optional type
+            raise FileNotFoundError(target)
+        if max_bytes is not None and before.size > max_bytes:
+            raise UnsafeProjectionPath(f"confined file exceeds size limit: {target}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(parts[-1], flags, dir_fd=parent_fd)
+        try:
+            opened = _regular_signature(os.fstat(fd), target)
+            if opened != before:
+                raise FileGenerationChanged(f"file changed while opening: {target}")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise UnsafeProjectionPath(f"confined file exceeds size limit: {target}")
+                chunks.append(chunk)
+            after = _regular_signature(os.fstat(fd), target)
+        finally:
+            os.close(fd)
+        anchored_after = _stat_at_signature(parent_fd, parts[-1], target)
+    data = b"".join(chunks)
+    if after != opened or anchored_after != opened or len(data) != opened.size:
+        raise FileGenerationChanged(f"file changed while reading: {target}")
+    return target, data
+
+
+def write_confined_bytes(vault: Path | str, relative_path: str, data: bytes) -> Path:
+    """Create a regular file atomically below ``vault`` without following symlinks.
+
+    Existing regular files are retained (callers use content-addressed names).  An
+    existing symlink, directory, or special file is always rejected.
+    """
+    root, target, parts = _target_components(vault, relative_path)
+    with _open_directory_chain(root, parts[:-1], create=True) as (parent_fd, _parent):
+        current = _stat_at_signature(parent_fd, parts[-1], target, missing_ok=True)
+        if current is not None:
+            return target
+        temp_name = f".{parts[-1]}.{uuid.uuid4().hex[:16]}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+        try:
+            view = memoryview(data)
+            offset = 0
+            while offset < len(view):
+                try:
+                    written = os.write(fd, view[offset:])
+                except InterruptedError:
+                    continue
+                if written <= 0:
+                    raise OSError("short write while storing confined file")
+                offset += written
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            try:
+                os.link(
+                    temp_name,
+                    parts[-1],
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                _stat_at_signature(parent_fd, parts[-1], target)
+            _fsync_directory_fd(parent_fd)
+        finally:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+    return target
+
+
+def list_confined_names(vault: Path | str, relative_directory: str) -> tuple[str, ...]:
+    """List a real directory below ``vault`` without following any parent symlink."""
+    root = _vault_root(vault)
+    parts = _relative_parts(relative_directory)
+    with _open_directory_chain(root, parts, create=False) as (directory_fd, _path):
+        return tuple(os.listdir(directory_fd))
+
+
 def _relative_parts(rel: str) -> tuple[str, ...]:
     if not isinstance(rel, str) or not rel or "\x00" in rel:
         raise UnsafeProjectionPath("projection path is empty or invalid")
@@ -730,13 +826,15 @@ def read_stable_markdown(vault: Path | str, path: Path | str) -> StableMarkdown:
     if post != opened_before:
         raise StableFileError("file_changed", f"file changed after reading: {target}")
 
-    return StableMarkdown(
-        root,
-        target,
-        "/".join(parts),
-        opened_before,
-        data.decode("utf-8", errors="replace"),
-    )
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise StableFileError(
+            "invalid_encoding",
+            f"markdown must be valid UTF-8: {target}",
+        ) from exc
+
+    return StableMarkdown(root, target, "/".join(parts), opened_before, text)
 
 
 def stable_markdown_is_current(stable: StableMarkdown) -> bool:

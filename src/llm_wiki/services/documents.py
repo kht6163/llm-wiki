@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import hmac
 import logging
 import os
 import re
@@ -62,13 +63,14 @@ from ..util import (
 )
 from . import audit
 from . import doc_import as _doc_import
-from .auth import Principal
+from .auth import ROLE_RANK, Principal
 from .errors import (
     ConflictError,
     EmbeddingUnavailableError,
     ForbiddenError,
     NotFoundError,
     ValidationError,
+    WikiError,
 )
 
 REGEX_TIMEOUT_S = 0.25
@@ -111,6 +113,7 @@ _IMPORT_RENAME_MAX_SUFFIX = _doc_import._IMPORT_RENAME_MAX_SUFFIX
 # week is generous; older rows are swept opportunistically on each keyed write to
 # bound the ledger's growth.
 _IDEM_RETENTION_DAYS = 7
+_IDEM_KEY_MAX_CHARS = 200
 
 
 class _ProjectionTokenState(StrEnum):
@@ -225,15 +228,41 @@ class SearchPage:
         return self.filters.url_for_page(self.page + 1, self.per_page)
 
 
-class ProjectionPendingError(RuntimeError):
-    """A committed DB write whose filesystem projection remains recoverable."""
+class ProjectionPendingError(WikiError):
+    """A filesystem projection that remains recoverable.
 
-    def __init__(self, result: fp.ProjectionResult):
+    Most instances follow a durable DB mutation, but purge also performs projection
+    safety checks *before* recording its durable intent.  ``committed`` keeps those
+    two cases machine-distinguishable so a caller does not mistake a safe retry for
+    a duplicate write.
+    """
+
+    code = "projection_pending"
+    http_status = 202
+    suggested_action = "check_status_do_not_repeat_write"
+
+    def __init__(
+        self,
+        result: fp.ProjectionResult,
+        *,
+        version: int | None = None,
+        committed: bool = True,
+    ):
         detail = f": {result.detail}" if result.detail else ""
+        self.suggested_action = (
+            "check_status_do_not_repeat_write" if committed else "retry_after_recovery"
+        )
+        self.http_status = 202 if committed else 409
         super().__init__(
-            f"Document file projection remains pending ({result.reason or 'unknown'}){detail}"
+            f"Document file projection remains pending ({result.reason or 'unknown'}){detail}",
+            committed=committed,
+            path=result.path,
+            version=version,
+            projection_reason=result.reason,
+            projection_attempts=result.attempts,
         )
         self.result = result
+        self.committed = committed
 
 
 def _attachment_subname(name: str, ext: str, data: bytes) -> str:
@@ -1354,8 +1383,61 @@ class DocumentService:
     def _require_projection(self, doc_id: int) -> fp.ProjectionResult:
         result = self._project_current(doc_id)
         if not result.settled:
-            raise ProjectionPendingError(result)
+            with self.db.reader() as conn:
+                row = conn.execute("SELECT version FROM documents WHERE id=?", (doc_id,)).fetchone()
+            raise ProjectionPendingError(result, version=int(row["version"]) if row else None)
         return result
+
+    @staticmethod
+    def _fence_principal(
+        conn: sqlite3.Connection,
+        principal: Principal,
+        *,
+        require_write: bool = False,
+        require_admin: bool = False,
+    ) -> None:
+        """Re-authorize a previously resolved identity inside the writer transaction.
+
+        Authentication and the eventual write are separated by request scheduling.  A
+        password change, deactivation, role downgrade, or API-key revocation in that
+        window must win over the stale in-memory ``Principal``.
+        """
+        # The local import command deliberately uses an unattributed, trusted CLI
+        # principal: its audit actor is the OS user and there is no wiki-user row to
+        # re-read.  Preserve that explicit host-only path while keeping every web/MCP
+        # write fenced against the current credential state.
+        if principal.via == "cli" and principal.user_id is None:
+            if require_admin and principal.role != "admin":
+                raise ForbiddenError("Current CLI role is not admin.")
+            if require_write and not principal.can_write:
+                raise ForbiddenError("Current CLI role is read-only.")
+            return
+        row = conn.execute(
+            "SELECT username, role, is_active, credential_version FROM users WHERE id=?",
+            (principal.user_id,),
+        ).fetchone()
+        if (
+            row is None
+            or not row["is_active"]
+            or int(row["credential_version"]) != int(principal.credential_version)
+        ):
+            raise ForbiddenError("Credentials changed or the account is no longer active.")
+        role = str(row["role"])
+        if require_admin and role != "admin":
+            raise ForbiddenError("Current account role is not admin.")
+        if require_write and ROLE_RANK.get(role, 0) < ROLE_RANK["editor"]:
+            raise ForbiddenError("Current account role is read-only.")
+        if principal.via == "mcp":
+            if principal.api_key_id is None:
+                raise ForbiddenError("The API key identity is no longer valid.")
+            key = conn.execute(
+                "SELECT scope FROM api_keys WHERE id=? AND user_id=? AND revoked_at IS NULL",
+                (principal.api_key_id, principal.user_id),
+            ).fetchone()
+            if key is None:
+                raise ForbiddenError("The API key was revoked before the write committed.")
+            if require_write and str(key["scope"]) != "readwrite":
+                raise ForbiddenError("The API key is read-only.")
 
     def _recover_pending_report(self, *, page_size: int = 64) -> RecoveryReport:
         """Visit a bounded ID frontier and continue after per-document failures."""
@@ -1429,18 +1511,27 @@ class DocumentService:
         return RecoveryReport(recovered, tuple(issues))
 
     # ---- idempotency ----------------------------------------------------
-    def _idem_lookup(self, scope: str, user_id: int, key: str) -> dict | None:
+    def _idem_lookup(
+        self, scope: str, user_id: int, key: str, request_hash: str
+    ) -> dict | None:
         """Return the cached result of a previously-applied write with this
         (scope, user, key), or None if the key is new. Lets a client safely retry
         a write whose response was lost without applying it twice."""
         with self.db.reader() as conn:
             row = conn.execute(
-                "SELECT result_path, result_version FROM idempotency_keys "
+                "SELECT result_path, result_version, request_hash FROM idempotency_keys "
                 "WHERE scope=? AND user_id=? AND idem_key=?",
                 (scope, user_id, key),
             ).fetchone()
         if row is None:
             return None
+        if not row["request_hash"] or not hmac.compare_digest(
+            str(row["request_hash"]), request_hash
+        ):
+            raise ConflictError(
+                "The idempotency key was already used for a different request.",
+                idempotency_key_reused=True,
+            )
         return {
             "ok": True,
             "path": row["result_path"],
@@ -1452,7 +1543,7 @@ class DocumentService:
     def get(self, path: str) -> dict:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
-        with self.db.reader() as conn:
+        with self.db.read_snapshot() as conn:
             d = conn.execute("SELECT * FROM documents WHERE path_norm=?", (norm,)).fetchone()
             if not d or d["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
@@ -1491,7 +1582,7 @@ class DocumentService:
         fp.managed_path(self.vault, rel, namespace="live")
         norm = path_norm(rel)
         requested_version = int(base_version)
-        with self.db.reader() as conn:
+        with self.db.read_snapshot() as conn:
             row = conn.execute(
                 "SELECT d.id,d.version,d.title AS current_title,d.is_deleted,d.updated_at,"
                 "u.username AS updated_by,current.body AS current_body,"
@@ -1577,7 +1668,7 @@ class DocumentService:
         latest-revision body, so polling 'has this changed since version N' is cheap."""
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
-        with self.db.reader() as conn:
+        with self.db.read_snapshot() as conn:
             d = conn.execute("SELECT * FROM documents WHERE path_norm=?", (norm,)).fetchone()
             if not d or d["is_deleted"]:
                 raise NotFoundError("No document at this path.", path=rel)
@@ -1615,7 +1706,7 @@ class DocumentService:
         norm = path_norm(rel)
         before = clamp_int(before, 0, 20)
         after = clamp_int(after, 0, 20)
-        with self.db.reader() as conn:
+        with self.db.read_snapshot() as conn:
             d = conn.execute(
                 "SELECT id, path, version FROM documents WHERE path_norm=? AND is_deleted=0",
                 (norm,),
@@ -1872,6 +1963,7 @@ class DocumentService:
         norm = rel.lower()
         now = now_iso()
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             if conn.execute("SELECT 1 FROM folders WHERE path_norm=?", (norm,)).fetchone():
                 raise ConflictError("A folder already exists at this path.", path=rel)
             if conn.execute(
@@ -1908,6 +2000,7 @@ class DocumentService:
             raise ValidationError("folder path must not be empty.")
         norm = rel.lower()
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             n = conn.execute(
                 "SELECT COUNT(*) FROM documents WHERE is_deleted=0 AND (folder=? OR folder LIKE ?)",
                 (rel, norm + "/%"),
@@ -1943,10 +2036,26 @@ class DocumentService:
     def attachment_file(self, subpath: str) -> Path:
         """Resolve an uploaded attachment to a real file under the vault, safely.
         Raises PathError for traversal, NotFoundError if missing."""
-        target = safe_join(self.vault / ATTACH_DIR, subpath)
-        if not target.is_file():
-            raise NotFoundError("No such attachment.", path=subpath)
+        try:
+            target, _data = fp.read_confined_bytes(
+                self.vault, f"{ATTACH_DIR}/{subpath}", max_bytes=ATTACH_MAX_BYTES
+            )
+        except (FileNotFoundError, fp.ProjectionPathMissing):
+            raise NotFoundError("No such attachment.", path=subpath) from None
+        except fp.FileProjectionError as exc:
+            raise PathError("unsafe attachment path") from exc
         return target
+
+    def attachment_bytes(self, subpath: str) -> tuple[Path, bytes]:
+        """Return a stable, confined attachment generation for an HTTP response."""
+        try:
+            return fp.read_confined_bytes(
+                self.vault, f"{ATTACH_DIR}/{subpath}", max_bytes=ATTACH_MAX_BYTES
+            )
+        except (FileNotFoundError, fp.ProjectionPathMissing):
+            raise NotFoundError("No such attachment.", path=subpath) from None
+        except fp.FileProjectionError as exc:
+            raise PathError("unsafe attachment path") from exc
 
     def tags(self) -> list[dict]:
         """Tag vocabulary across non-deleted documents, most-used first."""
@@ -2557,31 +2666,29 @@ class DocumentService:
         the first ~200 characters of the body after frontmatter is stripped.
         Templates are not indexed as wiki documents.
         """
-        root = self.vault / TEMPLATES_DIR
-        if not root.is_dir():
-            return []
         items: list[dict] = []
         try:
-            entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
-        except OSError:
+            names = sorted(fp.list_confined_names(self.vault, TEMPLATES_DIR), key=str.lower)
+        except (OSError, fp.FileProjectionError):
             return []
-        for entry in entries:
-            if not entry.is_file() or entry.suffix.lower() != ".md":
+        for name in names:
+            if not name.lower().endswith(".md"):
                 continue
-            if entry.name.startswith("."):
+            if name.startswith(".") or "/" in name or "\\" in name:
                 continue
             try:
-                raw = entry.read_text(encoding="utf-8")
-            except OSError:
+                _path, data = fp.read_confined_bytes(self.vault, f"{TEMPLATES_DIR}/{name}")
+                raw = data.decode("utf-8")
+            except (OSError, UnicodeError, fp.FileProjectionError):
                 continue
             meta, body_start = parse_frontmatter(raw)
             body = raw[body_start:]
-            rel = f"{TEMPLATES_DIR}/{entry.name}"
+            rel = f"{TEMPLATES_DIR}/{name}"
             title = derive_title(meta, raw, rel)
             preview = body.lstrip("\n\r")[:TEMPLATE_PREVIEW_CHARS]
             items.append(
                 {
-                    "name": entry.stem,
+                    "name": name[:-3],
                     "path": rel,
                     "title": title,
                     "preview": preview,
@@ -2615,22 +2722,23 @@ class DocumentService:
         filename = parts[0]
         if not filename.lower().endswith(".md"):
             filename = f"{filename}.md"
-        templates_root = (self.vault / TEMPLATES_DIR).resolve()
+        target = self.vault / TEMPLATES_DIR / filename
         try:
-            target = safe_join(templates_root, filename)
-        except PathError as e:
+            fp.read_confined_bytes(self.vault, f"{TEMPLATES_DIR}/{filename}")
+        except (FileNotFoundError, fp.ProjectionPathMissing):
+            raise ValidationError(f"template not found: {name}") from None
+        except (OSError, fp.FileProjectionError) as e:
             raise ValidationError("invalid template path") from e
-        if templates_root not in target.parents:
-            raise ValidationError("invalid template path")
-        if not target.is_file():
-            raise ValidationError(f"template not found: {name}")
         return target
 
     def _load_template_body(self, name: str) -> str:
         path = self._resolve_template_path(name)
         try:
-            return path.read_text(encoding="utf-8")
-        except OSError as e:
+            _target, data = fp.read_confined_bytes(
+                self.vault, f"{TEMPLATES_DIR}/{path.name}"
+            )
+            return data.decode("utf-8")
+        except (OSError, UnicodeError, fp.FileProjectionError) as e:
             raise ValidationError(f"template not readable: {name}") from e
 
     # ---- writes ---------------------------------------------------------
@@ -2665,6 +2773,7 @@ class DocumentService:
         chash, now = sha256_hex(content), now_iso()
 
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             row = conn.execute(
                 "SELECT d.id,d.path,d.version,d.is_deleted,"
                 "EXISTS(SELECT 1 FROM document_purge_intents p WHERE p.doc_id=d.id) "
@@ -2778,7 +2887,7 @@ class DocumentService:
         tags: list[str] | None = None,
         *,
         embed: bool = True,
-        idempotency: tuple[str, int, str] | None = None,
+        idempotency: tuple[str, int, str, str] | None = None,
     ) -> dict:
         if not principal.can_write:
             raise ForbiddenError(
@@ -2796,6 +2905,7 @@ class DocumentService:
         chash, now = sha256_hex(content), now_iso()
 
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             row = conn.execute(
                 "SELECT id, title, version, content_hash, is_deleted FROM documents "
                 "WHERE path_norm=?",
@@ -2864,11 +2974,11 @@ class DocumentService:
                 # concurrent request already committed this key, the UNIQUE constraint
                 # raises here and the whole write rolls back — so the duplicate never
                 # lands (the caller then replays the original result).
-                scope, uid, key = idempotency
+                scope, uid, key, request_hash = idempotency
                 conn.execute(
                     "INSERT INTO idempotency_keys(scope, user_id, idem_key, doc_id, "
-                    "result_version, result_path, created_at) VALUES(?,?,?,?,?,?,?)",
-                    (scope, uid, key, doc_id, new_version, rel, now),
+                    "result_version, result_path, request_hash, created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (scope, uid, key, doc_id, new_version, rel, request_hash, now),
                 )
                 cutoff = (datetime.now(UTC) - timedelta(days=_IDEM_RETENTION_DAYS)).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
@@ -2988,14 +3098,29 @@ class DocumentService:
             )
         if not text or not text.strip():
             raise ValidationError("'text' is required.")
+        idem_key = (idempotency_key or "").strip()
+        if idempotency_key is not None:
+            if not idem_key or len(idem_key) > _IDEM_KEY_MAX_CHARS:
+                raise ValidationError(
+                    f"idempotency_key must be 1-{_IDEM_KEY_MAX_CHARS} characters."
+                )
+            if any(ord(char) < 0x20 or ord(char) == 0x7F for char in idem_key):
+                raise ValidationError("idempotency_key cannot contain control characters.")
+        rel = normalize_rel_path(path)
+        logical_heading = ensure_heading.strip().lstrip("#").strip() if ensure_heading else ""
+        request_hash = hashlib.sha256(
+            "\0".join(
+                [rel, text, logical_heading, "" if base_version is None else str(int(base_version))]
+            ).encode("utf-8")
+        ).hexdigest()
         if idempotency_key:
-            cached = self._idem_lookup("append", principal.user_id, idempotency_key)
+            cached = self._idem_lookup("append", principal.user_id, idem_key, request_hash)
             if cached is not None:
                 return cached
-        doc = self.get(path)
+        doc = self.get(rel)
         body = doc["content"]
         if ensure_heading and ensure_heading.strip():
-            heading = ensure_heading.strip().lstrip("#").strip()
+            heading = logical_heading
             loc = _locate_section(body, heading)
             if loc:
                 lines, _start, end, _ = loc
@@ -3012,7 +3137,11 @@ class DocumentService:
             prefix = (base + "\n\n") if base else ""
             new_body = prefix + _as_block(text)
         bv = doc["version"] if base_version is None else int(base_version)
-        idem = ("append", principal.user_id, idempotency_key) if idempotency_key else None
+        idem = (
+            ("append", principal.user_id, idem_key, request_hash)
+            if idempotency_key
+            else None
+        )
         try:
             return self.update(principal, doc["path"], bv, new_body, idempotency=idem)
         except (sqlite3.IntegrityError, ConflictError):
@@ -3021,7 +3150,7 @@ class DocumentService:
             # sees either the key's UNIQUE constraint or the newer document version. Its
             # transaction rolled back in both cases, so replay the original result.
             cached = (
-                self._idem_lookup("append", principal.user_id, idempotency_key)
+                self._idem_lookup("append", principal.user_id, idem_key, request_hash)
                 if idempotency_key
                 else None
             )
@@ -3223,19 +3352,30 @@ class DocumentService:
                 )
             ]
         changed = 0
+        skipped: list[dict] = []
+        pending: list[dict] = []
         for p in paths:
-            before = self.get(p)["version"]
-            after = self.patch_tags(principal, p, add=[dest], remove=src)
-            if (
-                after["version"] != before
-            ):  # patch_tags is a no-op (no version bump) when there's no net change
+            try:
+                before = self.get(p)["version"]
+                after = self.patch_tags(principal, p, add=[dest], remove=src)
+                if after["version"] != before:
+                    changed += 1
+            except ProjectionPendingError as exc:
+                # The DB mutation committed; surface the recoverable file projection
+                # separately and continue the vault-wide operation.
                 changed += 1
+                pending.append({"path": p, "reason": exc.result.reason})
+            except (ConflictError, NotFoundError) as exc:
+                skipped.append({"path": p, "code": exc.code, "message": exc.message})
         return {
             "ok": True,
             "dest": dest,
             "sources": src,
             "docs_affected": len(paths),
             "docs_changed": changed,
+            "docs_skipped": len(skipped),
+            "skipped": skipped,
+            "projection_pending": pending,
         }
 
     def rename_tag(self, principal: Principal, old: str, new: str) -> dict:
@@ -3386,6 +3526,7 @@ class DocumentService:
         new_folder, new_stem = folder_of(new_rel), basename_stem(new_rel).lower()
         now = now_iso()
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             row = conn.execute(
                 "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.content_hash,"
                 "d.is_deleted,r.body,r.content_hash AS revision_content_hash "
@@ -3546,6 +3687,7 @@ class DocumentService:
         candidates = [r["path"] for r in rows]
 
         docs_rewritten = links_rewritten = skipped = 0
+        projection_pending: list[dict] = []
         for src_path in candidates:
             try:
                 doc = self.get(src_path)
@@ -3577,6 +3719,21 @@ class DocumentService:
                 new_body = new_body[:start] + new_raw + new_body[end:]
             try:
                 self.update(principal, doc["path"], doc["version"], new_body)
+            except ProjectionPendingError as exc:
+                # The reference rewrite committed to the DB.  Keep processing the
+                # remaining candidates and report only the recoverable projection
+                # work, rather than turning a vault-wide cleanup into an apparent
+                # all-or-nothing failure.
+                docs_rewritten += 1
+                links_rewritten += len(edits)
+                projection_pending.append(
+                    {
+                        "path": doc["path"],
+                        "reason": exc.result.reason,
+                        "version": exc.extra.get("version"),
+                    }
+                )
+                continue
             except ConflictError:
                 skipped += 1
                 continue
@@ -3588,6 +3745,7 @@ class DocumentService:
             "docs_rewritten": docs_rewritten,
             "links_rewritten": links_rewritten,
             "skipped_conflicts": skipped,
+            "projection_pending": projection_pending,
         }
 
     def recent_changes(
@@ -3653,6 +3811,7 @@ class DocumentService:
         norm = path_norm(rel)
         now = now_iso()
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             row = conn.execute(
                 "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.content_hash,"
                 "d.is_deleted,r.body,r.content_hash AS revision_content_hash,"
@@ -3762,6 +3921,7 @@ class DocumentService:
         norm = path_norm(rel)
         now = now_iso()
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
             row = conn.execute(
                 "SELECT d.id,d.path,d.path_norm,d.version,d.title,d.folder,d.content_hash,"
                 "d.is_deleted,r.body,r.content_hash AS revision_content_hash,"
@@ -3898,10 +4058,11 @@ class DocumentService:
                     and not projection.current_installed
                     and projection.reason != "purge_pending"
                 ):
-                    raise ProjectionPendingError(projection)
+                    raise ProjectionPendingError(projection, committed=False)
 
             retry = False
             with self.db.writer() as conn:
+                self._fence_principal(conn, principal, require_admin=True)
                 current = conn.execute(
                     "SELECT d.id,d.path,d.path_norm,d.version,d.content_hash,"
                     "d.file_state,d.is_deleted,"
@@ -3946,7 +4107,8 @@ class DocumentService:
                                         True,
                                         "The pending tombstone still has a live file.",
                                         bool(projection and projection.current_installed),
-                                    )
+                                    ),
+                                    committed=False,
                                 )
                         conn.execute(
                             "INSERT INTO document_purge_intents("
@@ -4002,6 +4164,7 @@ class DocumentService:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal)
             d = conn.execute(
                 "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
             ).fetchone()
@@ -4031,6 +4194,7 @@ class DocumentService:
         rel = normalize_rel_path(path)
         norm = path_norm(rel)
         with self.db.writer() as conn:
+            self._fence_principal(conn, principal)
             d = conn.execute(
                 "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
             ).fetchone()
@@ -4089,12 +4253,12 @@ class DocumentService:
                 f"Attachment too large ({len(data)} bytes; limit {ATTACH_MAX_BYTES})."
             )
         sub = _attachment_subname(name, ext, data)
-        target = safe_join(self.vault / ATTACH_DIR, sub)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if not target.exists():  # content-addressed: skip rewrite of an identical file
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            tmp.write_bytes(data)
-            os.replace(tmp, target)
+        with self.db.writer() as conn:
+            self._fence_principal(conn, principal, require_write=True)
+            try:
+                fp.write_confined_bytes(self.vault, f"{ATTACH_DIR}/{sub}", data)
+            except fp.FileProjectionError as exc:
+                raise PathError("unsafe attachment storage path") from exc
         url = "/attachments/" + quote(sub)
         alt = name[: len(name) - len(ext)] or "file"
         return {"path": f"{ATTACH_DIR}/{sub}", "url": url, "markdown": f"![{alt}]({url})"}

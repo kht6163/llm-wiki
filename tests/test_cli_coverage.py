@@ -162,6 +162,43 @@ def test_init_db_reports_bound_paths_and_model(monkeypatch, capsys):
     ]
 
 
+def test_init_and_serve_explain_embedding_revision_rebuild(monkeypatch, capsys):
+    error = RuntimeError(
+        "Database embedding binding predates model revision tracking; "
+        "run `llm-wiki reindex --reembed`."
+    )
+    monkeypatch.setattr(
+        _cli_impl, "build_context", lambda *args, **kwargs: (_ for _ in ()).throw(error)
+    )
+
+    assert _cli_impl._init_db() == 1
+    assert _cli_impl._serve_locked(_args(), _settings()) == 1
+    output = capsys.readouterr().out
+    assert output.count("embedding index requires a rebuild") == 2
+    assert output.count("uv run llm-wiki reindex --reembed") == 2
+
+    unrelated = RuntimeError("unrelated startup failure")
+    monkeypatch.setattr(
+        _cli_impl,
+        "build_context",
+        lambda *args, **kwargs: (_ for _ in ()).throw(unrelated),
+    )
+    with pytest.raises(RuntimeError, match="unrelated startup failure"):
+        _cli_impl._init_db()
+    with pytest.raises(RuntimeError, match="unrelated startup failure"):
+        _cli_impl._serve_locked(_args(), _settings())
+
+    monkeypatch.setattr(_cli_impl, "_dispatch", lambda _args: (_ for _ in ()).throw(error))
+    assert _cli_impl.run(["init-db"]) == 1
+    monkeypatch.setattr(
+        _cli_impl,
+        "_dispatch",
+        lambda _args: (_ for _ in ()).throw(unrelated),
+    )
+    with pytest.raises(RuntimeError, match="unrelated startup failure"):
+        _cli_impl.run(["init-db"])
+
+
 def test_os_actor_has_fallback(monkeypatch):
     monkeypatch.setattr(_cli_impl.getpass, "getuser", lambda: "operator")
     assert _cli_impl._os_actor() == "cli:operator"
@@ -275,7 +312,7 @@ def test_reindex_rebinds_and_reports_every_nonconverged_item(monkeypatch, capsys
     assert "Rebinding embedding model: old-model (dim 2) -> new-model (dim 3)" in out
     assert "renamed: old.md -> new.md" in out and "tombstoned" in out and "gone.md" in out
     assert "race.md: changed (attempts=3)" in out
-    assert db.rebound == [("new-model", 3, "pipe")]
+    assert db.rebound == [("new-model", 3, "pipe", "")]
 
 
 def test_reindex_same_or_unbound_model_does_not_claim_rebinding(monkeypatch, capsys):
@@ -484,6 +521,23 @@ def test_snapshot_refuses_overwrite_then_forwards_force(monkeypatch, tmp_path, c
     assert _cli_impl._snapshot(NS(out=str(out), force=True)) == 0
     assert calls == [(('db', tmp_path / "vault", out), {"force": True})]
     assert "schema v9 · 4 docs · 6 vault file(s) · model e5" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("error", [ValueError("invalid manifest"), RuntimeError("vault changed")])
+def test_snapshot_reports_validation_failures_without_traceback(
+    monkeypatch, tmp_path, capsys, error
+):
+    out = tmp_path / "wiki.tar"
+    ctx = NS(db="db", settings=NS(vault_path=tmp_path / "vault"))
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kwargs: ctx)
+    monkeypatch.setattr(
+        _cli_impl,
+        "write_snapshot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    assert _cli_impl._snapshot(NS(out=str(out), force=False)) == 1
+    assert capsys.readouterr().out.strip() == f"snapshot failed: {error}"
 
 
 def test_restore_handles_missing_busy_and_invalid_snapshot(monkeypatch, tmp_path, capsys):

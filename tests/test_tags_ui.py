@@ -25,6 +25,10 @@ def login(client: TestClient, username: str, password: str = "secret12"):
     )
 
 
+def logout(client: TestClient):
+    return client.post("/logout", data={"csrf_token": _token(client, "/")})
+
+
 def create_doc(client: TestClient, path: str, content: str, title: str = ""):
     return client.post(
         "/new",
@@ -40,7 +44,7 @@ def test_tags_page_requires_auth(client):
 def test_tags_page_lists_tags_for_viewer_without_write_forms(client):
     login(client, "alice")
     create_doc(client, "a.md", "---\ntags: [alpha, beta]\n---\n# A\n\nbody")
-    client.get("/logout")
+    logout(client)
     login(client, "bob")  # viewer
     r = client.get("/tags")
     assert r.status_code == 200
@@ -99,6 +103,38 @@ def test_merge_tags_works_for_editor(client, ctx):
     assert "draft" not in tags and "wip" not in tags
 
 
+def test_tag_routes_disclose_partial_and_projection_pending_results(
+    client, ctx, monkeypatch
+):
+    login(client, "alice")
+    partial = {
+        "sources": ["old"],
+        "dest": "new",
+        "docs_changed": 1,
+        "docs_skipped": 2,
+        "projection_pending": [{"path": "note.md", "reason": "busy"}],
+    }
+    monkeypatch.setattr(ctx.docs, "rename_tag", lambda *args, **kwargs: partial)
+    renamed = client.post(
+        "/tags/rename",
+        data={"old": "old", "new": "new", "csrf_token": _token(client, "/tags")},
+        follow_redirects=False,
+    )
+    assert renamed.status_code == 303
+    rename_flash = client.get("/tags").text
+    assert "건너뜀 2개" in rename_flash and "파일 반영 지연 1개" in rename_flash
+
+    monkeypatch.setattr(ctx.docs, "merge_tags", lambda *args, **kwargs: partial)
+    merged = client.post(
+        "/tags/merge",
+        data={"sources": ["old"], "dest": "new", "csrf_token": _token(client, "/tags")},
+        follow_redirects=False,
+    )
+    assert merged.status_code == 303
+    merge_flash = client.get("/tags").text
+    assert "건너뜀 2개" in merge_flash and "파일 반영 지연 1개" in merge_flash
+
+
 def _csrf_from_page(html: str) -> str:
     m = re.search(r'name="csrf_token" value="([^"]+)"', html)
     if m:
@@ -111,7 +147,7 @@ def _csrf_from_page(html: str) -> str:
 def test_viewer_cannot_rename_tag(client, ctx):
     login(client, "alice")
     create_doc(client, "a.md", "---\ntags: [keep]\n---\n# A\n\nbody")
-    client.get("/logout")
+    logout(client)
     login(client, "bob")
     tok = _csrf_from_page(client.get("/tags").text)
     r = client.post(
@@ -131,7 +167,7 @@ def test_viewer_cannot_rename_tag(client, ctx):
 def test_viewer_cannot_merge_tags(client, ctx):
     login(client, "alice")
     create_doc(client, "a.md", "---\ntags: [one, two]\n---\n# A\n\nbody")
-    client.get("/logout")
+    logout(client)
     login(client, "bob")
     tok = _csrf_from_page(client.get("/tags").text)
     r = client.post(

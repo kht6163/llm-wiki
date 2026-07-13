@@ -17,6 +17,7 @@ import pytest
 from llm_wiki import _cli_impl
 from llm_wiki import snapshot as snapshot_writer
 from llm_wiki.config import Settings
+from llm_wiki.embedding import Embedder
 from llm_wiki.process_lock import ProjectLock, ProjectLockError
 from llm_wiki.runtime import build_context
 from llm_wiki.services.auth import Principal, create_user
@@ -56,6 +57,114 @@ def test_snapshot_restore_roundtrip(tmp_path, monkeypatch):
     got = rctx.docs.get("note.md")
     assert "hello world" in got["content"]
     assert (dst.vault_path / "note.md").exists()      # vault projected too
+
+
+@pytest.mark.parametrize("kind", ["changed", "unmanaged"])
+def test_snapshot_refuses_unreconciled_external_markdown(tmp_path, kind):
+    src = _seed(_settings(tmp_path, f"unreconciled-{kind}"))
+    target = src.settings.vault_path / ("note.md" if kind == "changed" else "new.md")
+    target.write_text("# External\n\nnot reconciled", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="unreconciled external Markdown.*reindex"):
+        snapshot_writer.write_snapshot(
+            src.db, src.settings.vault_path, tmp_path / f"{kind}.tar", force=False
+        )
+
+
+@pytest.mark.parametrize("concurrent_change", ["update", "create", "delete"])
+def test_live_snapshot_accepts_canonical_write_after_database_clone(
+    tmp_path, monkeypatch, concurrent_change
+):
+    src = _seed(_settings(tmp_path, f"live-clone-{concurrent_change}"))
+    with src.db.reader() as conn:
+        user = conn.execute(
+            "SELECT id,credential_version FROM users WHERE username='ed'"
+        ).fetchone()
+    principal = Principal(
+        user["id"], "ed", "editor", via="web", credential_version=user["credential_version"]
+    )
+    original_stage = snapshot_writer._stage_managed_files
+    changed = False
+
+    def stage_then_commit(*args, **kwargs):
+        nonlocal changed
+        result = original_stage(*args, **kwargs)
+        if not changed:
+            changed = True
+            if concurrent_change == "update":
+                current = src.docs.get("note.md")
+                src.docs.update(
+                    principal,
+                    "note.md",
+                    current["version"],
+                    "# Note\n\nnew canonical generation",
+                )
+            else:
+                if concurrent_change == "create":
+                    src.docs.create(principal, "new.md", "# New\n\nnew canonical document")
+                else:
+                    current = src.docs.get("note.md")
+                    src.docs.delete(principal, "note.md", current["version"])
+        return result
+
+    monkeypatch.setattr(snapshot_writer, "_stage_managed_files", stage_then_commit)
+    report = snapshot_writer.write_snapshot(
+        src.db,
+        src.settings.vault_path,
+        tmp_path / f"live-clone-{concurrent_change}.tar",
+        force=False,
+    )
+
+    # The archive remains the self-consistent clone generation; the newer live write
+    # is neither mistaken for an external edit nor silently mixed into that generation.
+    assert report.doc_count == 1
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_snapshot_reconciliation_scan_rejects_markdown_symlinks(tmp_path, kind):
+    src = _seed(_settings(tmp_path, f"snapshot-symlink-{kind}"))
+    outside = tmp_path / f"outside-{kind}"
+    if kind == "file":
+        outside.write_text("secret", encoding="utf-8")
+        (src.settings.vault_path / "linked.md").symlink_to(outside)
+    else:
+        outside.mkdir()
+        (outside / "hidden.md").write_text("secret", encoding="utf-8")
+        (src.settings.vault_path / "linked-dir").symlink_to(
+            outside, target_is_directory=True
+        )
+
+    with pytest.raises(ValueError, match="unsafe vault path"):
+        snapshot_writer.write_snapshot(
+            src.db, src.settings.vault_path, tmp_path / f"symlink-{kind}.tar", force=False
+        )
+
+
+def test_snapshot_creation_rejects_foreign_keys_and_orphan_vectors(tmp_path):
+    src = _seed(_settings(tmp_path, "logical-corruption"))
+    raw = sqlite3.connect(src.settings.db_path)
+    raw.execute("PRAGMA foreign_keys=OFF")
+    raw.execute("INSERT INTO tags(doc_id,tag) VALUES(999999,'orphan')")
+    raw.commit()
+    raw.close()
+    with pytest.raises(ValueError, match="foreign key"):
+        snapshot_writer.write_snapshot(
+            src.db, src.settings.vault_path, tmp_path / "fk.tar", force=False
+        )
+
+    with src.db.writer() as conn:
+        conn.execute("DELETE FROM tags WHERE doc_id=999999")
+        dim = int(conn.execute(
+            "SELECT v FROM meta WHERE k='embedding_dim'"
+        ).fetchone()[0])
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(999999,?)",
+            (Embedder.serialize([0.0] * dim),),
+        )
+    with pytest.raises(ValueError, match="orphan vectors"):
+        snapshot_writer.write_snapshot(
+            src.db, src.settings.vault_path, tmp_path / "vectors.tar", force=False
+        )
 
 
 def test_snapshot_db_and_managed_files_share_one_generation(tmp_path, monkeypatch):
@@ -492,6 +601,45 @@ def _snapshot_for_restore(tmp_path: Path, name: str = "restore-source") -> Path:
     out = tmp_path / f"{name}.tar"
     snapshot_writer.write_snapshot(src.db, src.settings.vault_path, out, force=False)
     return out
+
+
+def test_restore_rejects_foreign_key_corruption_without_touching_live_targets(tmp_path):
+    original = _snapshot_for_restore(tmp_path, "restore-fk-source")
+    damaged = tmp_path / "restore-fk-damaged.tar"
+    scratch = tmp_path / "restore-fk.db"
+
+    def corrupt(members):
+        database_bytes = b""
+        result = []
+        for member, data in members:
+            if member.name == "wiki.db":
+                scratch.write_bytes(data)
+                with sqlite3.connect(scratch) as conn:
+                    conn.execute("PRAGMA foreign_keys=OFF")
+                    conn.execute("INSERT INTO tags(doc_id,tag) VALUES(999999,'orphan')")
+                data = scratch.read_bytes()
+                database_bytes = data
+            elif member.name == "manifest.json":
+                manifest = json.loads(data)
+                manifest["database"] = {
+                    "size": len(database_bytes),
+                    "sha256": hashlib.sha256(database_bytes).hexdigest(),
+                }
+                data = json.dumps(manifest).encode()
+            result.append((member, data))
+        return result
+
+    _rewrite_snapshot(original, damaged, corrupt)
+    db_path = tmp_path / "live-fk.db"
+    vault = tmp_path / "live-fk-vault"
+    db_path.write_bytes(b"original")
+    vault.mkdir()
+    (vault / "original.txt").write_text("original")
+
+    with pytest.raises(ValueError, match="integrity check.*foreign key"):
+        snapshot_writer.restore_snapshot(damaged, db_path, vault, force=True)
+    assert db_path.read_bytes() == b"original"
+    assert (vault / "original.txt").read_text() == "original"
 
 
 def test_restore_force_fully_replaces_targets_and_removes_sidecars(tmp_path):
@@ -1028,6 +1176,8 @@ with ProjectLock(Path(sys.argv[1])):
     finally:
         holder.terminate()
         holder.wait(timeout=10)
+        if holder.stdout is not None:
+            holder.stdout.close()
 
 
 def test_restore_cli_reports_preserved_backup_when_rollback_fails(

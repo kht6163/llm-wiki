@@ -26,8 +26,10 @@ class Embedder:
     pipeline = EMBEDDING_PIPELINE
     enabled = True
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, model_revision: str = ""):
         self.model_name = model_name
+        self.requested_revision = (model_revision or "").strip()
+        self._resolved_revision: str | None = None
         self._model = None
         self._lock = threading.RLock()
         # E5-family models require "query:"/"passage:" prefixes; bge-m3 etc. do not.
@@ -41,7 +43,25 @@ class Embedder:
                     try:
                         from sentence_transformers import SentenceTransformer
 
-                        self._model = SentenceTransformer(self.model_name)
+                        kwargs = (
+                            {"revision": self.requested_revision}
+                            if self.requested_revision
+                            else {}
+                        )
+                        self._model = SentenceTransformer(self.model_name, **kwargs)
+                        # Transformers records the immutable Hub commit used to load the
+                        # weights on its config. Prefer it over a mutable requested tag such
+                        # as ``main``; fall back only for local/custom model implementations.
+                        resolved = ""
+                        for module in getattr(self._model, "_modules", {}).values():
+                            config = getattr(getattr(module, "auto_model", None), "config", None)
+                            commit = getattr(config, "_commit_hash", None)
+                            if isinstance(commit, str) and commit.strip():
+                                resolved = commit.strip()
+                                break
+                        self._resolved_revision = (
+                            resolved or self.requested_revision or "unresolved"
+                        )
                     except Exception as e:
                         # A bad EMBEDDING_MODEL, no network/HF access, or a broken
                         # install would otherwise surface as a raw multi-line
@@ -69,6 +89,12 @@ class Embedder:
     def warm(self) -> None:
         """Eagerly load the model so the first request (and readiness) isn't slow."""
         self._load()
+
+    @property
+    def revision(self) -> str:
+        """Immutable artifact identity used by the database embedding binding."""
+        self._load()
+        return self._resolved_revision or self.requested_revision or "unresolved"
 
     @property
     def dim(self) -> int:
@@ -124,8 +150,10 @@ class DisabledEmbedder(Embedder):
 
     enabled = False
 
-    def __init__(self, model_name: str = "disabled"):
+    def __init__(self, model_name: str = "disabled", model_revision: str = ""):
         self.model_name = model_name
+        self.requested_revision = (model_revision or "").strip()
+        self._resolved_revision = "disabled"
         self._model = None
         self._lock = threading.RLock()
         self._is_e5 = False
@@ -142,6 +170,10 @@ class DisabledEmbedder(Embedder):
         return None
 
     @property
+    def revision(self) -> str:
+        return "disabled"
+
+    @property
     def dim(self) -> int:
         return 0
 
@@ -152,6 +184,6 @@ class DisabledEmbedder(Embedder):
         raise RuntimeError("embeddings are disabled (EMBEDDING_ENABLED=false)")
 
 
-@lru_cache(maxsize=4)
-def get_embedder(model_name: str) -> Embedder:
-    return Embedder(model_name)
+@lru_cache(maxsize=8)
+def get_embedder(model_name: str, model_revision: str = "") -> Embedder:
+    return Embedder(model_name, model_revision)

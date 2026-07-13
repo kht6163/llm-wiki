@@ -1,41 +1,53 @@
-# syntax=docker/dockerfile:1
-#
-# Single base for build + run so the venv's interpreter path stays valid.
-# torch resolves to the CPU-only wheel via the pytorch-cpu index pinned in
-# pyproject.toml, so the image stays slim (no CUDA).
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+# syntax=docker/dockerfile:1.7
+
+# Keep dependency resolution and compiler/build tooling out of the runtime image.
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON_DOWNLOADS=never
+
+COPY pyproject.toml uv.lock README.md LICENSE ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-install-project --no-dev
+COPY src ./src
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --locked --no-dev
+
+
+FROM python:3.12-slim-bookworm AS runtime
+
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid "${APP_GID}" llmwiki \
+    && useradd --uid "${APP_UID}" --gid "${APP_GID}" --create-home llmwiki
+
+WORKDIR /app
+COPY --from=builder --chown=llmwiki:llmwiki /app/.venv /app/.venv
+COPY --from=builder --chown=llmwiki:llmwiki /app/src /app/src
+
+RUN mkdir -p /data /vault /models \
+    && chown -R llmwiki:llmwiki /data /vault /models
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONDONTWRITEBYTECODE=1 \
     HF_HOME=/models \
+    XDG_CACHE_HOME=/models/.cache \
+    TORCH_HOME=/models/torch \
     HOST=0.0.0.0 \
     DB_PATH=/data/llm_wiki.db \
     VAULT_PATH=/vault
 
-# Install dependencies first (cached) using only the lockfile, then the project.
-COPY pyproject.toml uv.lock README.md ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-install-project --no-dev
-COPY src ./src
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
-
-ENV PATH="/app/.venv/bin:$PATH"
-
-# DB, vault, and the (large) embedding-model cache persist on volumes.
 VOLUME ["/data", "/vault", "/models"]
 EXPOSE 8080 8081
 
-# Readiness check against the web port (HOST=0.0.0.0 above): /readyz returns 200 only
-# once the embedding model is loaded AND the DB is reachable, so an orchestrator won't
-# route traffic to a container still downloading the model. start-period covers that
-# first-boot model download (large; raise further on slow links / big models).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/readyz',timeout=3).status==200 else 1)"
 
-# `serve` auto-creates the schema; create the first admin once with:
-#   docker compose run --rm llm-wiki create-admin --username admin
+USER llmwiki
 ENTRYPOINT ["llm-wiki"]
 CMD ["serve"]

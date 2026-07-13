@@ -42,6 +42,21 @@ class RateLimiter:
             dq.append(now)
             return len(dq) == self.max_attempts
 
+    def consume(self, key: str) -> bool:
+        """Atomically admit and record one bounded operation.
+
+        Unlike the failure-oriented two-step API, this is intended for expensive
+        successful work such as corpus exports.  ``False`` means the window is full.
+        """
+        now = time.monotonic()
+        with self._lock:
+            dq = self._hits[key]
+            self._prune(dq, now)
+            if len(dq) >= self.max_attempts:
+                return False
+            dq.append(now)
+            return True
+
     def reset(self, key: str) -> None:
         with self._lock:
             self._hits.pop(key, None)

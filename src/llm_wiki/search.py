@@ -250,8 +250,12 @@ def _prepare_query_vector(
 ) -> tuple[EmbeddingBinding, bytes]:
     """Capture the process binding, then encode outside the SQLite read snapshot."""
     expected = db.expected_embedding_binding()
-    actual_identity = (embedder.model_name, embedder.pipeline)
-    expected_identity = (expected.model, expected.pipeline)
+    actual_identity = (
+        embedder.model_name,
+        embedder.pipeline,
+        str(getattr(embedder, "revision", expected.revision)),
+    )
+    expected_identity = (expected.model, expected.pipeline, expected.revision)
     if actual_identity != expected_identity:
         raise EmbeddingBindingChanged(
             f"Process embedder {actual_identity} does not match expected binding "
@@ -309,6 +313,13 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
         rows = stable_scan()
     else:
         rows = rows[:limit]
+    return _resolve_vector_rows(conn, rows)
+
+
+def _resolve_vector_rows(conn, rows) -> list[tuple[int, dict]]:
+    """Resolve distance rows and collapse them to one deterministic chunk per doc."""
+    if not rows:
+        return []
     # Resolve all matched chunks in one query instead of one SELECT per hit.
     ids = [r["chunk_id"] for r in rows]
     ph = ",".join("?" * len(ids))
@@ -335,6 +346,105 @@ def _vector(conn, query_vector: bytes, limit: int) -> list[tuple[int, dict]]:
                 "path_norm": ch["path_norm"],
             }
     return sorted(best.items(), key=lambda kv: (kv[1]["distance"], kv[1]["path_norm"]))
+
+
+def _vector_filter_sql(
+    folder: str | None, tags: list[str] | None, filters: QueryFilters
+) -> tuple[str, list]:
+    sql = [" AND d.is_deleted=0"]
+    params: list = []
+    if folder:
+        normalized = folder.strip("/")
+        sql.append(" AND (d.folder=? OR d.folder LIKE ?)")
+        params.extend((normalized, normalized + "/%"))
+    for tag in tags or []:
+        sql.append(" AND d.id IN (SELECT doc_id FROM tags WHERE tag=?)")
+        params.append(tag)
+    if filters.active:
+        fragment, filter_params = _filter_sql(filters)
+        sql.append(fragment)
+        params.extend(filter_params)
+    return "".join(sql), params
+
+
+def _eligible_vector_ids(
+    conn,
+    ids: list[int],
+    *,
+    folder: str | None,
+    tags: list[str] | None,
+    filters: QueryFilters,
+) -> set[int]:
+    if not ids:
+        return set()
+    fragment, params = _vector_filter_sql(folder, tags, filters)
+    allowed: set[int] = set()
+    for offset in range(0, len(ids), 400):
+        batch = ids[offset:offset + 400]
+        placeholders = ",".join("?" * len(batch))
+        rows = conn.execute(
+            f"SELECT d.id FROM documents d WHERE d.id IN ({placeholders}){fragment}",
+            [*batch, *params],
+        )
+        allowed.update(int(row["id"]) for row in rows)
+    return allowed
+
+
+def _eligible_vector_doc_count(
+    conn,
+    limit: int,
+    *,
+    folder: str | None,
+    tags: list[str] | None,
+    filters: QueryFilters,
+) -> int:
+    """Count eligible embedded documents, capped at ``limit`` for fallback decisions."""
+    fragment, params = _vector_filter_sql(folder, tags, filters)
+    row = conn.execute(
+        "SELECT COUNT(*) FROM (SELECT d.id FROM documents d WHERE 1=1" + fragment +
+        " AND EXISTS (SELECT 1 FROM chunks c JOIN chunk_vectors v ON v.chunk_id=c.id "
+        "WHERE c.doc_id=d.id) LIMIT ?)",
+        [*params, limit],
+    ).fetchone()
+    return int(row[0])
+
+
+def _vector_filtered_exact(
+    conn,
+    query_vector: bytes,
+    limit: int,
+    scan_cap: int,
+    *,
+    folder: str | None,
+    tags: list[str] | None,
+    filters: QueryFilters,
+) -> list[tuple[int, dict]]:
+    """Bounded exact fallback over at most ``scan_cap`` filtered chunks.
+
+    vec0 chooses its KNN window before relational filters.  A selective folder/tag/query
+    operator can therefore hide every eligible document behind globally-nearer chunks.
+    This scan is used only for a selective eligible set, and materializes a stable bounded
+    chunk window *before* calculating distances so it cannot bypass ``vector_cap``.
+    """
+    fragment, params = _vector_filter_sql(folder, tags, filters)
+    rows = conn.execute(
+        "WITH eligible AS MATERIALIZED ("
+        " SELECT v.chunk_id,c.doc_id,c.ordinal,d.path_norm,v.embedding"
+        " FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id"
+        " JOIN documents d ON d.id=c.doc_id WHERE 1=1" + fragment +
+        " ORDER BY d.path_norm,c.ordinal LIMIT ?"
+        "), distances AS ("
+        " SELECT chunk_id,doc_id,ordinal,path_norm,"
+        " vec_distance_cosine(embedding, ?) AS distance FROM eligible"
+        "), per_doc AS ("
+        " SELECT chunk_id,doc_id,distance,path_norm,ordinal,"
+        " ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY distance,path_norm,ordinal) AS rn"
+        " FROM distances)"
+        " SELECT chunk_id,distance FROM per_doc WHERE rn=1"
+        " ORDER BY distance,path_norm LIMIT ?",
+        [*params, scan_cap, query_vector, limit],
+    ).fetchall()
+    return _resolve_vector_rows(conn, rows)
 
 
 def _rerank_boost(title: str | None, vi: dict | None, q_norm: str,
@@ -382,6 +492,37 @@ def _rank(conn, query: str, *, mode: str, k: int,
         if query_vector is None:
             raise RuntimeError("vector search requires a prepared query embedding")
         vec_list = _vector(conn, query_vector, k_vec)
+        if folder or tags or filters.active:
+            allowed = _eligible_vector_ids(
+                conn,
+                [doc_id for doc_id, _info in vec_list],
+                folder=folder,
+                tags=tags,
+                filters=filters,
+            )
+            vec_list = [item for item in vec_list if item[0] in allowed]
+            # Exact filtered distance scans restore recall for *selective* filters,
+            # but must not turn ``vector_cap`` into an advisory limit by scanning an
+            # arbitrarily large eligible corpus.  Count one beyond the cap so we can
+            # distinguish a bounded fallback from a policy-limited query.
+            eligible_count = _eligible_vector_doc_count(
+                conn,
+                params.vector_cap + 1,
+                folder=folder,
+                tags=tags,
+                filters=filters,
+            )
+            eligible_target = min(k, eligible_count)
+            if eligible_count <= params.vector_cap and len(vec_list) < eligible_target:
+                vec_list = _vector_filtered_exact(
+                    conn,
+                    query_vector,
+                    min(k, params.vector_cap),
+                    params.vector_cap,
+                    folder=folder,
+                    tags=tags,
+                    filters=filters,
+                )
     else:
         vec_list = []
 
@@ -563,6 +704,14 @@ def search_page(
     is rejected with ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
+    if not getattr(embedder, "enabled", True):
+        if mode == "vector":
+            from .services.errors import EmbeddingUnavailableError
+
+            raise EmbeddingUnavailableError(
+                "Vector search is unavailable because embeddings are disabled."
+            )
+        mode = "bm25"
     SEARCH_QUERIES.labels(mode).inc()
     t0 = time.perf_counter()
     top_k = clamp_int(top_k, 1, 50)
@@ -584,7 +733,7 @@ def search_page(
         expected, query_vector = _prepare_query_vector(db, embedder, text)
 
     read_context = (
-        db.embedding_read_snapshot(expected) if expected is not None else db.reader()
+        db.embedding_read_snapshot(expected) if expected is not None else db.read_snapshot()
     )
     with read_context as conn:
         scored, vec_info, match = _rank(
@@ -869,6 +1018,14 @@ def assemble_context(
     ``validation``."""
     if mode not in ("hybrid", "bm25", "vector"):
         mode = "hybrid"
+    if not getattr(embedder, "enabled", True):
+        if mode == "vector":
+            from .services.errors import EmbeddingUnavailableError
+
+            raise EmbeddingUnavailableError(
+                "Vector context retrieval is unavailable because embeddings are disabled."
+            )
+        mode = "bm25"
     max_chars = clamp_int(max_chars, 0, 24000)
     max_sources = clamp_int(max_sources, 1, 20)
     k = max(max_sources * params.candidate_factor, params.candidate_min)
@@ -889,7 +1046,7 @@ def assemble_context(
     total = 0
     truncated = False
     read_context = (
-        db.embedding_read_snapshot(expected) if expected is not None else db.reader()
+        db.embedding_read_snapshot(expected) if expected is not None else db.read_snapshot()
     )
     with read_context as conn:
         scored, vec_info, _match = _rank(

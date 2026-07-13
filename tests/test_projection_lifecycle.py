@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from llm_wiki import file_projection as fp
-from llm_wiki.services.auth import Principal
+from llm_wiki.services.auth import create_api_key, principal_from_api_key
 from llm_wiki.services.documents import ProjectionPendingError
 from llm_wiki.services.errors import ConflictError
 from llm_wiki.util import path_norm
@@ -206,7 +206,9 @@ def test_purge_intent_survives_post_commit_interruption_and_recovery_audits_once
 ):
     docs, editor = ctx.docs, principals["editor"]
     base_admin = principals["admin"]
-    admin = Principal(base_admin.user_id, base_admin.username, base_admin.role, via="mcp")
+    token = create_api_key(ctx.db, base_admin, "purge-lifecycle")
+    admin = principal_from_api_key(ctx.db, token)
+    assert admin is not None
     docs.create(editor, "purge-crash.md", "canonical", embed=False)
     docs.delete(editor, "purge-crash.md")
     doc_id = _doc_id(ctx, "purge-crash.md")

@@ -170,6 +170,7 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     # leaked key issuing distinct queries would serialize CPU and starve other reads + the
     # post-write embed worker. Generous burst, then 'rate_limited'.
     read_limiter = RateLimiter(max_attempts=60, window_s=60.0)
+    export_limiter = RateLimiter(max_attempts=6, window_s=60.0)
 
     def _throttle_read(principal: Principal, tool: str) -> None:
         key = f"read:{principal.user_id}"
@@ -260,7 +261,9 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                             log.exception("failed to audit mcp auth block")
                     outcome = e.code
                     return e.to_dict()
-                auth_limiter.reset(ip_key)
+                # Keep the IP-wide failure window intact after a success.  Clearing it
+                # here lets an attacker alternate guesses with one valid low-privilege
+                # key forever.  Expiry is time-based; successful calls do not add to it.
                 res = fn(principal)
                 if isinstance(res, dict) and res.get("ok") is False:
                     outcome = res.get("error", {}).get("code", "error")
@@ -609,6 +612,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
         def fn(_p: Principal) -> dict:
             title = app.settings.site_title
             if format == "full":
+                if not export_limiter.consume(f"export:{_p.user_id}"):
+                    raise RateLimitedError("Corpus export rate limit exceeded; retry later.")
                 return {"ok": True, "format": "full", **docs.llms_full(site_title=title, max_chars=max_chars)}
             return {"ok": True, "format": "index", "text": docs.llms_index(site_title=title)}
         return await _call(ctx, fn, "export_corpus")
@@ -1091,8 +1096,8 @@ def create_mcp_server(app: AppContext) -> FastMCP:
                           "behind. Use after move_document (or to repair links from the broken-"
                           "links list). Only currently-broken references keyed to the old "
                           "path/name are touched. Returns {from, to, docs_rewritten, "
-                          "links_rewritten, skipped_conflicts} — one conflicted document is skipped, "
-                          "not fatal.")
+                          "links_rewritten, skipped_conflicts, projection_pending} — one conflicted "
+                          "or projection-pending document does not stop the remaining rewrites.")
     async def rename_references(ctx: Context, old_path: str, new_path: str) -> dict:
         return await _call(ctx, lambda p: {"ok": True, **docs.rename_references(p, old_path, new_path)},
                            "rename_references", audit_action="doc_update",

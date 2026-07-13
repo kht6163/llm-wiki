@@ -134,6 +134,26 @@
   // ---- resizers --------------------------------------------------------
   function initResize(el) {
     var side = el.getAttribute("data-resize");
+    var varName = side === "left" ? "--left-w" : "--right-w";
+    var storageKey = side === "left" ? "wiki-left-w" : "wiki-right-w";
+    var fallback = side === "left" ? 260 : 300;
+    function clampWidth(w) { return Math.max(150, Math.min(560, w)); }
+    function currentWidth() {
+      var w = parseInt(getComputedStyle(document.documentElement).getPropertyValue(varName), 10);
+      return clampWidth(Number.isFinite(w) ? w : fallback);
+    }
+    function applyWidth(w, persist) {
+      w = clampWidth(w);
+      document.documentElement.style.setProperty(varName, w + "px");
+      el.setAttribute("aria-valuenow", String(w));
+      el.setAttribute("aria-valuetext", w + "픽셀");
+      if (persist) set(storageKey, String(w));
+      return w;
+    }
+    // Keep the range value in sync with the pre-paint width restored by base.html.
+    var initial = currentWidth();
+    el.setAttribute("aria-valuenow", String(initial));
+    el.setAttribute("aria-valuetext", initial + "픽셀");
     el.style.touchAction = "none";   // pointer drags shouldn't scroll the page on touch
     // Pointer events cover mouse, touch, and pen with one path (mouse-only events left
     // touch/tablet users unable to resize at all).
@@ -141,45 +161,71 @@
       e.preventDefault();
       try { el.setPointerCapture(e.pointerId); } catch (_) { /* unsupported: fall back */ }
       var startX = e.clientX;
-      var varName = side === "left" ? "--left-w" : "--right-w";
-      var start = parseInt(getComputedStyle(document.documentElement).getPropertyValue(varName), 10) || (side === "left" ? 260 : 300);
+      var start = currentWidth();
       document.body.classList.add("resizing");
       function move(ev) {
         var dx = ev.clientX - startX;
         var w = side === "left" ? start + dx : start - dx;
-        w = Math.max(150, Math.min(560, w));
-        document.documentElement.style.setProperty(varName, w + "px");
+        applyWidth(w, false);
       }
       function up() {
         el.removeEventListener("pointermove", move);
         el.removeEventListener("pointerup", up);
         el.removeEventListener("pointercancel", up);
         document.body.classList.remove("resizing");
-        var w = parseInt(getComputedStyle(document.documentElement).getPropertyValue(varName), 10);
-        set(side === "left" ? "wiki-left-w" : "wiki-right-w", String(w));
+        applyWidth(currentWidth(), true);
       }
       el.addEventListener("pointermove", move);
       el.addEventListener("pointerup", up);
       el.addEventListener("pointercancel", up);
     });
+    el.addEventListener("keydown", function (e) {
+      var w = currentWidth();
+      if (e.key === "Home") w = 150;
+      else if (e.key === "End") w = 560;
+      else if (e.key === "ArrowLeft") w += side === "left" ? -10 : 10;
+      else if (e.key === "ArrowRight") w += side === "left" ? 10 : -10;
+      else return;
+      e.preventDefault();
+      applyWidth(w, true);
+    });
   }
 
   // ---- tab switching (left .sb-tab / right .rp-tab) --------------------
   function initTabs(tabSel, panelAttr, tabAttr) {
+    function activate(tab, focusPanel) {
+      var key = tab.getAttribute(tabAttr);
+      var group = tab.parentElement;
+      group.querySelectorAll(tabSel).forEach(function (t) {
+        var on = t === tab;
+        t.classList.toggle("active", on);
+        t.setAttribute("aria-selected", on ? "true" : "false");
+        t.tabIndex = on ? 0 : -1;
+      });
+      var scope = group.parentElement;
+      scope.querySelectorAll("[" + panelAttr + "]").forEach(function (p) {
+        p.hidden = p.getAttribute(panelAttr) !== key;
+      });
+      if (focusPanel && key === "search") {
+        var i = document.getElementById("sb-search-input");
+        if (i) i.focus();
+      }
+    }
     document.querySelectorAll(tabSel).forEach(function (tab) {
-      tab.addEventListener("click", function () {
-        var key = tab.getAttribute(tabAttr);
-        var group = tab.parentElement;
-        group.querySelectorAll(tabSel).forEach(function (t) {
-          var on = t === tab;
-          t.classList.toggle("active", on);
-          t.setAttribute("aria-selected", on ? "true" : "false");
-        });
-        var scope = group.parentElement;
-        scope.querySelectorAll("[" + panelAttr + "]").forEach(function (p) {
-          p.hidden = p.getAttribute(panelAttr) !== key;
-        });
-        if (key === "search") { var i = document.getElementById("sb-search-input"); if (i) i.focus(); }
+      tab.tabIndex = tab.getAttribute("aria-selected") === "true" || tab.classList.contains("active") ? 0 : -1;
+      tab.addEventListener("click", function () { activate(tab, true); });
+      tab.addEventListener("keydown", function (e) {
+        var tabs = Array.prototype.slice.call(tab.parentElement.querySelectorAll(tabSel));
+        var index = tabs.indexOf(tab);
+        var next = null;
+        if (e.key === "ArrowRight" || e.key === "ArrowDown") next = tabs[(index + 1) % tabs.length];
+        else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = tabs[(index - 1 + tabs.length) % tabs.length];
+        else if (e.key === "Home") next = tabs[0];
+        else if (e.key === "End") next = tabs[tabs.length - 1];
+        if (!next) return;
+        e.preventDefault();
+        activate(next, false);
+        next.focus();
       });
     });
   }

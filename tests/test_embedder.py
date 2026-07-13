@@ -3,6 +3,8 @@ install) must surface as a ConfigError the CLI prints as one clear line, not a r
 SentenceTransformer traceback. serve/init-db/reindex --reembed/import all funnel
 through Embedder._load, so wrapping it there covers every entry point."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from llm_wiki.config import ConfigError
@@ -27,3 +29,28 @@ def test_embedder_load_failure_raises_config_error(monkeypatch):
     assert "EMBEDDING_MODEL" in msg            # points at the knob to fix
     assert "reindex --reembed" in msg          # recovery hint for an intentional change
     assert "OSError" in msg                    # preserves the original error type
+
+
+def test_embedder_uses_resolved_commit_for_binding_revision(monkeypatch):
+    import sentence_transformers
+
+    captured = {}
+
+    class Model:
+        _modules = {
+            "0": SimpleNamespace(
+                auto_model=SimpleNamespace(
+                    config=SimpleNamespace(_commit_hash="resolved-commit")
+                )
+            )
+        }
+
+    def load(name, **kwargs):
+        captured.update(name=name, **kwargs)
+        return Model()
+
+    monkeypatch.setattr(sentence_transformers, "SentenceTransformer", load)
+    embedder = Embedder("owner/model", "main")
+
+    assert embedder.revision == "resolved-commit"
+    assert captured == {"name": "owner/model", "revision": "main"}

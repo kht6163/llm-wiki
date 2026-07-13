@@ -22,7 +22,9 @@ def health_is_ok(url: str) -> bool:
         return False
 
 
-def smoke(image: str, *, port: int = 18080, timeout_seconds: int = 180) -> None:
+def smoke(
+    image: str, *, port: int = 18080, mcp_port: int = 18081, timeout_seconds: int = 180
+) -> None:
     container_id = ""
     try:
         started = subprocess.run(
@@ -34,6 +36,13 @@ def smoke(image: str, *, port: int = 18080, timeout_seconds: int = 180) -> None:
                 CONTAINER_NAME,
                 "--publish",
                 f"127.0.0.1:{port}:8080",
+                "--publish",
+                f"127.0.0.1:{mcp_port}:8081",
+                "--read-only",
+                "--tmpfs",
+                "/tmp:rw,noexec,nosuid,size=64m",
+                "--cap-drop",
+                "ALL",
                 "--env",
                 f"EMBEDDING_MODEL={TEST_MODEL}",
                 image,
@@ -47,7 +56,11 @@ def smoke(image: str, *, port: int = 18080, timeout_seconds: int = 180) -> None:
             raise RuntimeError("docker run returned no container id")
 
         deadline = time.monotonic() + timeout_seconds
-        while not health_is_ok(f"http://127.0.0.1:{port}/healthz"):
+        health_urls = (
+            f"http://127.0.0.1:{port}/healthz",
+            f"http://127.0.0.1:{mcp_port}/healthz",
+        )
+        while not all(health_is_ok(url) for url in health_urls):
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"container did not become healthy within {timeout_seconds}s")
             time.sleep(2)
@@ -63,9 +76,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
     parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--mcp-port", type=int, default=18081)
     parser.add_argument("--timeout", type=int, default=180)
     args = parser.parse_args()
-    smoke(args.image, port=args.port, timeout_seconds=args.timeout)
+    smoke(
+        args.image,
+        port=args.port,
+        mcp_port=args.mcp_port,
+        timeout_seconds=args.timeout,
+    )
     print(f"docker smoke passed for {args.image}")
     return 0
 

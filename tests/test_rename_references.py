@@ -2,6 +2,8 @@
 doesn't leave dangling references behind."""
 import pytest
 
+from llm_wiki import file_projection as fp
+from llm_wiki.services.documents import ProjectionPendingError
 from llm_wiki.services.errors import ForbiddenError
 
 
@@ -35,6 +37,41 @@ def test_move_with_fix_references(ctx, principals):
     # Bare [[a]] still resolves by stem -> left intact; the path-form link repointed.
     assert "[md](sub/a.md)" in body
     assert not _broken_targets(docs)
+
+
+def test_move_reports_committed_reference_projection_and_continues(
+    ctx, principals, monkeypatch
+):
+    docs, principal = ctx.docs, principals["editor"]
+    docs.create(principal, "a.md", "# A\n\nbody", embed=False)
+    docs.create(principal, "b.md", "points to [A](a.md)", embed=False)
+    real_update = docs.update
+
+    def committed_then_pending(*args, **kwargs):
+        updated = real_update(*args, **kwargs)
+        raise ProjectionPendingError(
+            fp.ProjectionResult(
+                1,
+                updated["path"],
+                False,
+                False,
+                "io_error",
+                1,
+                False,
+            ),
+            version=updated["version"],
+        )
+
+    monkeypatch.setattr(docs, "update", committed_then_pending)
+
+    moved = docs.move(principal, "a.md", "sub/a.md", fix_references=True)
+
+    refs = moved["references"]
+    assert refs["docs_rewritten"] == 1 and refs["links_rewritten"] == 1
+    assert refs["projection_pending"] == [
+        {"path": "b.md", "reason": "io_error", "version": 2}
+    ]
+    assert docs.get("b.md")["content"] == "points to [A](sub/a.md)"
 
 
 def test_bare_name_rewritten_when_stem_changes(ctx, principals):

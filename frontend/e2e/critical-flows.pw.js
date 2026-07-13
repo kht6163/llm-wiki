@@ -53,6 +53,65 @@ test("로그인 후 키보드 빠른 이동으로 문서를 연다", async ({ pa
   expectNoExternalRequests(page.context());
 });
 
+test("문서 화면의 건너뛰기·탭·리사이저를 키보드로 조작한다", async ({ page }) => {
+  await login(page);
+  await page.goto("/doc/start.md");
+
+  await page.evaluate(() => {
+    document.body.tabIndex = -1;
+    document.body.focus();
+    document.body.removeAttribute("tabindex");
+  });
+  await page.keyboard.press("Tab");
+  const skip = page.getByRole("link", { name: "본문으로 건너뛰기" });
+  await expect(skip).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#main-content")).toBeFocused();
+
+  const outline = page.getByRole("tab", { name: "목차" });
+  const links = page.getByRole("tab", { name: "링크" });
+  await outline.focus();
+  await outline.press("ArrowRight");
+  await expect(links).toBeFocused();
+  await expect(links).toHaveAttribute("aria-selected", "true");
+  await links.press("Home");
+  await expect(outline).toBeFocused();
+
+  const separator = page.getByRole("separator", { name: "좌측 사이드바 너비" });
+  await separator.focus();
+  const initial = Number(await separator.getAttribute("aria-valuenow"));
+  await separator.press("ArrowRight");
+  await expect(separator).toHaveAttribute("aria-valuenow", String(initial + 10));
+  await separator.press("Home");
+  await expect(separator).toHaveAttribute("aria-valuenow", "150");
+  await separator.press("End");
+  await expect(separator).toHaveAttribute("aria-valuenow", "560");
+  expectNoExternalRequests(page.context());
+});
+
+test("공개 링크를 명시적으로 발급하고 그래프에서 Tab으로 빠져나온다", async ({ page }) => {
+  await login(page);
+  await page.goto("/doc/start.md");
+  await page.getByRole("button", { name: "공유", exact: true }).click();
+  await expect(page.getByText("30일 후 자동 만료되며 언제든 이 화면에서 취소할 수 있습니다.")).toBeVisible();
+  await page.getByRole("button", { name: "30일 링크 만들기" }).click();
+  const shareInput = page.locator("#share-url");
+  await expect(shareInput).toHaveValue(/\/share\//);
+  const shareUrl = await shareInput.inputValue();
+  expect(shareUrl).toContain("/share/");
+  const publicView = await page.request.get(shareUrl);
+  expect(publicView.ok()).toBeTruthy();
+  expect(await publicView.text()).toContain("키보드 탐색 기준 문서");
+
+  await page.goto("/graph");
+  await expect(page.locator("#ginfo")).toContainText("노드");
+  const graph = page.locator("#cy");
+  await graph.focus();
+  await page.keyboard.press("Tab");
+  await expect(graph).not.toBeFocused();
+  expectNoExternalRequests(page.context());
+});
+
 test("문서를 만들고 편집해 원문에 저장한다", async ({ page }, testInfo) => {
   const documentName = `브라우저 흐름-${testInfo.retry}`;
   await login(page);

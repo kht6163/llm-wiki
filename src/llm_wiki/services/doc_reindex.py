@@ -122,6 +122,13 @@ def reindex_all(
     vault = svc.vault.resolve(strict=True)
     log.info("reindex: scanning vault %s (reembed=%s)", vault, reembed)
 
+    # Re-embedding is an index-maintenance operation, not a document edit. Mark every
+    # live document dirty up front so existing chunks are encoded again, but preserve
+    # version/revision/updated_at for files whose canonical content did not change.
+    if reembed and svc.embedding_enabled():
+        with svc.db.writer() as conn:
+            conn.execute("UPDATE documents SET vector_dirty=1 WHERE is_deleted=0")
+
     recovered_pending = 0
 
     def recover_one(target_id: int) -> fp.ProjectionResult:
@@ -376,7 +383,7 @@ def reindex_all(
                         ).fetchall()
                         affected_owner_ids = tuple(int(row["doc_id"]) for row in owner_rows)
                         exact_spelling = current.path == rel
-                        if current.content_hash == chash and not reembed and exact_spelling:
+                        if current.content_hash == chash and exact_spelling:
                             conn.execute(
                                 "UPDATE documents SET file_mtime=? "
                                 "WHERE id=? AND path=? AND path_norm=? AND version=? "

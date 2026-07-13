@@ -39,6 +39,22 @@ def test_reindex_create_update_unchanged_missing(ctx, principals):
     assert "db_only.md" in res["missing_files"]
 
 
+def test_reindex_rejects_invalid_utf8_without_adopting_or_mutating(ctx):
+    invalid = ctx.settings.vault_path / "invalid.md"
+    original = b"valid prefix\xffinvalid suffix"
+    invalid.write_bytes(original)
+
+    report = ctx.docs.reindex_all()
+
+    assert report["created"] == 0
+    assert any(
+        item["path"] == "invalid.md" and item["reason"] == "invalid_encoding"
+        for item in report["skipped_conflicts"]
+    )
+    assert not ctx.docs.exists("invalid.md")
+    assert invalid.read_bytes() == original
+
+
 def test_reindex_treats_external_rename_as_move(ctx, principals):
     import os
     docs, p = ctx.docs, principals["editor"]
@@ -228,9 +244,9 @@ def test_cli_reindex_reembed_passes_current_embedding_pipeline(ctx, monkeypatch)
     rebind_args = []
     build_args = []
 
-    def rebind(model, dim, pipeline):
-        rebind_args.append((model, dim, pipeline))
-        return original_rebind(model, dim, pipeline)
+    def rebind(model, dim, pipeline, revision):
+        rebind_args.append((model, dim, pipeline, revision))
+        return original_rebind(model, dim, pipeline, revision)
 
     def build_context(**kwargs):
         build_args.append(kwargs)
@@ -242,7 +258,12 @@ def test_cli_reindex_reembed_passes_current_embedding_pipeline(ctx, monkeypatch)
     assert _cli_impl._reindex(SimpleNamespace(reembed=True)) == 0
     assert build_args == [{"full": False}]
     assert rebind_args == [
-        (ctx.settings.embedding_model, ctx.embedder.dim, ctx.embedder.pipeline)
+        (
+            ctx.settings.embedding_model,
+            ctx.embedder.dim,
+            ctx.embedder.pipeline,
+            ctx.embedder.revision,
+        )
     ]
 
 
@@ -356,9 +377,17 @@ def test_reindex_reembed_flag_runs(ctx, reembed):
     docs = ctx.docs
     _write(ctx, "r.md", "# R\n\nsome words to embed")
     docs.reindex_all()
+    before = docs.get("r.md")
     res = docs.reindex_all(reembed=reembed)
-    # With reembed, the unchanged file is still re-processed (updated), not skipped.
+    after = docs.get("r.md")
+    # Re-embedding is index maintenance: it refreshes vectors without manufacturing a
+    # user-visible edit revision or changing recency metadata.
     if reembed:
-        assert res["updated"] >= 1
+        assert res["unchanged"] >= 1
+        assert res["embedded"] >= 1
+        assert (after["version"], after["updated_at"]) == (
+            before["version"],
+            before["updated_at"],
+        )
     else:
         assert res["unchanged"] >= 1

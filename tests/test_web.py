@@ -35,6 +35,14 @@ def login(client: TestClient, username: str, password: str = "secret12"):
     )
 
 
+def logout(client: TestClient):
+    return client.post("/logout", data={"csrf_token": _token(client, "/")})
+
+
+def _main_html(html: str) -> str:
+    return re.split(r"<main\b[^>]*>", html, maxsplit=1)[-1].split("</main>", 1)[0]
+
+
 def create_doc(client: TestClient, path: str, content: str, title: str = ""):
     return client.post(
         "/new",
@@ -303,7 +311,7 @@ def test_property_panel_editable_for_editor_not_viewer(client):
     editor_view = client.get("/doc/p.md").text
     assert 'data-action="edit-props"' in editor_view
     assert "props.js" in editor_view
-    client.get("/logout")
+    logout(client)
     login(client, "bob")  # viewer
     viewer_view = client.get("/doc/p.md").text
     assert 'data-action="edit-props"' not in viewer_view
@@ -361,6 +369,10 @@ def test_login_success_and_logout(client):
     r = login(client, "admin")
     assert r.status_code == 200 and "llm-wiki" in r.text
     assert client.get("/", follow_redirects=False).status_code == 200
+    assert client.get("/logout", follow_redirects=False).status_code == 405
+    r = logout(client)
+    assert r.status_code == 200 and "login" in r.text.lower()
+    assert client.get("/", follow_redirects=False).status_code == 303
 
 
 def test_bad_password_is_401(client):
@@ -758,7 +770,7 @@ def test_tree_folder_has_create_here_affordance_for_editors(client):
 def test_tree_create_here_affordance_hidden_for_viewers(client):
     login(client, "alice")
     create_doc(client, "work/report.md", "body")  # editor seeds a folder
-    client.get("/logout")
+    logout(client)
     login(client, "bob")                       # viewer
     home = client.get("/").text
     assert 'data-action="new-doc-here"' not in home
@@ -859,7 +871,7 @@ def test_activity_page_visible_to_editor_not_viewer(client):
     assert r.status_code == 200
     assert "활동" in r.text and "문서 생성" in r.text  # Korean action label, not raw action
     # A viewer has no edit footprint to audit and is refused.
-    client.get("/logout")
+    logout(client)
     login(client, "bob")  # viewer
     assert client.get("/activity").status_code == 403
 
@@ -1077,7 +1089,7 @@ def test_preview_api_is_csrf_exempt(client):
     )
     assert r.status_code == 200 and r.json()["ok"]
     # Still gated on auth: a logged-out client gets 401, not a render.
-    client.get("/logout")
+    logout(client)
     assert client.post("/api/preview", data={"content": "x"}).status_code == 401
 
 
@@ -1211,7 +1223,7 @@ def test_search_folder_filter(client):
     assert r.status_code == 200
     # Scope to the main content: the persistent file tree (left sidebar) lists every
     # document, so assert against the search-results region only.
-    results = r.text.split("<main>")[-1]
+    results = _main_html(r.text)
     assert "notes/a.md" in results and "other/b.md" not in results
 
 
@@ -1229,10 +1241,10 @@ def test_home_pagination(client):
         create_doc(client, f"p{i:03}.md", f"doc number {i}")
     # Scope to the main list region: the left file tree lists every doc regardless
     # of which page is shown, so pagination must be asserted on <main> only.
-    first = client.get("/?sort=path").text.split("<main>")[-1]
+    first = _main_html(client.get("/?sort=path").text)
     assert "p000.md" in first and "/ 55" in first  # pager total shown
     # Page 2 holds the tail; page 1 doesn't.
-    second = client.get("/?sort=path&page=2").text.split("<main>")[-1]
+    second = _main_html(client.get("/?sort=path&page=2").text)
     assert "p054.md" in second and "p054.md" not in first
     assert "p000.md" not in second
 
@@ -1360,6 +1372,32 @@ def test_login_lockout_collapses_ipv4_mapped_ipv6(ctx, principals):
         follow_redirects=False,
     )
     assert r.status_code == 429
+
+
+def test_successful_login_does_not_clear_shared_ip_failure_history(ctx, principals):
+    # A caller who owns one valid low-privilege account must not be able to reset the
+    # IP bucket between guesses against a different account.
+    app = create_web_app(ctx)
+    attacker = TestClient(app, client=("8.8.8.8", 1))
+    member = TestClient(app, client=("8.8.8.8", 2))
+    for _ in range(7):
+        response = attacker.post(
+            "/login",
+            data={"username": "admin", "password": "wrong", "csrf_token": _token(attacker, "/login")},
+        )
+        assert response.status_code == 401
+
+    assert login(member, "bob").status_code == 200
+    eighth = attacker.post(
+        "/login",
+        data={"username": "admin", "password": "wrong", "csrf_token": _token(attacker, "/login")},
+    )
+    assert eighth.status_code == 401
+    blocked = attacker.post(
+        "/login",
+        data={"username": "admin", "password": "wrong", "csrf_token": _token(attacker, "/login")},
+    )
+    assert blocked.status_code == 429
 
 
 def test_login_throttle_block_is_audited_once(ctx, principals):

@@ -624,6 +624,19 @@ def test_llms_full_bad_bearer_rejected(client):
     assert r.status_code == 401
 
 
+def test_llms_full_rate_limit_bounds_repeated_corpus_materialization(
+    ctx, principals, client
+):
+    _seed(ctx, principals)
+    key = create_api_key(ctx.db, principals["editor"], "bounded-export")
+    headers = {"Authorization": f"Bearer {key}"}
+    for _ in range(6):
+        assert client.get("/llms-full.txt", headers=headers).status_code == 200
+    blocked = client.get("/llms-full.txt", headers=headers)
+    assert blocked.status_code == 429
+    assert "retry later" in blocked.text
+
+
 def test_raw_md_link_fetchable_by_bearer_agent(ctx, principals, client):
     # The whole point of /llms.txt: an agent that fetched the index with its API key
     # must be able to GET each linked raw (.md) with the SAME key (was session-only).
@@ -675,3 +688,15 @@ async def test_export_corpus_full_truncates(ctx, principals, editor_mcp):
         "export_corpus", {"format": "full", "max_chars": 1000}))
     assert full["truncated"] is True
     assert full["included"] < full["total"]
+
+
+async def test_export_corpus_full_limit_never_blocks_lightweight_index(editor_mcp):
+    for _ in range(6):
+        result = _payload(await editor_mcp.call_tool("export_corpus", {"format": "full"}))
+        assert result["ok"] is True
+
+    limited = _payload(await editor_mcp.call_tool("export_corpus", {"format": "full"}))
+    assert limited["error"]["code"] == "rate_limited"
+
+    index = _payload(await editor_mcp.call_tool("export_corpus", {"format": "index"}))
+    assert index["ok"] is True and index["format"] == "index"

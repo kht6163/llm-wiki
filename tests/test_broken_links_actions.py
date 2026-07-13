@@ -26,6 +26,10 @@ def login(client: TestClient, username: str, password: str = "secret12"):
     )
 
 
+def logout(client: TestClient):
+    return client.post("/logout", data={"csrf_token": _token(client, "/")})
+
+
 def create_doc(client: TestClient, path: str, content: str, title: str = ""):
     return client.post(
         "/new",
@@ -47,7 +51,7 @@ def test_broken_links_create_button_for_editor_not_viewer(client):
     assert "문서 만들기" in editor_page.text
     assert 'action="/broken-links/create"' in editor_page.text
 
-    client.get("/logout")
+    logout(client)
     login(client, "bob")
     viewer_page = client.get("/broken-links")
     assert viewer_page.status_code == 200
@@ -129,7 +133,7 @@ def _csrf_from_page(html: str) -> str:
 def test_viewer_cannot_create_from_broken_link(client, ctx):
     login(client, "alice")
     create_doc(client, "src.md", "see [[ghost2]] for details")
-    client.get("/logout")
+    logout(client)
     login(client, "bob")
     tok = _csrf_from_page(client.get("/broken-links").text)
     r = client.post(

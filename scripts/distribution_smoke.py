@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 ASSET_ROOTS = ("web/templates", "web/static")
 MAX_SDIST_BYTES = 10 * 1024 * 1024
-REQUIRED_SDIST_FILES = {".env.example"}
+REQUIRED_SDIST_FILES = {".env.example", "LICENSE", "SECURITY.md"}
 FORBIDDEN_SDIST_PREFIXES = (
     ".venv/",
     ".wheel-smoke/",
@@ -126,6 +126,7 @@ def main() -> int:
     import llm_wiki
 
     installed_version = importlib.metadata.version("llm-wiki")
+    metadata = importlib.metadata.metadata("llm-wiki")
     if llm_wiki.__version__ != installed_version:
         raise RuntimeError(
             f"package version mismatch: {llm_wiki.__version__} != {installed_version}"
@@ -134,6 +135,11 @@ def main() -> int:
         raise RuntimeError(
             f"installed version {installed_version} != expected {args.expected_version}"
         )
+    if metadata.get("License-Expression") != "MIT":
+        raise RuntimeError("wheel is missing the expected MIT license expression")
+    project_urls = metadata.get_all("Project-URL") or []
+    if not any(value.startswith("Security, ") for value in project_urls):
+        raise RuntimeError("wheel is missing the security policy URL")
 
     installed_root = importlib.resources.files("llm_wiki")
     verify_assets(args.source_package, installed_root)

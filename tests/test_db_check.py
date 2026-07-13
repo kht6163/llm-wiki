@@ -5,6 +5,8 @@ copies a broken DB."""
 import sqlite3
 from types import SimpleNamespace
 
+import pytest
+
 from llm_wiki import _cli_impl
 
 
@@ -81,6 +83,63 @@ def test_delete_orphan_vectors_repairs(ctx):
     assert ctx.db.delete_orphan_vectors() == 0        # idempotent: nothing left to remove
 
 
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("missing_revision", "no current revision"),
+        ("hash", "revision hash mismatch"),
+        ("duplicate_chunk", "duplicate chunk ordinal"),
+        ("invalid_range", "invalid range"),
+        ("missing_fts", "missing its FTS row"),
+        ("deleted_fts", "deleted document"),
+        ("incomplete_vectors", "incomplete chunk vectors"),
+    ],
+)
+def test_integrity_check_detects_application_invariant_violations(
+    ctx, principals, case, message
+):
+    ctx.docs.create(principals["editor"], "invariant.md", "# Invariant\n\nbody")
+    with ctx.db.writer() as conn:
+        doc_id = conn.execute(
+            "SELECT id FROM documents WHERE path_norm='invariant.md'"
+        ).fetchone()[0]
+        if case == "missing_revision":
+            conn.execute("UPDATE documents SET version=version+100 WHERE id=?", (doc_id,))
+        elif case == "hash":
+            conn.execute(
+                "UPDATE revisions SET body='tampered' WHERE doc_id=? AND version=1",
+                (doc_id,),
+            )
+        elif case == "duplicate_chunk":
+            conn.execute(
+                "INSERT INTO chunks(doc_id,ordinal,heading,text,char_start,char_end,heading_path) "
+                "SELECT doc_id,ordinal,heading,text,char_start,char_end,heading_path "
+                "FROM chunks WHERE doc_id=? LIMIT 1",
+                (doc_id,),
+            )
+        elif case == "invalid_range":
+            conn.execute(
+                "UPDATE chunks SET char_end=-1 WHERE doc_id=? AND ordinal=0", (doc_id,)
+            )
+        elif case == "missing_fts":
+            conn.execute("DELETE FROM documents_fts WHERE rowid=?", (doc_id,))
+        elif case == "deleted_fts":
+            conn.execute("UPDATE documents SET is_deleted=1 WHERE id=?", (doc_id,))
+        else:
+            conn.execute(
+                "DELETE FROM chunk_vectors WHERE chunk_id IN "
+                "(SELECT id FROM chunks WHERE doc_id=?)",
+                (doc_id,),
+            )
+
+    report = ctx.db.integrity_check()
+    assert report["ok"] is False
+    assert any(
+        message in violation
+        for violation in report["application_invariant_violations"]
+    )
+
+
 def test_db_check_cli_healthy(ctx, monkeypatch, capsys):
     monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
     rc = _cli_impl._db_check(SimpleNamespace(quick=False, fix_orphan_vectors=False))
@@ -98,6 +157,25 @@ def test_db_check_cli_reports_corruption(ctx, monkeypatch, capsys):
     assert rc == 1
     out = capsys.readouterr().out
     assert "table=chunks" in out
+
+
+def test_db_check_cli_reports_application_invariant_violations(
+    ctx, principals, monkeypatch, capsys
+):
+    ctx.docs.create(principals["editor"], "cli-invariant.md", "body")
+    with ctx.db.writer() as conn:
+        conn.execute(
+            "DELETE FROM documents_fts WHERE rowid=(SELECT id FROM documents "
+            "WHERE path_norm='cli-invariant.md')"
+        )
+    monkeypatch.setattr(_cli_impl, "build_context", lambda **kw: ctx)
+
+    assert _cli_impl._db_check(
+        SimpleNamespace(quick=True, fix_orphan_vectors=False)
+    ) == 1
+    out = capsys.readouterr().out
+    assert "application invariants: 1 violation(s)" in out
+    assert "missing its FTS row" in out
 
 
 def test_db_check_cli_fixes_orphan_vectors(ctx, monkeypatch, capsys):

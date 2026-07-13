@@ -77,6 +77,15 @@ a:hover { text-decoration: underline; }
 /* One visible focus ring for keyboard nav; pointer focus stays quiet. */
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 3px; }
 :focus:not(:focus-visible) { outline: none; }
+/* Keyboard users can bypass the persistent ribbon/sidebars. Keep the target just
+   outside the viewport until it receives focus, then render it above all chrome. */
+.skip-link {
+  position: fixed; top: 8px; left: 8px; z-index: var(--z-toast);
+  padding: 7px 11px; border: 1px solid var(--accent); border-radius: var(--r-sm);
+  background: var(--pop); color: var(--accent-hover); box-shadow: var(--shadow-pop);
+  font-weight: 600; transform: translateY(calc(-100% - 16px));
+}
+.skip-link:focus { transform: translateY(0); text-decoration: none; }
 /* Mechanical data (paths, versions, timestamps, hashes, scores) reads as code. */
 code, pre, kbd, samp { font-family: var(--font-mono); }
 code { background: var(--inset); padding: 1px 5px; border-radius: 4px; font-size: 0.88em;
@@ -215,6 +224,43 @@ tr.via-mcp-row > td { background: var(--accent-soft); }
 .doc-meta { color: var(--fg-muted); font-size: 0.78em; font-family: var(--font-mono);
   font-variant-numeric: tabular-nums; margin: 6px 0 20px; padding-bottom: 14px;
   border-bottom: 1px solid var(--line); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Explicit, compact disclosure before minting a bearer-style public link. */
+.share-panel {
+  max-width: 74ch; margin: -8px 0 20px; padding: 12px 14px;
+  border: 1px solid var(--line-strong); border-radius: var(--r-md); background: var(--inset);
+}
+.share-panel h2 { margin: 0 0 5px; font-size: 0.96em; }
+.share-caution { margin: 0 0 10px; color: var(--fg-muted); font-size: 0.84em; }
+.share-actions, .share-result { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.share-result { flex: 1; }
+.share-result input {
+  flex: 1; min-width: 8em; padding: 6px 8px; border: 1px solid var(--field-border);
+  border-radius: var(--r-sm); background: var(--bg); color: var(--fg);
+  font-family: var(--font-mono); font-size: 0.78em;
+}
+.share-status { min-height: 1.4em; margin: 7px 0 0; font-size: 0.78em; }
+.share-status.share-error { color: var(--danger); }
+.share-list-head { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.share-list-head h3 { margin: 0; font-size: 0.84em; }
+.share-list-head button { margin-left: auto; padding: 2px 8px; font-size: 0.74em; }
+.share-links { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 6px; }
+.share-link-row {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 10px;
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg);
+}
+.share-link-heading { display: flex; align-items: center; gap: 7px; min-width: 0; font-size: 0.8em; }
+.share-state {
+  padding: 0 5px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  font-family: var(--font-mono); font-size: 0.78em; font-weight: 600;
+}
+.share-state-active { color: var(--success); background: var(--success-soft); }
+.share-state-expired { color: var(--warn); background: var(--warn-soft); }
+.share-state-revoked { color: var(--fg-muted); background: var(--inset); }
+.share-link-meta {
+  grid-column: 1; display: flex; flex-wrap: wrap; gap: 2px 10px;
+  color: var(--fg-muted); font-family: var(--font-mono); font-size: 0.7em;
+}
+.share-revoke { grid-row: 1 / span 2; grid-column: 2; align-self: center; padding: 3px 8px; font-size: 0.74em; }
 /* Frontmatter Properties — structured metadata surfaced from YAML frontmatter
    (title/tags omitted; already the h1 + doc-meta chips). All-monospace key→value
    grid on the inset surface: the "mechanical info in mono" signature, dense and
@@ -785,6 +831,7 @@ body.resizing { cursor: col-resize; user-select: none; }
 .ribbon-btn.brand:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent-hover); }
 .ribbon-btn.brand svg { width: 24px; height: 24px; }
 .ribbon-spacer { flex: 1; }
+.ribbon-form { margin: 0; }
 
 /* left sidebar */
 .sidebar-left {
@@ -898,7 +945,7 @@ details.tree-folder[open] > summary .tree-twisty::before { content: "▾"; }
 .sb-resizer { position: absolute; top: 0; width: 6px; height: 100%; cursor: col-resize; z-index: var(--z-resizer); }
 .sidebar-left .sb-resizer { right: -3px; }
 .sidebar-right .sb-resizer { left: -3px; }
-.sb-resizer:hover { background: color-mix(in srgb, var(--accent) 40%, transparent); }
+.sb-resizer:hover, .sb-resizer:focus-visible { background: color-mix(in srgb, var(--accent) 40%, transparent); }
 
 /* main column */
 .main-col { grid-row: 1; grid-column: 3; display: flex; flex-direction: column; min-width: 0; overflow: hidden; }

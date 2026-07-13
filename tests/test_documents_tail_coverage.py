@@ -550,6 +550,10 @@ def test_purge_rejects_a_pending_tombstone_when_projection_cannot_start(
         docs.purge(admin, "blocked-purge.md")
 
     assert raised.value.result.reason == "io_error"
+    assert raised.value.committed is False
+    assert raised.value.http_status == 409
+    assert raised.value.suggested_action == "retry_after_recovery"
+    assert raised.value.to_dict()["error"]["suggested_action"] == "retry_after_recovery"
     with ctx.db.reader() as conn:
         row = conn.execute("SELECT file_state FROM documents WHERE id=?", (doc_id,)).fetchone()
         intent = conn.execute(
@@ -581,6 +585,10 @@ def test_purge_rejects_a_live_file_reappearing_after_pending_projection(
         docs.purge(admin, "live-reappeared.md")
 
     assert raised.value.result.reason == "purge_live_present"
+    assert raised.value.committed is False
+    assert raised.value.http_status == 409
+    assert raised.value.suggested_action == "retry_after_recovery"
+    assert raised.value.to_dict()["error"]["suggested_action"] == "retry_after_recovery"
     with ctx.db.reader() as conn:
         assert (
             conn.execute(

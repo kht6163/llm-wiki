@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from ...markdown_render import render_markdown
 from ...markdown_utils import document_properties
 from ...services.auth import Principal
+from ...services.documents import ProjectionPendingError
 from ...services.errors import ConflictError, WikiError
 from ...util import PathError, content_disposition_attachment, word_count
 from ..helpers import _diff_lines
@@ -39,13 +40,21 @@ def register_docs_pages(web: FastAPI, deps: WebDeps) -> None:
                       folders=folders, page=page, per_page=per_page, total=total,
                       has_prev=page > 1, has_next=offset + len(items) < total)
 
-    @web.get("/daily")
+    @web.post("/daily")
     def daily(request: Request, p: Principal = Depends(require_user)):
         # Open (creating if absent) today's daily note and jump to it — the journaling
         # entry point. Idempotent: returns the existing note for any role; only creating
         # one needs write (a viewer hitting a missing note gets a flash + home).
         try:
             d = docs.daily_note(p)
+        except ProjectionPendingError as e:
+            request.session["flash"] = (
+                "오늘 노트는 저장됐지만 파일 반영이 지연되고 있습니다. "
+                "서버가 자동 복구합니다."
+            )
+            return RedirectResponse(
+                "/doc/" + quote(e.extra.get("path") or "daily"), status_code=303
+            )
         except WikiError as e:
             request.session["flash"] = e.message
             return RedirectResponse("/", status_code=303)
@@ -82,6 +91,11 @@ def register_docs_pages(web: FastAPI, deps: WebDeps) -> None:
         tpl = (template.strip() or None) if not (content or "").strip() else None
         try:
             doc = docs.create(p, path, content, title=title or None, template=tpl)
+        except ProjectionPendingError as e:
+            request.session["flash"] = (
+                "문서는 저장됐지만 파일 반영이 지연되고 있습니다. 서버가 자동 복구합니다."
+            )
+            return RedirectResponse("/doc/" + quote(e.extra.get("path") or path), status_code=303)
         except PathError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
@@ -120,6 +134,11 @@ def register_docs_pages(web: FastAPI, deps: WebDeps) -> None:
                   p: Principal = Depends(require_user)):
         try:
             doc = docs.update(p, path, base_version, content, title=title or None)
+        except ProjectionPendingError as e:
+            request.session["flash"] = (
+                "변경은 저장됐지만 파일 반영이 지연되고 있습니다. 같은 편집을 다시 저장하지 마세요."
+            )
+            return RedirectResponse("/doc/" + quote(e.extra.get("path") or path), status_code=303)
         except ConflictError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
@@ -185,6 +204,11 @@ def register_docs_pages(web: FastAPI, deps: WebDeps) -> None:
                     p: Principal = Depends(require_user)):
         try:
             docs.delete(p, path, base_version)
+        except ProjectionPendingError:
+            request.session["flash"] = (
+                "삭제는 저장됐지만 파일 정리가 지연되고 있습니다. 서버가 자동 복구합니다."
+            )
+            return RedirectResponse("/", status_code=303)
         except WikiError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
@@ -238,6 +262,13 @@ def register_docs_pages(web: FastAPI, deps: WebDeps) -> None:
                          p: Principal = Depends(require_user)):
         try:
             doc = docs.restore_revision(p, path, version)
+        except ProjectionPendingError as e:
+            request.session["flash"] = (
+                "복원은 저장됐지만 파일 반영이 지연되고 있습니다. 같은 복원을 반복하지 마세요."
+            )
+            return RedirectResponse(
+                "/doc/" + quote(e.extra.get("path") or path), status_code=303
+            )
         except ConflictError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path

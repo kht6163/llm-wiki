@@ -1,6 +1,10 @@
 services:
   llm-wiki:
-    build: .
+    build:
+      context: .
+      args:
+        APP_UID: ${LLM_WIKI_UID:-1000}
+        APP_GID: ${LLM_WIKI_GID:-1000}
     image: llm-wiki:latest
     ports:
       - "127.0.0.1:8080:8080"   # web UI
@@ -9,6 +13,7 @@ services:
       - HOST=0.0.0.0
       # - COOKIE_SECURE=true              # enable when serving behind TLS
       # - EMBEDDING_MODEL=intfloat/multilingual-e5-base
+      # - EMBEDDING_REVISION=<commit-hash> # pin model artifacts in production
       # - SESSION_SECRET=change-me        # else auto-generated + persisted in the DB
       # - LOG_FILE=/data/llm-wiki.log     # rotating file log (in addition to stderr)
     volumes:
@@ -16,7 +21,13 @@ services:
       - ./vault:/vault      # markdown documents
       - hf-models:/models   # embedding-model cache (avoids re-downloading)
     restart: unless-stopped
-    # Block in-container privilege escalation (defense in depth).
+    # Runtime root filesystem and Linux capabilities are not needed; writable state is
+    # confined to the three mounts and a small temporary filesystem.
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
     security_opt:
       - no-new-privileges:true
     # The image (Dockerfile HEALTHCHECK) also reports health; this surfaces it to
@@ -35,9 +46,8 @@ services:
       resources:
         limits:
           memory: 2g
-    # Runs as root by default for bind-mount (./data, ./vault) write compatibility.
-    # To run non-root, ensure those host dirs are writable by the uid and set e.g.:
-    #   user: "1000:1000"
+    # The image runs as uid/gid 1000. Create ./data and ./vault as the host user before
+    # first start. Hosts using another uid can rebuild with APP_UID/APP_GID build args.
 
 volumes:
   hf-models:

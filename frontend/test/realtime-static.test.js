@@ -280,6 +280,54 @@ describe("realtime.js", () => {
     expect(banner.textContent).toContain("v9");
   });
 
+  test("soft-refresh covers hidden, unattributed, and in-flight checks", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
+      json: () => Promise.resolve({ ok: true, html: "ignored", version: 4 }),
+    })));
+    await boot({ mode: "edit", version: "2" });
+
+    Object.defineProperty(document, "visibilityState", { value: "hidden", configurable: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    expect(fetch).not.toHaveBeenCalled();
+
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    window.dispatchEvent(new Event("focus"));
+    vi.advanceTimersByTime(2000);
+    await flush();
+    expect(document.querySelector("#rt-banner").textContent).toContain("v4");
+    expect(document.querySelector("#rt-banner").textContent).not.toContain(" · ");
+
+    window.dispatchEvent(new Event("focus"));
+    vi.advanceTimersByTime(2000);
+    await flush();
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  test("soft-refresh skips list mode and absorbs network failures", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new Error("offline"))));
+    await boot({ path: "", mode: "list" });
+    window.dispatchEvent(new Event("focus"));
+    expect(fetch).not.toHaveBeenCalled();
+
+    await boot();
+    window.dispatchEvent(new Event("focus"));
+    vi.advanceTimersByTime(2000);
+    await flush();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  test("unload clears a pending soft-refresh and guards its racing callback", async () => {
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+    vi.stubGlobal("fetch", vi.fn());
+    await boot();
+    window.dispatchEvent(new Event("focus"));
+    const callback = timerSpy.mock.calls.at(-1)[0];
+    window.dispatchEvent(new Event("beforeunload"));
+    callback();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   test("soft-refresh debounces and skips when version is not newer", async () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({
       json: () => Promise.resolve({ ok: true, html: "same", version: 2 }),

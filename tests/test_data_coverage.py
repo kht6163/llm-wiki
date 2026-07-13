@@ -712,6 +712,169 @@ def test_vector_tie_at_vector_cap_uses_stable_subset_across_insertion_orders(tmp
     assert forward == reverse == ["alpha.md", "bravo.md"]
 
 
+@pytest.mark.parametrize("filter_kind", ["folder", "tag"])
+def test_vector_filter_exact_fallback_recovers_candidate_outside_global_cap(
+    tmp_path, filter_kind
+):
+    db = _fresh_db(tmp_path)
+    ids = [
+        _insert_indexed_doc(db, f"other-{index}.md", "# Same\nvector passage")
+        for index in range(2)
+    ]
+    target = _insert_indexed_doc(db, "wanted/target.md", "# Target\nvector passage")
+    vectors = {
+        ids[0]: Embedder.serialize([1.0, 0.0]),
+        ids[1]: Embedder.serialize([0.99, 0.01]),
+        target: Embedder.serialize([0.9, 0.1]),
+    }
+    with db.writer() as conn:
+        conn.execute("UPDATE documents SET folder='wanted' WHERE id=?", (target,))
+        if filter_kind == "tag":
+            conn.execute("INSERT INTO tags(doc_id,tag) VALUES(?,?)", (target, "selected"))
+        for doc_id, vector in vectors.items():
+            chunk_id = conn.execute(
+                "SELECT id FROM chunks WHERE doc_id=?", (doc_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(?,?)",
+                (chunk_id, vector),
+            )
+
+    with db.read_snapshot() as conn:
+        ranked, _info, _match = search._rank(
+            conn,
+            "vector passage",
+            mode="vector",
+            k=2,
+            folder="wanted" if filter_kind == "folder" else None,
+            tags=["selected"] if filter_kind == "tag" else None,
+            query_vector=Embedder.serialize([1.0, 0.0]),
+            params=search.FusionParams(vector_factor=1, vector_cap=2),
+        )
+    assert [doc_id for doc_id, _score in ranked] == [target]
+
+
+def test_vector_filter_skips_exact_scan_when_global_window_has_every_eligible_doc(
+    tmp_path, monkeypatch
+):
+    db = _fresh_db(tmp_path)
+    target = _insert_indexed_doc(db, "wanted/target.md", "# Target\nvector passage")
+    with db.writer() as conn:
+        conn.execute("UPDATE documents SET folder='wanted' WHERE id=?", (target,))
+        chunk_id = conn.execute(
+            "SELECT id FROM chunks WHERE doc_id=?", (target,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(?,?)",
+            (chunk_id, Embedder.serialize([1.0, 0.0])),
+        )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("exact scan is unnecessary when all eligible docs are present")
+
+    monkeypatch.setattr(search, "_vector_filtered_exact", unexpected)
+    with db.read_snapshot() as conn:
+        ranked, _info, _match = search._rank(
+            conn,
+            "vector passage",
+            mode="vector",
+            k=40,
+            folder="wanted",
+            tags=None,
+            query_vector=Embedder.serialize([1.0, 0.0]),
+        )
+    assert [doc_id for doc_id, _score in ranked] == [target]
+
+
+def test_vector_filter_exact_scan_respects_candidate_cap(tmp_path, monkeypatch):
+    db = _fresh_db(tmp_path)
+    vectors: list[tuple[int, bytes]] = []
+    for index in range(2):
+        doc_id = _insert_indexed_doc(db, f"global-{index}.md", "# Global\nvector")
+        vectors.append((doc_id, Embedder.serialize([1.0, index * 0.001])))
+    for index in range(3):
+        doc_id = _insert_indexed_doc(db, f"selected-{index}.md", "# Selected\nvector")
+        vectors.append((doc_id, Embedder.serialize([0.5, 0.5 + index * 0.001])))
+    with db.writer() as conn:
+        conn.executemany(
+            "INSERT INTO tags(doc_id,tag) VALUES(?, 'selected')",
+            [(doc_id,) for doc_id, _vector in vectors[2:]],
+        )
+        for doc_id, vector in vectors:
+            chunk_id = conn.execute(
+                "SELECT id FROM chunks WHERE doc_id=?", (doc_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(?,?)",
+                (chunk_id, vector),
+            )
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("exact scan must not bypass vector_cap")
+
+    monkeypatch.setattr(search, "_vector_filtered_exact", unexpected)
+    with db.read_snapshot() as conn:
+        ranked, _info, _match = search._rank(
+            conn,
+            "vector",
+            mode="vector",
+            k=2,
+            folder=None,
+            tags=["selected"],
+            query_vector=Embedder.serialize([1.0, 0.0]),
+            params=search.FusionParams(vector_factor=1, vector_cap=2),
+        )
+
+    assert ranked == []
+
+
+def test_filtered_fallback_bounds_distance_scan_by_vector_cap(tmp_path):
+    db = _fresh_db(tmp_path)
+    doc_id = _insert_indexed_doc(db, "selected.md", "# Selected\nfirst")
+    with db.writer() as conn:
+        conn.execute("INSERT INTO tags(doc_id,tag) VALUES(?, 'selected')", (doc_id,))
+        first_chunk = conn.execute(
+            "SELECT id FROM chunks WHERE doc_id=?", (doc_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chunks(doc_id,ordinal,heading,text,char_start,char_end) "
+            "VALUES(?,1,NULL,'second',5,11)",
+            (doc_id,),
+        )
+        second_chunk = conn.execute(
+            "SELECT id FROM chunks WHERE doc_id=? AND ordinal=1", (doc_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO chunks(doc_id,ordinal,heading,text,char_start,char_end) "
+            "VALUES(?,2,NULL,'closest',11,18)",
+            (doc_id,),
+        )
+        third_chunk = conn.execute(
+            "SELECT id FROM chunks WHERE doc_id=? AND ordinal=2", (doc_id,)
+        ).fetchone()[0]
+        conn.executemany(
+            "INSERT INTO chunk_vectors(chunk_id,embedding) VALUES(?,?)",
+            [
+                (first_chunk, Embedder.serialize([0.0, 1.0])),
+                (second_chunk, Embedder.serialize([0.5, 0.5])),
+                (third_chunk, Embedder.serialize([1.0, 0.0])),
+            ],
+        )
+
+    with db.read_snapshot() as conn:
+        ranked = search._vector_filtered_exact(
+            conn,
+            Embedder.serialize([1.0, 0.0]),
+            1,
+            2,
+            folder=None,
+            tags=["selected"],
+            filters=search.QueryFilters(),
+        )
+
+    assert ranked[0][1]["ordinal"] == 1
+
+
 def test_vector_max_knn_boundary_and_larger_cap_stay_stable(tmp_path):
     paths = [f"doc-{index:04}.md" for index in range(4097)]
     query_vector = Embedder.serialize([1.0, 0.0])

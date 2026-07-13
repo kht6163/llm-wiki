@@ -1,0 +1,135 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "발행할 SemVer (v 접두사 제외, 예: 0.33.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+      TAG: v${{ inputs.version }}
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Validate version, lockfile, draft, and successful CI
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          project_version="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$project_version" = "$VERSION"
+          uv lock --check
+          if git rev-parse "$TAG" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "tag already exists: $TAG" >&2
+            exit 1
+          fi
+
+          ci_run="$(gh run list --workflow ci.yml --branch main --commit "$GITHUB_SHA" \
+            --status success --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+          test -n "$ci_run"
+
+          gh release view next --json isDraft,body \
+            --jq 'select(.isDraft == true) | .body' > release-notes.md
+          test -s release-notes.md
+          grep -Eq '^### (새 기능|개선|수정|내부)$' release-notes.md
+          grep -Eq '테스트 [0-9]+ passed.*ruff.*mypy' release-notes.md
+          if grep -Eiq 'Claude|Anthropic|Generated with' release-notes.md; then
+            echo "release notes contain a prohibited tool attribution" >&2
+            exit 1
+          fi
+
+      - name: Build wheel and source distribution once
+        run: uv build
+
+      - name: Generate source SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: ${{ github.workspace }}/dist/llm-wiki-${{ inputs.version }}.spdx.json
+
+      - name: Verify the built distribution in a clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .wheel-smoke
+          uv pip install --python .wheel-smoke/bin/python --torch-backend cpu dist/*.whl
+          .wheel-smoke/bin/python scripts/distribution_smoke.py \
+            --expected-version "$VERSION" \
+            --source-package src/llm_wiki \
+            --sdist dist/*.tar.gz
+
+      - name: Write release checksums
+        shell: bash
+        run: sha256sum dist/*.whl dist/*.tar.gz dist/*.spdx.json > dist/SHA256SUMS
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.spdx.json
+            dist/SHA256SUMS
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and publish the versioned image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Publish tag and formal GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --target "$GITHUB_SHA" \
+            --title "llm-wiki $TAG" \
+            --notes-file release-notes.md \
+            dist/*.whl dist/*.tar.gz dist/*.spdx.json dist/SHA256SUMS
+          gh release delete next --yes

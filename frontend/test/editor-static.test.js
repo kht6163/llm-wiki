@@ -122,6 +122,23 @@ describe("editor.js", () => {
     expect(document.querySelector("#loc-path").value).toBe("x.md");
   });
 
+  test("reloads the new-document form with every template and location shape", async () => {
+    const cases = [
+      `
+        <input id="loc-folder" value=" /notes/ "><input id="loc-name" value=" Daily.md ">
+        <select id="doc-template"><option value="daily" selected>daily</option></select>`,
+      `
+        <input id="loc-folder" value=""><input id="loc-name" value="Loose">
+        <select id="doc-template"><option value="" selected>none</option></select>`,
+      '<select id="doc-template"><option value="" selected>none</option></select>',
+    ];
+    for (const html of cases) {
+      document.body.innerHTML = html;
+      await loadStatic("editor");
+      event(document.querySelector("#doc-template"), "change");
+    }
+  });
+
   test("requires form and textarea while falling back without mount or bundle", async () => {
     for (const html of [
       "", '<form class="editform"></form>',
@@ -266,6 +283,11 @@ describe("editor.js", () => {
     mountOptions.onSave("fallback");
     expect(submitted).toHaveBeenCalledOnce();
     expect(form.submit).not.toHaveBeenCalled();
+
+    form.querySelector('button[type="submit"]').remove();
+    submitted.mockClear();
+    mountOptions.onSave("event fallback");
+    expect(submitted).toHaveBeenCalledOnce();
   });
 
   test("warns on dirty navigation and respects both cancel decisions", async () => {

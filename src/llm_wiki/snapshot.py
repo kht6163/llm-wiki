@@ -18,11 +18,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import IO
 
+import sqlite_vec
 from filelock import FileLock
 
-from .db import SCHEMA_VERSION, Database, get_meta
+from . import file_projection as fp
+from .db import SCHEMA_VERSION, Database, application_invariant_violations, get_meta
 from .process_lock import ProjectLock
-from .util import now_iso
+from .util import now_iso, path_norm
 
 SNAPSHOT_FORMAT = "llm-wiki-snapshot"
 _ATTACHMENT_ATTEMPTS = 3
@@ -375,6 +377,186 @@ def _stage_attachment_files(
     return files
 
 
+def _live_managed_change_explains_disk(
+    db: Database,
+    clone_row: sqlite3.Row,
+    *,
+    disk_body: str | None,
+) -> bool:
+    """Whether a post-clone canonical write explains a managed-file mismatch.
+
+    A snapshot synthesizes managed Markdown from its DB clone.  The live service may
+    commit and project a newer generation after that clone is taken; treating the newer
+    disk file as an external edit would make safe live snapshots fail spuriously.  Only
+    accept a mismatch when the *same document id* has advanced and the live canonical
+    row accounts exactly for the observed absence/content.
+    """
+    with db.read_snapshot() as live_conn:
+        live = live_conn.execute(
+            "SELECT d.path,d.path_norm,d.version,d.file_state,d.is_deleted,r.body "
+            "FROM documents d LEFT JOIN revisions r "
+            "ON r.doc_id=d.id AND r.version=d.version WHERE d.id=?",
+            (clone_row["id"],),
+        ).fetchone()
+    if live is None:
+        return disk_body is None
+    advanced = (
+        int(live["version"]) != int(clone_row["version"])
+        or str(live["path_norm"]) != str(clone_row["path_norm"])
+        or bool(live["is_deleted"])
+    )
+    if not advanced:
+        return False
+    if disk_body is None:
+        return bool(live["is_deleted"]) or str(live["path_norm"]) != str(
+            clone_row["path_norm"]
+        )
+    return (
+        not live["is_deleted"]
+        and live["file_state"] == "clean"
+        and str(live["path_norm"]) == str(clone_row["path_norm"])
+        and live["body"] is not None
+        and str(live["body"]) == disk_body
+    )
+
+
+def _live_new_document_explains_disk(db: Database, identity: str, disk_body: str) -> bool:
+    """Whether an archive path absent from the clone is a newly committed live doc."""
+    with db.read_snapshot() as live_conn:
+        live = live_conn.execute(
+            "SELECT d.file_state,r.body FROM documents d JOIN revisions r "
+            "ON r.doc_id=d.id AND r.version=d.version "
+            "WHERE d.path_norm=? AND d.is_deleted=0",
+            (identity,),
+        ).fetchone()
+    return bool(
+        live is not None
+        and live["file_state"] == "clean"
+        and str(live["body"]) == disk_body
+    )
+
+
+def _assert_reconciled_markdown(
+    conn: sqlite3.Connection,
+    vault: Path,
+    *,
+    live_db: Database | None = None,
+) -> None:
+    """Refuse to silently omit external Markdown that has not reached the DB yet."""
+    if not vault.exists():
+        return
+    rows = conn.execute(
+        "SELECT d.id,d.path,d.path_norm,d.version,d.file_state,r.body FROM documents d "
+        "JOIN revisions r ON r.doc_id=d.id AND r.version=d.version "
+        "WHERE d.is_deleted=0 ORDER BY d.path_norm"
+    ).fetchall()
+    managed: dict[str, sqlite3.Row] = {}
+    for row in rows:
+        archive_path, identity = _normalized_archive_path(str(row["path"]))
+        managed[identity] = row
+        # A pending projection is deliberately synthesized from the canonical revision.
+        if row["file_state"] != "clean":
+            continue
+        target = vault / archive_path.removeprefix("vault/")
+        try:
+            stable = fp.read_stable_markdown(vault, target)
+            disk_body = stable.text
+        except fp.StableFileError as exc:
+            if (
+                live_db is not None
+                and exc.reason == "file_disappeared"
+                and _live_managed_change_explains_disk(live_db, row, disk_body=None)
+            ):
+                continue
+            if exc.reason == "invalid_encoding":
+                detail = f"invalid UTF-8 in {row['path']}"
+            elif exc.reason == "file_disappeared":
+                detail = f"missing {row['path']}"
+            else:
+                detail = f"unstable {row['path']}"
+            raise RuntimeError(
+                "unreconciled external Markdown detected; run 'llm-wiki reindex' "
+                f"before snapshotting ({detail})"
+            ) from exc
+        if disk_body != str(row["body"]):
+            if live_db is not None and _live_managed_change_explains_disk(
+                live_db, row, disk_body=disk_body
+            ):
+                continue
+            raise RuntimeError(
+                "unreconciled external Markdown detected; run 'llm-wiki reindex' "
+                f"before snapshotting (changed {row['path']})"
+            )
+
+    internal = {".trash", "_templates"}
+    for path in vault.rglob("*"):
+        relative = path.relative_to(vault)
+        if relative.parts and relative.parts[0].casefold() == ".tmp":
+            continue
+        visible = os.lstat(path)
+        if stat.S_ISLNK(visible.st_mode):
+            raise ValueError(f"unsafe vault path: {relative.as_posix()!r}")
+        if stat.S_ISDIR(visible.st_mode):
+            continue
+        if not stat.S_ISREG(visible.st_mode):
+            raise ValueError(f"vault entry must be a regular file: {relative.as_posix()!r}")
+        if path.suffix.lower() != ".md":
+            continue
+        if relative.parts and relative.parts[0].casefold() in internal:
+            continue
+        _archive_path, identity = _normalized_archive_path(relative.as_posix())
+        if identity not in managed:
+            if live_db is not None:
+                try:
+                    stable = fp.read_stable_markdown(vault, path)
+                except fp.StableFileError as exc:
+                    raise RuntimeError(
+                        "unreconciled external Markdown detected; run 'llm-wiki reindex' "
+                        f"before snapshotting (unstable {relative.as_posix()})"
+                    ) from exc
+                if _live_new_document_explains_disk(
+                    live_db, path_norm(relative.as_posix()), stable.text
+                ):
+                    continue
+            raise RuntimeError(
+                "unreconciled external Markdown detected; run 'llm-wiki reindex' "
+                f"before snapshotting (unmanaged {relative.as_posix()})"
+            )
+
+
+def _database_validation_errors(conn: sqlite3.Connection) -> list[str]:
+    errors: list[str] = []
+    integrity = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+    if integrity != ["ok"]:
+        errors.extend(f"integrity: {item}" for item in integrity if item != "ok")
+    foreign_keys = conn.execute("PRAGMA foreign_key_check").fetchall()
+    errors.extend(
+        f"foreign key: table={row[0]} rowid={row[1]} parent={row[2]}"
+        for row in foreign_keys
+    )
+    vector_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
+    ).fetchone()
+    if vector_table is not None:
+        orphans = conn.execute(
+            "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+        ).fetchone()[0]
+        if orphans:
+            errors.append(f"orphan vectors: {orphans}")
+    errors.extend(application_invariant_violations(conn))
+    return errors
+
+
+def _load_sqlite_vec(conn: sqlite3.Connection) -> None:
+    if not hasattr(conn, "enable_load_extension"):
+        return
+    conn.enable_load_extension(True)
+    try:
+        sqlite_vec.load(conn)
+    finally:
+        conn.enable_load_extension(False)
+
+
 def _count_snapshot_members(conn: sqlite3.Connection, vault: Path) -> int:
     managed = int(
         conn.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0]
@@ -458,7 +640,14 @@ def write_snapshot(
                 clone = sqlite3.connect(cloned_db)
                 clone.row_factory = sqlite3.Row
                 try:
+                    _load_sqlite_vec(clone)
                     managed, normalized = _stage_managed_files(clone, staging, budget)
+                    _assert_reconciled_markdown(clone, vault, live_db=db)
+                    validation_errors = _database_validation_errors(clone)
+                    if validation_errors:
+                        raise ValueError(
+                            "snapshot database validation failed: " + validation_errors[0]
+                        )
                     schema = get_meta(clone, "schema_version")
                     embedding_model = get_meta(clone, "embedding_model")
                     embedding_dim = get_meta(clone, "embedding_dim")
@@ -898,12 +1087,15 @@ def _validate_staged_database(
         )
         conn.row_factory = sqlite3.Row
         try:
+            _load_sqlite_vec(conn)
             try:
-                integrity = conn.execute("PRAGMA integrity_check").fetchall()
+                validation_errors = _database_validation_errors(conn)
             except sqlite3.Error as exc:
                 raise ValueError("snapshot database integrity check failed") from exc
-            if len(integrity) != 1 or integrity[0][0] != "ok":
-                raise ValueError("snapshot database integrity check failed")
+            if validation_errors:
+                raise ValueError(
+                    "snapshot database integrity check failed: " + validation_errors[0]
+                )
             schema_raw = get_meta(conn, "schema_version")
             schema_version = int(schema_raw) if schema_raw is not None else None
             if schema_version is None or schema_version > SCHEMA_VERSION:

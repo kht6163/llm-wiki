@@ -18,6 +18,8 @@
       </form>
       {% if user.can_write %}
         <a href="/doc/{{ doc.path|urlpath }}/edit">편집</a>
+        <button id="share-toggle" class="doc-action-button" type="button"
+                aria-expanded="false" aria-controls="share-panel">공유</button>
         <form method="post" action="/doc/{{ doc.path|urlpath }}/delete" class="inline"
               data-confirm="이 문서를 삭제할까요?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -36,6 +38,30 @@
     {{ via_badge(doc.last_via) }}
     {% for t in doc.tags %}<a class="tag" href="/?tag={{ t|urlpath }}">#{{ t }}</a>{% endfor %}
   </div>
+  {% if user.can_write %}
+  <section class="share-panel" id="share-panel" data-share-path="{{ doc.path }}"
+           aria-labelledby="share-panel-title" hidden>
+    <h2 id="share-panel-title">공개 읽기 링크</h2>
+    <p class="share-caution">링크를 받은 누구나 로그인 없이 이 문서의 최신 내용을 볼 수 있습니다.
+      링크는 30일 후 자동 만료되며 언제든 이 화면에서 취소할 수 있습니다.
+      임베드한 다른 문서의 본문은 공개되지 않습니다.</p>
+    <div class="share-actions">
+      <button id="share-generate" type="button">30일 링크 만들기</button>
+      <div id="share-result" class="share-result" hidden>
+        <label class="visually-hidden" for="share-url">공개 링크</label>
+        <input id="share-url" type="text" readonly>
+        <button id="share-copy" type="button">복사</button>
+      </div>
+    </div>
+    <p id="share-status" class="share-status muted" role="status" aria-live="polite"></p>
+    <div class="share-list-head">
+      <h3>발급 내역</h3>
+      <button id="share-refresh" type="button">새로 고침</button>
+    </div>
+    <p id="share-list-empty" class="muted" hidden>발급한 링크가 없습니다.</p>
+    <ul id="share-links" class="share-links" aria-label="공개 링크 발급 내역"></ul>
+  </section>
+  {% endif %}
   {% if properties or user.can_write %}
   <section class="doc-props-wrap" id="doc-props-wrap"
            data-path="{{ doc.path }}" data-version="{{ doc.version }}">
@@ -62,8 +88,8 @@
 
 {% block right %}
 <div class="rp-tabs" role="tablist" aria-label="문서 정보">
-  <button class="rp-tab active" type="button" data-rp="outline" role="tab" id="rp-tab-outline" aria-controls="rp-panel-outline" aria-selected="true">목차</button>
-  <button class="rp-tab" type="button" data-rp="links" role="tab" id="rp-tab-links" aria-controls="rp-panel-links" aria-selected="false">링크</button>
+  <button class="rp-tab active" type="button" data-rp="outline" role="tab" id="rp-tab-outline" aria-controls="rp-panel-outline" aria-selected="true" tabindex="0">목차</button>
+  <button class="rp-tab" type="button" data-rp="links" role="tab" id="rp-tab-links" aria-controls="rp-panel-links" aria-selected="false" tabindex="-1">링크</button>
 </div>
 <div class="rp-body">
   <div class="rp-panel" data-rp-panel="outline" id="rp-panel-outline" role="tabpanel" tabindex="0" aria-labelledby="rp-tab-outline">
@@ -101,4 +127,5 @@
 <script src="{{ static('tasks.js') }}"></script>
 <script src="{{ static('related.js') }}"></script>
 {% if user.can_write %}<script src="{{ static('props.js') }}"></script>{% endif %}
+{% if user.can_write %}<script src="{{ static('share.js') }}"></script>{% endif %}
 {% endblock %}

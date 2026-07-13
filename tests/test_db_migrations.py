@@ -114,9 +114,14 @@ def test_downgrade_guard_refuses_newer_db(tmp_path):
     db = Database(tmp_path / "newer.db")
     db.ensure_schema()
     with db.writer() as conn:
+        conn.execute("DROP TABLE favorites")
         set_meta(conn, "schema_version", str(SCHEMA_VERSION + 5))
     with pytest.raises(RuntimeError):
         db.ensure_schema()
+    with db.reader() as conn:
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='favorites'"
+        ).fetchone() is None
 
 
 def test_old_version_is_bumped_to_current(tmp_path):
@@ -142,6 +147,42 @@ def test_v13_adds_user_credential_version(tmp_path):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
         assert "credential_version" in columns
         assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
+
+
+def test_upgraded_api_key_scope_enforces_same_check_as_fresh_database(tmp_path):
+    db = Database(tmp_path / "scope-check.db")
+    db.ensure_schema()
+    with db.writer() as conn:
+        set_meta(conn, "schema_version", "14")
+
+    db.ensure_schema()
+
+    with db.writer() as conn:
+        conn.execute(
+            "INSERT INTO users(username,password_hash,role,created_at,updated_at) "
+            "VALUES('u','hash','viewer','now','now')"
+        )
+        user_id = conn.execute("SELECT id FROM users WHERE username='u'").fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO api_keys(user_id,name,key_prefix,key_hash,created_at,scope) "
+                "VALUES(?,?,?,?,?,?)",
+                (user_id, "bad", "prefix", "hash", "now", "invalid"),
+            )
+
+
+def test_sessions_and_share_link_indexes_exist(tmp_path):
+    db = Database(tmp_path / "ops-indexes.db")
+    db.ensure_schema()
+    with db.reader() as conn:
+        indexes = _indexes(conn)
+    assert {
+        "idx_sessions_user",
+        "idx_sessions_expires",
+        "idx_share_links_doc",
+        "idx_share_links_created_by",
+        "idx_share_links_active",
+    } <= indexes
 
 
 def test_migration_failure_is_atomic_and_resumable(tmp_path, monkeypatch):

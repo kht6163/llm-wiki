@@ -34,15 +34,24 @@ def build_context(settings: Settings | None = None, *, full: bool = True,
     db = Database(settings.db_path)
     try:
         if settings.embedding_enabled:
-            embedder: Embedder = get_embedder(
-                settings.embedding_model
+            embedder: Embedder = (
+                get_embedder(settings.embedding_model, settings.embedding_revision)
+                if settings.embedding_revision
+                else get_embedder(settings.embedding_model)
             )  # model loads lazily on first use
             if full:
-                db.initialize(settings.embedding_model, embedder.dim, embedder.pipeline)
+                db.initialize(
+                    settings.embedding_model,
+                    embedder.dim,
+                    embedder.pipeline,
+                    embedder.revision,
+                )
             else:
                 db.ensure_schema()
         else:
-            embedder = DisabledEmbedder(settings.embedding_model)
+            embedder = DisabledEmbedder(
+                settings.embedding_model, settings.embedding_revision
+            )
             # Relational schema only — no vector table binding required.
             db.ensure_schema()
         events = EventHub()

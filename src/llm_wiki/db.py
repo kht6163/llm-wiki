@@ -14,6 +14,7 @@ import sqlite3
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from hashlib import sha256
 from pathlib import Path
 
 import sqlite_vec
@@ -24,7 +25,7 @@ from .embedding_contract import (
     EmbeddingBindingChanged,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 17
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -65,6 +66,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 
 CREATE TABLE IF NOT EXISTS documents (
   id           INTEGER PRIMARY KEY,
@@ -250,24 +253,101 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   doc_id         INTEGER,              -- document the write landed on
   result_version INTEGER,              -- version produced by the original write
   result_path    TEXT,                 -- path produced by the original write
+  request_hash   TEXT NOT NULL,        -- identity of the original logical request
   created_at     TEXT NOT NULL,
   UNIQUE(scope, user_id, idem_key)
 );
 CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);
+
+CREATE TABLE IF NOT EXISTS share_links (
+  id         INTEGER PRIMARY KEY,
+  token_hash TEXT NOT NULL UNIQUE,
+  doc_id     INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_share_links_doc ON share_links(doc_id);
+CREATE INDEX IF NOT EXISTS idx_share_links_created_by ON share_links(created_by);
+CREATE INDEX IF NOT EXISTS idx_share_links_active
+  ON share_links(doc_id, expires_at) WHERE revoked_at IS NULL;
 """
+
+
+def application_invariant_violations(conn: sqlite3.Connection) -> list[str]:
+    """Return logical corruption not covered by SQLite's b-tree/FK checks."""
+    violations: list[str] = []
+    current_rows = conn.execute(
+        "SELECT d.id,d.path,d.is_deleted,d.content_hash,r.body,"
+        "r.content_hash AS revision_hash FROM documents d "
+        "LEFT JOIN revisions r ON r.doc_id=d.id AND r.version=d.version "
+        "ORDER BY d.id"
+    ).fetchall()
+    for row in current_rows:
+        if row["body"] is None:
+            violations.append(f"document {row['id']} has no current revision")
+            continue
+        digest = sha256(str(row["body"]).encode("utf-8")).hexdigest()
+        if row["content_hash"] != digest or row["revision_hash"] != digest:
+            violations.append(f"document {row['id']} current revision hash mismatch")
+
+    duplicate_chunk = conn.execute(
+        "SELECT doc_id,ordinal FROM chunks GROUP BY doc_id,ordinal HAVING COUNT(*)<>1 LIMIT 1"
+    ).fetchone()
+    if duplicate_chunk is not None:
+        violations.append(
+            f"document {duplicate_chunk['doc_id']} has duplicate chunk ordinal "
+            f"{duplicate_chunk['ordinal']}"
+        )
+    invalid_chunk = conn.execute(
+        "SELECT id FROM chunks WHERE ordinal<0 OR char_start<0 OR char_end<char_start LIMIT 1"
+    ).fetchone()
+    if invalid_chunk is not None:
+        violations.append(f"chunk {invalid_chunk['id']} has an invalid range")
+
+    missing_fts = conn.execute(
+        "SELECT d.id FROM documents d LEFT JOIN documents_fts f ON f.rowid=d.id "
+        "WHERE d.is_deleted=0 AND f.rowid IS NULL LIMIT 1"
+    ).fetchone()
+    if missing_fts is not None:
+        violations.append(f"live document {missing_fts['id']} is missing its FTS row")
+    deleted_fts = conn.execute(
+        "SELECT d.id FROM documents d JOIN documents_fts f ON f.rowid=d.id "
+        "WHERE d.is_deleted=1 LIMIT 1"
+    ).fetchone()
+    if deleted_fts is not None:
+        violations.append(f"deleted document {deleted_fts['id']} still has an FTS row")
+
+    vector_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
+    ).fetchone()
+    if vector_table is not None:
+        incomplete = conn.execute(
+            "SELECT d.id FROM documents d "
+            "WHERE d.is_deleted=0 AND d.vector_dirty=0 AND "
+            "(SELECT COUNT(*) FROM chunks c WHERE c.doc_id=d.id) <> "
+            "(SELECT COUNT(*) FROM chunk_vectors v JOIN chunks c ON c.id=v.chunk_id "
+            " WHERE c.doc_id=d.id) LIMIT 1"
+        ).fetchone()
+        if incomplete is not None:
+            violations.append(
+                f"clean document {incomplete['id']} has incomplete chunk vectors"
+            )
+    return violations
 
 # Numbered forward migrations for EXISTING databases, applied in ascending order.
 # New *tables* belong in SCHEMA_SQL (IF NOT EXISTS covers fresh and existing DBs);
 # use a migration only for changes IF NOT EXISTS can't express — ALTER TABLE ADD
 # COLUMN, index/constraint changes, data backfills.
 #
-# Each entry is (target_version, ddl) and MUST be a SINGLE SQL statement: the
-# applier runs the statement and bumps schema_version in one transaction, so a
+# Each entry is (target_version, ddl-or-statements). The applier runs every statement
+# for one target and bumps schema_version in one transaction, so a
 # failure rolls the step back atomically (no half-migrated DB) and leaves the
-# version at the last fully-applied step (resumable). For a multi-step change, use
-# several entries so each step is independently atomic. Example:
+# version at the last fully-applied step (resumable). Example:
 #   (3, "ALTER TABLE documents ADD COLUMN archived INTEGER NOT NULL DEFAULT 0"),
-MIGRATIONS: list[tuple[int, str]] = [
+MIGRATIONS: list[tuple[int, str | tuple[str, ...]]] = [
     # v3: record which surface authored each revision (web | mcp | cli) so history
     # can tell a human edit from an agent edit. Pre-existing rows predate the MCP
     # write surface in practice, so 'web' is the safe backfill default.
@@ -301,6 +381,31 @@ MIGRATIONS: list[tuple[int, str]] = [
     (13, "ALTER TABLE users ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 1"),
     # v14: optional read-only MCP API keys (agents that must not write).
     (14, "ALTER TABLE api_keys ADD COLUMN scope TEXT NOT NULL DEFAULT 'readwrite'"),
+    # v15: v14's ADD COLUMN could not attach the CHECK present on fresh databases.
+    # Rebuild atomically so upgraded and newly-created databases enforce the same domain.
+    (15, (
+        "CREATE TABLE api_keys__v15 ("
+        "id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        "name TEXT NOT NULL,key_prefix TEXT NOT NULL UNIQUE,key_hash TEXT NOT NULL,"
+        "created_at TEXT NOT NULL,last_used_at TEXT,revoked_at TEXT,"
+        "scope TEXT NOT NULL DEFAULT 'readwrite' CHECK(scope IN ('read','readwrite')))",
+        "INSERT INTO api_keys__v15(id,user_id,name,key_prefix,key_hash,created_at,last_used_at,"
+        "revoked_at,scope) SELECT id,user_id,name,key_prefix,key_hash,created_at,last_used_at,"
+        "revoked_at,scope FROM api_keys",
+        "DROP TABLE api_keys",
+        "ALTER TABLE api_keys__v15 RENAME TO api_keys",
+        "CREATE INDEX idx_api_keys_user ON api_keys(user_id)",
+    )),
+    # v16: bind idempotency keys to the logical request. Existing rows predate request
+    # fingerprints and retain an empty sentinel; all new service writes provide a hash.
+    (16, "ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''"),
+    # v17: revocable public-share ledger. SCHEMA_SQL creates it before migrations on an
+    # existing database, so this statement is intentionally idempotent and stamps the
+    # feature boundary explicitly.
+    (17, "CREATE TABLE IF NOT EXISTS share_links (id INTEGER PRIMARY KEY,token_hash TEXT "
+         "NOT NULL UNIQUE,doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,"
+         "created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,created_at TEXT NOT NULL,"
+         "expires_at TEXT NOT NULL,revoked_at TEXT,last_used_at TEXT)"),
 ]
 
 
@@ -356,6 +461,26 @@ class Database:
         yield self._conn()
 
     @contextmanager
+    def read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Yield one consistent read snapshot without disturbing an outer transaction.
+
+        Thread-local connections run in autocommit mode, so a sequence of SELECTs through
+        :meth:`reader` can otherwise observe different committed generations.  When the
+        connection is not already in a transaction this context owns a short deferred read
+        transaction and closes it with ``ROLLBACK`` (read-only, so there is nothing to
+        commit).  Nested callers reuse their caller's transaction unchanged.
+        """
+        with self.reader() as conn:
+            owned = not conn.in_transaction
+            if owned:
+                conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                if owned and conn.in_transaction:
+                    conn.execute("ROLLBACK")
+
+    @contextmanager
     def writer(self) -> Iterator[sqlite3.Connection]:
         with self._write_lock:
             conn = self._conn()
@@ -369,6 +494,37 @@ class Database:
                 except Exception:
                     pass
                 raise
+
+    def try_write(self, sql: str, params=()) -> bool:
+        """Run disposable telemetry SQL immediately, or return ``False`` without waiting.
+
+        The dedicated connection has a zero busy timeout and the process writer lock is
+        acquired non-blocking.  Correctness must never depend on this path; it exists for
+        sparse metadata such as public-link ``last_used_at`` only.
+        """
+        if not self._write_lock.acquire(blocking=False):
+            return False
+        conn: sqlite3.Connection | None = None
+        try:
+            # Telemetry never touches vector tables, so a minimal connection avoids
+            # extension loading and WAL reconfiguration before its zero-timeout BEGIN.
+            conn = sqlite3.connect(
+                str(self.path), timeout=0.0, isolation_level=None, check_same_thread=False
+            )
+            conn.execute("PRAGMA busy_timeout=0")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(sql, params)
+            conn.execute("COMMIT")
+            return True
+        except sqlite3.Error:
+            if conn is not None:
+                conn.rollback()
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+            self._write_lock.release()
 
     @contextmanager
     def _embedding_binding_writer(
@@ -414,18 +570,26 @@ class Database:
         vectors. Read-only: safe on a live DB. Worth running before a backup/snapshot, since
         a consistent copy of a corrupt DB is still corrupt."""
         check = "quick_check" if quick else "integrity_check"
-        with self.reader() as conn:
+        with self.read_snapshot() as conn:
             integrity = [r[0] for r in conn.execute(f"PRAGMA {check}").fetchall()]
             fk = conn.execute("PRAGMA foreign_key_check").fetchall()
-            orphans = conn.execute(
-                "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
-            ).fetchone()[0]
+            vector_table = self.vector_table_exists(conn)
+            orphans = (
+                conn.execute(
+                    "SELECT COUNT(*) FROM chunk_vectors "
+                    "WHERE chunk_id NOT IN (SELECT id FROM chunks)"
+                ).fetchone()[0]
+                if vector_table
+                else 0
+            )
+            app_violations = application_invariant_violations(conn)
         violations = [
             {"table": r[0], "rowid": r[1], "parent": r[2], "fkid": r[3]} for r in fk
         ]
-        ok = integrity == ["ok"] and not violations and not orphans
+        ok = integrity == ["ok"] and not violations and not orphans and not app_violations
         return {"ok": ok, "check": check, "integrity": integrity,
-                "foreign_key_violations": violations, "orphan_vectors": orphans}
+                "foreign_key_violations": violations, "orphan_vectors": orphans,
+                "application_invariant_violations": app_violations}
 
     def delete_orphan_vectors(self) -> int:
         """Delete ``chunk_vectors`` rows whose ``chunk_id`` has no surviving ``chunks`` row
@@ -434,6 +598,8 @@ class Database:
         search leg already skips it), so dropping it only reclaims space and stops it from
         crowding the KNN window. Runs in its own write transaction."""
         with self.writer() as conn:
+            if not self.vector_table_exists(conn):
+                return 0
             before = conn.execute(
                 "SELECT COUNT(*) FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)"
             ).fetchone()[0]
@@ -442,6 +608,12 @@ class Database:
                     "DELETE FROM chunk_vectors WHERE chunk_id NOT IN (SELECT id FROM chunks)")
             return before
 
+    @staticmethod
+    def vector_table_exists(conn: sqlite3.Connection) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
+        ).fetchone() is not None
+
     # -- schema / meta -----------------------------------------------------
     def ensure_schema(self) -> None:
         # executescript() implicitly COMMITs, so it must run outside our explicit
@@ -449,6 +621,26 @@ class Database:
         with self._write_lock:
             conn = self.connect()
             try:
+                # Refuse a newer database before SCHEMA_SQL can recreate an obsolete
+                # table/index that a future schema intentionally removed.
+                has_meta = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'"
+                ).fetchone()
+                if has_meta:
+                    stored = get_meta(conn, "schema_version")
+                    if stored is not None:
+                        try:
+                            current = int(stored)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                "Database schema_version is not a valid integer."
+                            ) from exc
+                        if current > SCHEMA_VERSION:
+                            raise RuntimeError(
+                                f"Database schema_version is {current}, newer than this build "
+                                f"supports ({SCHEMA_VERSION}). Upgrade llm-wiki to match the "
+                                "database."
+                            )
                 conn.executescript(SCHEMA_SQL)
                 self._apply_migrations(conn)
             finally:
@@ -478,7 +670,9 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 try:
-                    conn.execute(ddl)
+                    statements = (ddl,) if isinstance(ddl, str) else ddl
+                    for statement in statements:
+                        conn.execute(statement)
                 except sqlite3.OperationalError as e:
                     # ADD COLUMN is idempotent. A fresh DB already carries the column
                     # from SCHEMA_SQL and never runs migrations; but a DB whose stamp
@@ -516,6 +710,7 @@ class Database:
         embedding_model: str,
         embedding_dim: int,
         embedding_pipeline: str = EMBEDDING_PIPELINE,
+        embedding_revision: str | None = None,
     ) -> EmbeddingBinding:
         """Create the full schema and validate the process embedding binding."""
         if embedding_dim <= 0:
@@ -529,15 +724,18 @@ class Database:
                     "embedding_dim",
                     "embedding_pipeline",
                     "embedding_epoch",
+                    "embedding_revision",
                 )
             }
             model = values["embedding_model"]
             raw_dim = values["embedding_dim"]
             pipeline = values["embedding_pipeline"]
             raw_epoch = values["embedding_epoch"]
+            revision = values["embedding_revision"]
             table_row = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
             ).fetchone()
+            requested_revision = embedding_revision or ""
 
             if all(value is None for value in values.values()):
                 if table_row is not None:
@@ -547,33 +745,62 @@ class Database:
                         "instead of inferring provenance for existing vectors."
                     )
                 binding = EmbeddingBinding(
-                    embedding_model, embedding_dim, embedding_pipeline, 1
+                    embedding_model,
+                    embedding_dim,
+                    embedding_pipeline,
+                    1,
+                    requested_revision,
                 )
                 set_meta(conn, "embedding_model", embedding_model)
                 set_meta(conn, "embedding_dim", str(embedding_dim))
                 set_meta(conn, "embedding_pipeline", embedding_pipeline)
                 set_meta(conn, "embedding_epoch", "1")
+                set_meta(conn, "embedding_revision", requested_revision)
             else:
-                legacy = (
+                legacy_v0 = (
                     model is not None
                     and raw_dim is not None
                     and pipeline is None
                     and raw_epoch is None
                 )
+                legacy_v1 = (
+                    model is not None
+                    and raw_dim is not None
+                    and pipeline is not None
+                    and raw_epoch is not None
+                    and revision is None
+                )
                 complete = all(value is not None for value in values.values())
-                if not (legacy or complete):
+                if not (legacy_v0 or legacy_v1 or complete):
                     raise RuntimeError(
                         "Database embedding binding is corrupt: model, dimension, "
-                        "pipeline, and epoch must be stored together."
+                        "pipeline, epoch, and revision must be stored together."
                     )
                 assert model is not None and raw_dim is not None
-                if legacy:
+                if (
+                    (legacy_v0 or legacy_v1)
+                    and requested_revision
+                    and table_row is not None
+                ):
+                    raise RuntimeError(
+                        "Database embedding binding predates model revision tracking, so "
+                        "the existing vectors' weights cannot be verified. Re-embed with "
+                        "`llm-wiki reindex --reembed` before serving searches."
+                    )
+                if legacy_v0:
                     stored_pipeline = embedding_pipeline
                     epoch_value = "1"
-                else:
+                    stored_revision = revision or requested_revision
+                elif legacy_v1:
                     assert pipeline is not None and raw_epoch is not None
                     stored_pipeline = pipeline
                     epoch_value = raw_epoch
+                    stored_revision = requested_revision
+                else:
+                    assert pipeline is not None and raw_epoch is not None and revision is not None
+                    stored_pipeline = pipeline
+                    epoch_value = raw_epoch
+                    stored_revision = revision
 
                 try:
                     stored_dim = int(raw_dim)
@@ -590,13 +817,14 @@ class Database:
                     )
 
                 binding = EmbeddingBinding(
-                    model, stored_dim, stored_pipeline, stored_epoch
+                    model, stored_dim, stored_pipeline, stored_epoch, stored_revision
                 )
                 requested = EmbeddingBinding(
                     embedding_model,
                     embedding_dim,
                     embedding_pipeline,
                     stored_epoch,
+                    stored_revision if embedding_revision is None else requested_revision,
                 )
                 if binding != requested:
                     raise RuntimeError(
@@ -604,9 +832,11 @@ class Database:
                         f"{requested}. Re-embed with `llm-wiki reindex --reembed` "
                         "or restore the original embedding configuration."
                     )
-                if legacy:
+                if legacy_v0:
                     set_meta(conn, "embedding_pipeline", embedding_pipeline)
                     set_meta(conn, "embedding_epoch", "1")
+                if legacy_v0 or legacy_v1:
+                    set_meta(conn, "embedding_revision", requested_revision)
 
             if table_row is None:
                 conn.execute(
@@ -661,12 +891,13 @@ class Database:
             "embedding_dim",
             "embedding_pipeline",
             "embedding_epoch",
+            "embedding_revision",
         )
         values = dict.fromkeys(keys)
         values.update({
             row["k"]: row["v"]
             for row in conn.execute(
-                "SELECT k, v FROM meta WHERE k IN (?, ?, ?, ?)", keys
+                "SELECT k, v FROM meta WHERE k IN (?, ?, ?, ?, ?)", keys
             )
         })
         try:
@@ -675,6 +906,7 @@ class Database:
                 dim=int(values["embedding_dim"] or ""),
                 pipeline=values["embedding_pipeline"] or "",
                 epoch=int(values["embedding_epoch"] or ""),
+                revision=values["embedding_revision"] or "",
             )
         except ValueError as exc:
             raise EmbeddingBindingChanged(
@@ -697,16 +929,9 @@ class Database:
         Otherwise the binding read establishes the WAL snapshot and the context closes
         the owned transaction with ``ROLLBACK`` after all vector/result reads finish.
         """
-        with self.reader() as conn:
-            owned = not conn.in_transaction
-            if owned:
-                conn.execute("BEGIN")
-            try:
-                self.verify_embedding_binding(conn, expected)
-                yield conn
-            finally:
-                if owned and conn.in_transaction:
-                    conn.execute("ROLLBACK")
+        with self.read_snapshot() as conn:
+            self.verify_embedding_binding(conn, expected)
+            yield conn
 
     def embedding_binding_is_current(self) -> bool:
         """Whether DB metadata still matches this process's immutable binding."""
@@ -722,6 +947,7 @@ class Database:
         embedding_model: str,
         embedding_dim: int,
         embedding_pipeline: str,
+        embedding_revision: str | None = None,
     ) -> EmbeddingBinding:
         """Atomically create a new embedding generation and dirty live documents."""
         if embedding_dim <= 0:
@@ -735,12 +961,19 @@ class Database:
                     "embedding_dim",
                     "embedding_pipeline",
                     "embedding_epoch",
+                    "embedding_revision",
                 )
             }
             model = values["embedding_model"]
             dim = values["embedding_dim"]
             pipeline = values["embedding_pipeline"]
             raw_epoch = values["embedding_epoch"]
+            revision = values["embedding_revision"]
+            next_revision = (
+                embedding_revision
+                if embedding_revision is not None
+                else (revision or "")
+            )
             if all(value is None for value in values.values()):
                 previous_epoch = 0
             elif (
@@ -750,6 +983,23 @@ class Database:
                 and raw_epoch is None
             ):
                 previous_epoch = 1
+            elif (
+                model is not None
+                and dim is not None
+                and pipeline is not None
+                and raw_epoch is not None
+                and revision is None
+            ):
+                try:
+                    previous_epoch = int(raw_epoch)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Database embedding epoch must be a valid integer before rebind."
+                    ) from exc
+                if previous_epoch <= 0:
+                    raise RuntimeError(
+                        "Database embedding epoch must be positive before rebind."
+                    )
             elif all(value is not None for value in values.values()):
                 assert raw_epoch is not None
                 try:
@@ -765,13 +1015,14 @@ class Database:
             else:
                 raise RuntimeError(
                     "Database embedding binding is partial: model, dimension, "
-                    "pipeline, and epoch must be stored together."
+                    "pipeline, epoch, and revision must be stored together."
                 )
             binding = EmbeddingBinding(
                 embedding_model,
                 embedding_dim,
                 embedding_pipeline,
                 previous_epoch + 1,
+                next_revision,
             )
             conn.execute("DROP TABLE IF EXISTS chunk_vectors")
             conn.execute(
@@ -786,6 +1037,7 @@ class Database:
             set_meta(conn, "embedding_dim", str(binding.dim))
             set_meta(conn, "embedding_pipeline", binding.pipeline)
             set_meta(conn, "embedding_epoch", str(binding.epoch))
+            set_meta(conn, "embedding_revision", binding.revision)
 
             stage_binding(binding)
         return binding

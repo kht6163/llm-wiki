@@ -23,7 +23,6 @@ def register_auth_pages(web: FastAPI, deps: WebDeps) -> None:
     secret = deps.secret
     user = deps.user
     render = deps.render
-    embed_resolver = deps.embed_resolver
     login_redirect = deps.login_redirect
     login_limiter = deps.login_limiter
 
@@ -58,7 +57,10 @@ def register_auth_pages(web: FastAPI, deps: WebDeps) -> None:
                 audit.record_tx(db, actor=uname or "-", via="web", action="login_blocked",
                                 target=None, outcome="blocked", detail=f"ip={ip}")
             return render("login.html", request, status=401, error="Invalid username or password.")
-        login_limiter.reset(ip_key)
+        # Keep the IP-wide failure history until the sliding window expires.  If any
+        # successful login cleared it, an attacker with one valid low-privilege account
+        # could alternate guesses against another account with successful logins of
+        # their own and bypass the brute-force limit indefinitely.
         # Drop any pre-login session state (fixation hardening), then bind the new
         # session. A fresh CSRF token is minted on the next rendered page.
         request.session.clear()
@@ -71,7 +73,7 @@ def register_auth_pages(web: FastAPI, deps: WebDeps) -> None:
         )
         return RedirectResponse("/", status_code=303)
 
-    @web.get("/logout")
+    @web.post("/logout")
     def logout(request: Request):
         delete_session(db, request.session.get("sid"))
         request.session.clear()
@@ -83,13 +85,15 @@ def register_auth_pages(web: FastAPI, deps: WebDeps) -> None:
         from ...services import share as share_svc
 
         try:
-            path = share_svc.verify_share_token(secret, token)
+            path = share_svc.verify_share_token(secret, token, db=db)
             doc = docs.get(path)
         except ValidationError as e:
             return render("error.html", request, status=400, message=e.message)
         except NotFoundError as e:
             return render("error.html", request, status=404, message=e.message)
-        html = render_markdown(
-            doc["content"], doc["path"], resolve_embed=embed_resolver(doc["path"])
-        )
+        # A share token authorizes exactly this one document.  Authenticated document
+        # views expand ![[transclusions]], but doing that here would disclose the full
+        # bodies of other notes to an anonymous token holder.  Without a resolver the
+        # renderer keeps embeds as ordinary wikilinks, preserving the single-path grant.
+        html = render_markdown(doc["content"], doc["path"])
         return render("share.html", request, status=200, doc=doc, html=html)

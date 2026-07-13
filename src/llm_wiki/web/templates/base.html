@@ -22,6 +22,7 @@
   </script>
 </head>
 <body>
+<a class="skip-link" href="#main-content">본문으로 건너뛰기</a>
 {% if user %}
 {% from "_icons.html" import icon %}
 {# nav_path: route-highlight only. Do NOT name this `path` — child templates
@@ -35,7 +36,12 @@
     <button class="ribbon-btn" type="button" data-action="switcher" title="빠른 이동 (Ctrl/⌘+O)" aria-label="빠른 이동">{{ icon("search") }}</button>
     <button class="ribbon-btn" type="button" data-action="palette" title="명령 팔레트 (Ctrl/⌘+P)" aria-label="명령 팔레트">{{ icon("command") }}</button>
     {% if user.can_write %}<a class="ribbon-btn" href="/new" {% if nav_path == '/new' %}aria-current="page"{% endif %} title="새 문서" aria-label="새 문서">{{ icon("file-plus") }}</a>{% endif %}
-    {% if user.can_write %}<a class="ribbon-btn" href="/daily" title="오늘 노트" aria-label="오늘 노트">{{ icon("calendar") }}</a>{% endif %}
+    {% if user.can_write %}
+    <form class="ribbon-form" method="post" action="/daily">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="ribbon-btn" type="submit" title="오늘 노트" aria-label="오늘 노트">{{ icon("calendar") }}</button>
+    </form>
+    {% endif %}
     <a class="ribbon-btn" href="/graph" {% if nav_path == '/graph' %}aria-current="page"{% endif %} title="그래프" aria-label="그래프">{{ icon("network") }}</a>
     {% if user.can_write %}<a class="ribbon-btn" href="/activity" {% if nav_path == '/activity' %}aria-current="page"{% endif %} title="활동" aria-label="활동">{{ icon("activity") }}</a>{% endif %}
     <a class="ribbon-btn" href="/broken-links" {% if nav_path == '/broken-links' %}aria-current="page"{% endif %} title="깨진 링크" aria-label="깨진 링크">{{ icon("unlink") }}</a>
@@ -44,14 +50,17 @@
     <button class="ribbon-btn" type="button" data-action="toggle-theme" title="라이트/다크 전환" aria-label="테마 전환">{{ icon("contrast") }}</button>
     <a class="ribbon-btn" href="/settings" {% if nav_path.startswith('/settings') %}aria-current="page"{% endif %} title="API 키 / 설정" aria-label="설정">{{ icon("settings") }}</a>
     {% if user.can_admin %}<a class="ribbon-btn" href="/admin/users" {% if nav_path.startswith('/admin') %}aria-current="page"{% endif %} title="사용자 관리" aria-label="사용자 관리">{{ icon("users") }}</a>{% endif %}
-    <a class="ribbon-btn" href="/logout" title="로그아웃" aria-label="로그아웃">{{ icon("log-out") }}</a>
+    <form class="ribbon-form" id="logout-form" method="post" action="/logout">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="ribbon-btn" type="submit" title="로그아웃" aria-label="로그아웃">{{ icon("log-out") }}</button>
+    </form>
   </nav>
 
   <aside class="sidebar-left" id="sidebar-left" aria-label="탐색">
     <div class="sb-tabs" role="tablist" aria-label="사이드바">
-      <button class="sb-tab active" type="button" data-tab="files" role="tab" id="sb-tab-files" aria-controls="sb-panel-files" aria-selected="true">파일</button>
-      <button class="sb-tab" type="button" data-tab="search" role="tab" id="sb-tab-search" aria-controls="sb-panel-search" aria-selected="false">검색</button>
-      <button class="sb-tab" type="button" data-tab="tags" role="tab" id="sb-tab-tags" aria-controls="sb-panel-tags" aria-selected="false">태그</button>
+      <button class="sb-tab active" type="button" data-tab="files" role="tab" id="sb-tab-files" aria-controls="sb-panel-files" aria-selected="true" tabindex="0">파일</button>
+      <button class="sb-tab" type="button" data-tab="search" role="tab" id="sb-tab-search" aria-controls="sb-panel-search" aria-selected="false" tabindex="-1">검색</button>
+      <button class="sb-tab" type="button" data-tab="tags" role="tab" id="sb-tab-tags" aria-controls="sb-panel-tags" aria-selected="false" tabindex="-1">태그</button>
     </div>
     <div class="sb-body">
       <div class="sb-panel" data-panel="files" id="sb-panel-files" role="tabpanel" tabindex="0" aria-labelledby="sb-tab-files">
@@ -96,7 +105,9 @@
         </ul>
       </div>
     </div>
-    <div class="sb-resizer" data-resize="left" aria-hidden="true"></div>
+    <div class="sb-resizer" data-resize="left" role="separator" tabindex="0"
+         aria-label="좌측 사이드바 너비" aria-controls="sidebar-left"
+         aria-orientation="vertical" aria-valuemin="150" aria-valuemax="560" aria-valuenow="260"></div>
   </aside>
 
   <div class="main-col">
@@ -118,11 +129,13 @@
         user: {{ user.username|tojson }}
       };
     </script>
-    <main>{% block content %}{% endblock %}</main>
+    <main id="main-content" tabindex="-1">{% block content %}{% endblock %}</main>
   </div>
 
   <aside class="sidebar-right" id="sidebar-right" aria-label="문서 정보">
-    <div class="sb-resizer" data-resize="right" aria-hidden="true"></div>
+    <div class="sb-resizer" data-resize="right" role="separator" tabindex="0"
+         aria-label="우측 사이드바 너비" aria-controls="sidebar-right"
+         aria-orientation="vertical" aria-valuemin="150" aria-valuemax="560" aria-valuenow="300"></div>
     {% block right %}{% endblock %}
   </aside>
 
@@ -147,7 +160,7 @@
 <script src="{{ static('datetime.js') }}"></script>
 {% else %}
 {% if flash %}<div class="flash" role="status" aria-live="polite">{{ flash }}</div>{% endif %}
-<main class="login-shell">{{ self.content() }}</main>
+<main class="login-shell" id="main-content" tabindex="-1">{{ self.content() }}</main>
 {% endif %}
 </body>
 </html>

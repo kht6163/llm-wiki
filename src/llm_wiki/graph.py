@@ -315,17 +315,15 @@ def build_graph(
         visited |= frontier
         # When folder/tag filters are active, keep only matching docs from the BFS set.
         if filt_sql:
-            ph = ",".join("?" * len(visited)) if visited else "NULL"
-            if visited:
-                match_ids = {
-                    r[0]
-                    for r in conn.execute(
-                        f"SELECT id FROM documents WHERE id IN ({ph}) AND is_deleted=0{filt_sql}",
-                        list(visited) + filt_params,
-                    )
-                }
-            else:
-                match_ids = set()
+            # ``visited`` always contains the resolved root by this point.
+            ph = ",".join("?" * len(visited))
+            match_ids = {
+                r[0]
+                for r in conn.execute(
+                    f"SELECT id FROM documents WHERE id IN ({ph}) AND is_deleted=0{filt_sql}",
+                    list(visited) + filt_params,
+                )
+            }
             # Always keep the root so a focused graph is not emptied by a narrow filter.
             match_ids.add(root["id"])
             visited = match_ids

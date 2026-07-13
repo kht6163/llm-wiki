@@ -504,6 +504,26 @@ def test_search_page_truncation_is_exact(ctx, principals):
     assert len(res2) == 2 and trunc2 is True
 
 
+def test_bm25_result_assembly_uses_one_read_snapshot(ctx, principals, monkeypatch):
+    docs = ctx.docs
+    docs.create(principals["editor"], "stable.md", "# Stable\n\nsnapshot needle")
+    other = Database(ctx.settings.db_path)
+    real_rank = search_module._rank
+
+    def rank_then_commit(*args, **kwargs):
+        ranked = real_rank(*args, **kwargs)
+        with other.writer() as conn:
+            conn.execute(
+                "UPDATE documents SET title='committed after rank' WHERE path_norm='stable.md'"
+            )
+        return ranked
+
+    monkeypatch.setattr(search_module, "_rank", rank_then_commit)
+    results, _ = docs.search_page("snapshot needle", mode="bm25", top_k=5)
+
+    assert results[0].title == "Stable"
+
+
 def test_password_and_api_key_auth(ctx, principals):
     # password auth
     assert authenticate(ctx.db, "alice", "secret12") is not None

@@ -24,7 +24,10 @@
     { label: "좌측 사이드바 토글", hint: "toggle left sidebar", run: function () { (shell().toggleLeft || noop)(); } },
     { label: "우측 패널 토글", hint: "toggle right panel", run: function () { (shell().toggleRight || noop)(); } },
     { label: "라이트/다크 테마 전환", hint: "theme dark light", run: function () { (shell().toggleTheme || noop)(); } },
-    { label: "로그아웃", hint: "logout", run: function () { location.href = "/logout"; } }
+    { label: "로그아웃", hint: "logout", run: function () {
+      var form = document.getElementById("logout-form");
+      if (form) form.requestSubmit();
+    } }
   ];
   function noop() {}
 

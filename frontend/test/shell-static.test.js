@@ -28,12 +28,12 @@ function shellPage({ right = true, tabs = true, tree = "", search = true, resize
       <button id="right-a" data-action="toggle-right"></button>
       <button data-action="toggle-theme"></button>
       <aside id="sidebar-left">
-        ${tabs ? `<div class="sb-tabs"><button class="sb-tab active" data-tab="files"></button><button class="sb-tab" data-tab="search"></button></div><section data-panel="files"></section><section data-panel="search" hidden></section>` : ""}
+        ${tabs ? `<div class="sb-tabs"><button class="sb-tab active" data-tab="files" aria-selected="true" tabindex="0"></button><button class="sb-tab" data-tab="search" aria-selected="false" tabindex="-1"></button></div><section data-panel="files"></section><section data-panel="search" hidden></section>` : ""}
         ${search ? '<input id="sb-search-input"><div id="sb-search-results" aria-live="polite"></div>' : ""}
         <div id="file-tree">${tree}</div>
-        ${resizers ? '<div id="left-resizer" class="sb-resizer" data-resize="left"></div>' : ""}
+        ${resizers ? '<div id="left-resizer" class="sb-resizer" data-resize="left" role="separator" tabindex="0" aria-valuemin="150" aria-valuemax="560"></div>' : ""}
       </aside>
-      ${right ? `<aside id="sidebar-right"><div class="rp-tabs"><button class="rp-tab active" data-rp="outline"></button><button class="rp-tab" data-rp="links"></button></div><section data-rp-panel="outline"></section><section data-rp-panel="links" hidden></section>${resizers ? '<div id="right-resizer" class="sb-resizer" data-resize="right"></div>' : ""}</aside>` : ""}
+      ${right ? `<aside id="sidebar-right"><div class="rp-tabs"><button class="rp-tab active" data-rp="outline" aria-selected="true" tabindex="0"></button><button class="rp-tab" data-rp="links" aria-selected="false" tabindex="-1"></button></div><section data-rp-panel="outline"></section><section data-rp-panel="links" hidden></section>${resizers ? '<div id="right-resizer" class="sb-resizer" data-resize="right" role="separator" tabindex="0" aria-valuemin="150" aria-valuemax="560"></div>' : ""}</aside>` : ""}
     </div>`;
 }
 
@@ -230,6 +230,38 @@ describe("tabs, global actions and resizing", () => {
     document.querySelector('.rp-tab[data-rp="links"]').click();
     expect(document.querySelector('.rp-tab[data-rp="outline"]').getAttribute("aria-selected")).toBe("false");
     expect(document.querySelector('[data-rp-panel="links"]').hidden).toBe(false);
+    expect(document.querySelector('.rp-tab[data-rp="links"]').tabIndex).toBe(0);
+    expect(document.querySelector('.rp-tab[data-rp="outline"]').tabIndex).toBe(-1);
+  });
+
+  test("provides roving tab focus with arrows, Home and End", async () => {
+    shellPage();
+    await boot();
+    const files = document.querySelector('.sb-tab[data-tab="files"]');
+    const search = document.querySelector('.sb-tab[data-tab="search"]');
+    const press = (target, key) => {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      target.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    };
+
+    press(files, "ArrowRight");
+    expect(document.activeElement).toBe(search);
+    expect(search.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).not.toBe(document.querySelector("#sb-search-input"));
+    press(search, "ArrowDown");
+    expect(document.activeElement).toBe(files);
+    press(files, "ArrowLeft");
+    expect(document.activeElement).toBe(search);
+    press(search, "ArrowUp");
+    expect(document.activeElement).toBe(files);
+    press(files, "End");
+    expect(document.activeElement).toBe(search);
+    press(search, "Home");
+    expect(document.activeElement).toBe(files);
+    const ordinary = new KeyboardEvent("keydown", { key: "x", bubbles: true, cancelable: true });
+    files.dispatchEvent(ordinary);
+    expect(ordinary.defaultPrevented).toBe(false);
   });
 
   test("opens search through the public API and handles absent tabs and inputs", async () => {
@@ -284,6 +316,8 @@ describe("tabs, global actions and resizing", () => {
     left.setPointerCapture = vi.fn(() => { throw new Error("unsupported"); });
     right.setPointerCapture = vi.fn();
     expect(left.style.touchAction).toBe("none");
+    expect(left.getAttribute("aria-valuenow")).toBe("200");
+    expect(right.getAttribute("aria-valuenow")).toBe("300");
 
     const down = pointer("pointerdown", { pointerId: 1, clientX: 100 });
     left.dispatchEvent(down);
@@ -291,6 +325,7 @@ describe("tabs, global actions and resizing", () => {
     expect(document.body.classList.contains("resizing")).toBe(true);
     left.dispatchEvent(pointer("pointermove", { clientX: 1000 }));
     expect(document.documentElement.style.getPropertyValue("--left-w")).toBe("560px");
+    expect(left.getAttribute("aria-valuetext")).toBe("560픽셀");
     left.dispatchEvent(pointer("pointerup", { clientX: 1000 }));
     expect(localStorage.getItem("wiki-left-w")).toBe("560");
     expect(document.body.classList.contains("resizing")).toBe(false);
@@ -308,6 +343,37 @@ describe("tabs, global actions and resizing", () => {
     left.dispatchEvent(pointer("pointermove", { clientX: -1000 }));
     expect(document.documentElement.style.getPropertyValue("--left-w")).toBe("150px");
     left.dispatchEvent(pointer("pointerup", { clientX: -1000 }));
+  });
+
+  test("resizes separators from the keyboard with physical arrow direction", async () => {
+    shellPage();
+    document.documentElement.style.setProperty("--left-w", "200px");
+    document.documentElement.style.setProperty("--right-w", "300px");
+    await boot();
+    const left = document.querySelector("#left-resizer");
+    const right = document.querySelector("#right-resizer");
+    const press = (target, key) => {
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      target.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    };
+
+    press(left, "ArrowRight");
+    expect(left.getAttribute("aria-valuenow")).toBe("210");
+    press(left, "ArrowLeft");
+    expect(left.getAttribute("aria-valuenow")).toBe("200");
+    press(left, "Home");
+    expect(document.documentElement.style.getPropertyValue("--left-w")).toBe("150px");
+    press(left, "End");
+    expect(localStorage.getItem("wiki-left-w")).toBe("560");
+
+    press(right, "ArrowLeft");
+    expect(right.getAttribute("aria-valuenow")).toBe("310");
+    press(right, "ArrowRight");
+    expect(right.getAttribute("aria-valuenow")).toBe("300");
+    const ordinary = new KeyboardEvent("keydown", { key: "x", bubbles: true, cancelable: true });
+    right.dispatchEvent(ordinary);
+    expect(ordinary.defaultPrevented).toBe(false);
   });
 });
 

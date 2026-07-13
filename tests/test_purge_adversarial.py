@@ -8,7 +8,7 @@ import pytest
 
 from llm_wiki import file_projection as fp
 from llm_wiki.db import Database
-from llm_wiki.services.auth import Principal, create_user
+from llm_wiki.services.auth import Principal, create_api_key, create_user, principal_from_api_key
 from llm_wiki.services.documents import DocumentService
 from llm_wiki.util import path_norm
 
@@ -84,12 +84,9 @@ def test_purge_api_retry_keeps_original_intent_actor_and_via(
     docs = ctx.docs
     docs.create(principals["editor"], "immutable-request.md", "body", embed=False)
     docs.delete(principals["editor"], "immutable-request.md")
-    original_admin = Principal(
-        principals["admin"].user_id,
-        principals["admin"].username,
-        principals["admin"].role,
-        via="mcp",
-    )
+    token = create_api_key(ctx.db, principals["admin"], "purge-retry")
+    original_admin = principal_from_api_key(ctx.db, token)
+    assert original_admin is not None
     retry_id = create_user(ctx.db, "retry-admin", "secret12", "admin")
     retry_admin = Principal(retry_id, "retry-admin", "admin", via="web")
     doc_id = _leave_purge_intent(

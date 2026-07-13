@@ -123,6 +123,10 @@ def run(argv: list[str] | None = None) -> int:
     except WikiError as e:
         print(f"error: {e.message}")
         return 1
+    except RuntimeError as e:
+        if _report_embedding_rebind_required(e):
+            return 1
+        raise
     except KeyboardInterrupt:
         return 0
 
@@ -166,11 +170,30 @@ def _dispatch(args) -> int:
 
 
 def _init_db() -> int:
-    ctx = build_context(full=True)
+    try:
+        ctx = build_context(full=True)
+    except RuntimeError as exc:
+        if _report_embedding_rebind_required(exc):
+            return 1
+        raise
     print(f"Initialized database at {ctx.settings.db_path}")
     print(f"Vault: {ctx.settings.vault_path}")
     print(f"Embedding model: {ctx.settings.embedding_model} (dim={ctx.embedder.dim})")
     return 0
+
+
+def _report_embedding_rebind_required(exc: RuntimeError) -> bool:
+    """Turn embedding provenance/binding guards into an actionable CLI error.
+
+    Keep unrelated runtime failures visible to callers: only binding errors that already
+    identify the supported repair command are handled here.
+    """
+    message = str(exc)
+    if "reindex --reembed" not in message.lower():
+        return False
+    print(f"embedding index requires a rebuild: {message}")
+    print("Stop every running server, run 'uv run llm-wiki reindex --reembed', then retry.")
+    return True
 
 
 def _os_actor() -> str:
@@ -257,6 +280,12 @@ def _reindex(args) -> int:
         # with full=False to skip that guard, then rebind: recreate the vector table at the
         # current model's dimension and update the binding, before re-embedding every doc.
         ctx = build_context(full=False)
+        if hasattr(ctx.docs, "embedding_enabled") and not ctx.docs.embedding_enabled():
+            print(
+                "reindex --reembed requires embeddings; set EMBEDDING_ENABLED=true "
+                "and retry."
+            )
+            return 1
         with ctx.db.reader() as conn:
             prev_model = get_meta(conn, "embedding_model")
             prev_dim = get_meta(conn, "embedding_dim")
@@ -265,7 +294,10 @@ def _reindex(args) -> int:
             print(f"Rebinding embedding model: {prev_model} (dim {prev_dim}) -> "
                   f"{ctx.settings.embedding_model} (dim {new_dim})")
         ctx.db.rebind_model(
-            ctx.settings.embedding_model, new_dim, ctx.embedder.pipeline
+            ctx.settings.embedding_model,
+            new_dim,
+            ctx.embedder.pipeline,
+            getattr(ctx.embedder, "revision", ""),
         )
         print("Reindexing vault (re-embedding all documents)…")
     else:
@@ -414,6 +446,7 @@ def _db_check(args) -> int:
         print(f"integrity ({report['check']}): ok")
         print("foreign keys: ok")
         print("orphan vectors: ok")
+        print("application invariants: ok")
         return 0
     print(f"integrity ({report['check']}): "
           f"{'ok' if report['integrity'] == ['ok'] else 'FAILED'}")
@@ -433,6 +466,13 @@ def _db_check(args) -> int:
         print(f"orphan vectors: {orphans} (run with --fix-orphan-vectors to remove)")
     else:
         print("orphan vectors: ok")
+    app_violations = report.get("application_invariant_violations", [])
+    if app_violations:
+        print(f"application invariants: {len(app_violations)} violation(s)")
+        for violation in app_violations:
+            print(f"  - {violation}")
+    else:
+        print("application invariants: ok")
     return 1
 
 
@@ -464,13 +504,17 @@ def _backup(args) -> int:
 def _snapshot(args) -> int:
     """Single-file snapshot: a WAL-consistent DB copy + the whole vault (minus the
     .tmp scratch dir) + a manifest, packed as one .tar. The companion of `restore`."""
-    ctx = build_context(full=False)
     out = Path(args.out)
     if out.exists() and not args.force:
         print(f"refusing to overwrite existing file (use --force): {out}")
         return 1
-    vault = Path(ctx.settings.vault_path)
-    report = write_snapshot(ctx.db, vault, out, force=args.force)
+    try:
+        ctx = build_context(full=False)
+        vault = Path(ctx.settings.vault_path)
+        report = write_snapshot(ctx.db, vault, out, force=args.force)
+    except (RuntimeError, ValueError) as exc:
+        print(f"snapshot failed: {exc}")
+        return 1
     print(f"Snapshot written to {out}")
     print(f"  schema v{report.schema_version} · {report.doc_count} docs · "
           f"{report.file_count} vault file(s) · model {report.embedding_model}")
@@ -611,7 +655,12 @@ def _serve_locked(args, settings) -> int:
 
     # Logging is already configured for all commands in _dispatch().
     print("Loading embedding model… (first run downloads it from HuggingFace)")
-    ctx = build_context(settings, full=True, start_embed_worker=True)
+    try:
+        ctx = build_context(settings, full=True, start_embed_worker=True)
+    except RuntimeError as exc:
+        if _report_embedding_rebind_required(exc):
+            return 1
+        raise
     ctx.embedder.warm()  # load weights now so the first request isn't slow / failing readiness
     if not args.no_recover:
         n = ctx.docs.recover_pending()

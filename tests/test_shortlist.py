@@ -141,7 +141,13 @@ def test_trash_page_and_restore_via_web(ctx, principals, client):
 
 def test_daily_route_redirects_to_today(client):
     _login(client)
-    r = client.get("/daily", follow_redirects=False)
+    assert client.get("/daily", follow_redirects=False).status_code == 405
+    assert client.post(
+        "/daily", data={"csrf_token": "invalid"}, follow_redirects=False
+    ).status_code == 403
+    r = client.post(
+        "/daily", data={"csrf_token": _csrf(client, "/")}, follow_redirects=False
+    )
     assert r.status_code == 303 and r.headers["location"].startswith("/doc/daily/")
 
 

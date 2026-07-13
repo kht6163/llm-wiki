@@ -178,6 +178,40 @@ def test_binding_change_requires_explicit_reembed(
     assert "reindex --reembed" in str(exc_info.value)
 
 
+def test_same_model_and_dimension_with_different_revision_requires_reembed(tmp_path):
+    db = Database(tmp_path / "revision.db")
+    original = db.initialize(MODEL, DIM, PIPELINE, "commit-a")
+    assert original.revision == "commit-a"
+    db.close()
+
+    with pytest.raises(RuntimeError, match="reindex --reembed"):
+        Database(tmp_path / "revision.db").initialize(
+            MODEL, DIM, PIPELINE, "commit-b"
+        )
+
+
+def test_rebind_persists_new_model_revision(tmp_path):
+    db = Database(tmp_path / "revision-rebind.db")
+    db.initialize(MODEL, DIM, PIPELINE, "commit-a")
+    rebound = db.rebind_model(MODEL, DIM, PIPELINE, "commit-b")
+    assert rebound.revision == "commit-b"
+    with db.reader() as conn:
+        assert get_meta(conn, "embedding_revision") == "commit-b"
+
+
+def test_legacy_vectors_without_revision_are_not_silently_adopted(tmp_path):
+    db = Database(tmp_path / "legacy-revision.db")
+    db.initialize(MODEL, DIM, PIPELINE)
+    with db.writer() as conn:
+        conn.execute("DELETE FROM meta WHERE k='embedding_revision'")
+    db.close()
+
+    with pytest.raises(RuntimeError, match="predates model revision tracking.*reindex --reembed"):
+        Database(tmp_path / "legacy-revision.db").initialize(
+            MODEL, DIM, PIPELINE, "resolved-commit"
+        )
+
+
 def test_vector_table_dimension_must_match_binding(tmp_path):
     db, _ = _initialize(tmp_path)
     with db.writer() as conn:
@@ -387,6 +421,7 @@ def test_rebind_stores_new_binding_tuple_in_meta_and_local_token(tmp_path):
         "embedding_epoch": "2",
         "embedding_model": "test/new-model",
         "embedding_pipeline": "passage-input-v2",
+        "embedding_revision": "",
     }
 
 

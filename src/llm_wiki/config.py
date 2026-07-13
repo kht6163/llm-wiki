@@ -36,6 +36,10 @@ class Settings(BaseSettings):
 
     # Embeddings (local HuggingFace sentence-transformers model)
     embedding_model: str = "intfloat/multilingual-e5-base"
+    # Optional HuggingFace revision (commit/tag/branch).  At runtime the resolved model
+    # commit is persisted in the DB binding, so an upstream model update cannot mix old
+    # passage vectors with query vectors from different weights unnoticed.
+    embedding_revision: str = ""
     # When false: skip model load / vector index init; BM25 search still works.
     # Related/RAG/vector mode return empty or structured unavailable.
     embedding_enabled: bool = True
@@ -128,6 +132,11 @@ class Settings(BaseSettings):
         if not (v or "").strip():
             raise ValueError(f"{info.field_name} must not be empty")
         return v
+
+    @field_validator("embedding_revision")
+    @classmethod
+    def _clean_embedding_revision(cls, v: str) -> str:
+        return (v or "").strip()
 
     @field_validator("rrf_k", "search_candidate_factor", "search_candidate_min",
                       "search_vector_factor", "search_vector_cap")

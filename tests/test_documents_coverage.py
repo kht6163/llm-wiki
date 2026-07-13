@@ -264,6 +264,10 @@ def test_projection_path_failure_leaves_durable_write_for_recovery(
     with pytest.raises(ProjectionPendingError) as caught:
         docs.create(editor, "pending.md", "durable", embed=False)
     assert caught.value.result.reason == "io_error"
+    assert caught.value.committed is True
+    assert caught.value.to_dict()["error"]["suggested_action"] == (
+        "check_status_do_not_repeat_write"
+    )
     with ctx.db.reader() as conn:
         row = conn.execute(
             "SELECT d.id,d.file_state,d.version,r.body FROM documents d JOIN revisions r "
@@ -317,6 +321,8 @@ def test_purge_io_failure_preserves_intent_and_retry_finishes(ctx, principals, m
     with pytest.raises(ProjectionPendingError) as caught:
         docs.purge(admin, "purge.md")
     assert caught.value.result.reason == "purge_io_error"
+    assert caught.value.committed is True
+    assert caught.value.suggested_action == "check_status_do_not_repeat_write"
     with ctx.db.reader() as conn:
         row = conn.execute(
             "SELECT d.is_deleted,d.file_state,COUNT(p.doc_id) AS intents FROM documents d "

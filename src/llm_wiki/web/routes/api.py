@@ -1,8 +1,9 @@
 """JSON/API endpoints, attachments, and share-token minting."""
 from __future__ import annotations
 
+import anyio
 from fastapi import Depends, FastAPI, File, Form, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from ...markdown_render import render_markdown
 from ...services import audit
@@ -25,10 +26,24 @@ def register_api(web: FastAPI, deps: WebDeps) -> None:
 
         if not p.can_write:
             raise ForbiddenError("Only editors can mint share links.")
-        docs.get(path)
-        token = share_svc.mint_share_token(secret, path)
+        token = share_svc.mint_share_token(secret, path, db=db, principal=p)
         url = str(request.base_url).rstrip("/") + "/share/" + token
-        return JSONResponse({"ok": True, "path": path, "token": token, "url": url})
+        links = share_svc.list_share_links(db, p, path)
+        return JSONResponse(
+            {"ok": True, "path": path, "token": token, "url": url, "link": links[0]}
+        )
+
+    @web.get("/api/doc/{path:path}/shares")
+    def list_share_links(path: str, request: Request, p: Principal = Depends(require_user)):
+        from ...services import share as share_svc
+
+        return JSONResponse({"ok": True, "links": share_svc.list_share_links(db, p, path)})
+
+    @web.post("/api/shares/{link_id}/revoke")
+    def revoke_share_link(link_id: int, request: Request, p: Principal = Depends(require_user)):
+        from ...services import share as share_svc
+
+        return JSONResponse({"ok": True, **share_svc.revoke_share_link(db, p, link_id)})
 
     @web.get("/api/graph")
     def api_graph(
@@ -105,7 +120,9 @@ def register_api(web: FastAPI, deps: WebDeps) -> None:
             else:
                 values = []
             props.append((key, values))
-        doc = docs.replace_properties(p, path, props, base_version=base_version)
+        doc = await anyio.to_thread.run_sync(
+            lambda: docs.replace_properties(p, path, props, base_version=base_version)
+        )
         return JSONResponse({"ok": True, "version": doc["version"]})
 
     @web.post("/api/preview")
@@ -144,13 +161,23 @@ def register_api(web: FastAPI, deps: WebDeps) -> None:
         data = await _read_capped(file, limit)
         if data is None:
             raise ValidationError(f"Attachment too large (limit {limit} bytes).")
-        res = docs.save_attachment(p, file.filename or "file", data)
-        audit.record_tx(db, actor=p.username, via="web", action="attachment_upload", target=res["path"])
+        def persist_upload() -> dict:
+            result = docs.save_attachment(p, file.filename or "file", data)
+            audit.record_tx(
+                db,
+                actor=p.username,
+                via="web",
+                action="attachment_upload",
+                target=result["path"],
+            )
+            return result
+
+        res = await anyio.to_thread.run_sync(persist_upload)
         return JSONResponse({"ok": True, **res})
 
     @web.get("/attachments/{subpath:path}")
     def attachment(subpath: str, request: Request, _p: Principal = Depends(require_user)):
-        target = docs.attachment_file(subpath)
+        target, data = docs.attachment_bytes(subpath)
         # Serve with an explicit, known Content-Type so nosniff has a correct type to
         # pin (unknown -> octet-stream, never a guessed renderable type).
         media = _ATTACH_MIME.get(target.suffix.lower(), "application/octet-stream")
@@ -160,7 +187,7 @@ def register_api(web: FastAPI, deps: WebDeps) -> None:
         # in depth, and Content-Disposition: inline keeps it from being treated as a
         # download. <img> embedding is governed by the embedding page's CSP (the
         # resource's own CSP is ignored for subresource loads), so images still render.
-        return FileResponse(target, media_type=media, headers={
+        return Response(data, media_type=media, headers={
             "Content-Security-Policy": "default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; sandbox",
             "X-Content-Type-Options": "nosniff",
         })

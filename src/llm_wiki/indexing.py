@@ -35,6 +35,12 @@ from .metrics import (
 log = logging.getLogger("llm_wiki.indexing")
 
 
+def _vector_table_exists(conn: sqlite3.Connection) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunk_vectors'"
+    ).fetchone() is not None
+
+
 @dataclass(frozen=True)
 class PreparedMarkdown:
     fts_body: str
@@ -66,8 +72,10 @@ def publish_prepared(
         (doc_id, title or "", prepared.fts_body),
     )
     old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    vectors_enabled = _vector_table_exists(conn)
     if old:
-        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        if vectors_enabled:
+            conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
     for chunk in prepared.chunks:
         conn.execute(
@@ -84,6 +92,8 @@ def publish_prepared(
             ),
         )
     graph.store_links(conn, doc_id, list(prepared.links), folder)
+    if not vectors_enabled:
+        conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
 
 
 def reindex_fts(conn: sqlite3.Connection, doc_id: int, title: str, body: str) -> None:
@@ -107,8 +117,10 @@ def remove_fts(conn: sqlite3.Connection, doc_id: int) -> None:
 def rechunk(conn: sqlite3.Connection, doc_id: int, body: str) -> list[tuple[int, str]]:
     """Replace a document's chunks (and drop their vectors). Returns (chunk_id, text)."""
     old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
+    vectors_enabled = _vector_table_exists(conn)
     if old:
-        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        if vectors_enabled:
+            conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
     out: list[tuple[int, str]] = []
     for ch in chunk_markdown(body):
@@ -119,13 +131,16 @@ def rechunk(conn: sqlite3.Connection, doc_id: int, body: str) -> list[tuple[int,
         )
         assert cur.lastrowid is not None
         out.append((cur.lastrowid, ch.text))
+    if not vectors_enabled:
+        conn.execute("UPDATE documents SET vector_dirty=0 WHERE id=?", (doc_id,))
     return out
 
 
 def clear_chunks(conn: sqlite3.Connection, doc_id: int) -> None:
     old = [r[0] for r in conn.execute("SELECT id FROM chunks WHERE doc_id=?", (doc_id,))]
     if old:
-        conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
+        if _vector_table_exists(conn):
+            conn.executemany("DELETE FROM chunk_vectors WHERE chunk_id=?", [(i,) for i in old])
         conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
 
 
@@ -169,15 +184,24 @@ def _embedding_snapshot(
 def _verify_embedder_identity(
     expected: EmbeddingBinding, embedder: Embedder
 ) -> None:
-    actual_identity = (embedder.model_name, embedder.pipeline)
-    expected_identity = (expected.model, expected.pipeline)
+    actual_identity = (
+        embedder.model_name,
+        embedder.pipeline,
+        str(getattr(embedder, "revision", expected.revision)),
+    )
+    expected_identity = (expected.model, expected.pipeline, expected.revision)
     if actual_identity != expected_identity:
         raise EmbeddingBindingChanged(
             f"Process embedder {actual_identity} does not match expected binding "
             f"{expected_identity}."
         )
-    actual = (embedder.model_name, int(embedder.dim), embedder.pipeline)
-    wanted = (expected.model, expected.dim, expected.pipeline)
+    actual = (
+        embedder.model_name,
+        int(embedder.dim),
+        embedder.pipeline,
+        actual_identity[2],
+    )
+    wanted = (expected.model, expected.dim, expected.pipeline, expected.revision)
     if actual != wanted:
         raise EmbeddingBindingChanged(
             f"Process embedder {actual} does not match expected binding {wanted}."
@@ -298,6 +322,8 @@ def embed_pending(
     :func:`embed_doc`; a document race therefore stays dirty without starving later
     IDs, while an encoder or binding error stops the sweep without rolling back prior
     document commits."""
+    if not getattr(embedder, "enabled", True):
+        return 0
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if doc_batch_size <= 0:

@@ -568,14 +568,15 @@ def test_stable_read_reports_platform_generation_read_and_post_read_failures(tmp
     assert interrupted and stable.text == "body"
 
 
-def test_stable_read_replaces_invalid_utf8_bytes(tmp_path):
+def test_stable_read_rejects_invalid_utf8_bytes(tmp_path):
     vault = _vault(tmp_path)
     target = vault / "invalid.md"
     target.write_bytes(b"before\xffafter")
 
-    stable = fp.read_stable_markdown(vault, target)
-
-    assert stable.text == "before\ufffdafter"
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, target)
+    assert raised.value.reason == "invalid_encoding"
+    assert target.read_bytes() == b"before\xffafter"
 
 
 def test_stable_read_detects_size_and_post_read_generation_changes(tmp_path, monkeypatch):

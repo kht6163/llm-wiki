@@ -16,6 +16,7 @@ beforeEach(() => {
 function page() {
   document.body.innerHTML = `
     <button id="outside">outside</button>
+    <form id="logout-form"></form>
     <div id="cmd-overlay" hidden>
       <input id="cmd-input">
       <ul id="cmd-list"></ul>
@@ -107,13 +108,21 @@ describe("palette.js", () => {
       ["새 문서 만들기", "/new"], ["문서 목록", "/"], ["그래프 보기", "/graph"],
       ["활동 피드", "/activity"], ["태그 보기", "/tags"], ["깨진 링크", "/broken-links"],
       ["검색 페이지", "/search"], ["API 키 / 설정", "/settings"],
-      ["사용자 관리", "/admin/users"], ["로그아웃", "/logout"],
+      ["사용자 관리", "/admin/users"],
     ]);
     for (const [label, href] of destinations) {
       window.WikiPalette.openCommands();
       chooseLabel(list, label);
       expect(location.href).toBe(href);
     }
+    const logoutForm = document.querySelector("#logout-form");
+    const requestSubmit = vi.spyOn(logoutForm, "requestSubmit").mockImplementation(() => {});
+    window.WikiPalette.openCommands();
+    chooseLabel(list, "로그아웃");
+    expect(requestSubmit).toHaveBeenCalledOnce();
+    logoutForm.remove();
+    window.WikiPalette.openCommands();
+    chooseLabel(list, "로그아웃");
     for (const [label, method] of [["좌측 사이드바 토글", "toggleLeft"], ["우측 패널 토글", "toggleRight"], ["라이트/다크 테마 전환", "toggleTheme"]]) {
       window.WikiPalette.openCommands();
       chooseLabel(list, label);

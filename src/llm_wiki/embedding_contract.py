@@ -15,6 +15,9 @@ class EmbeddingBinding:
     dim: int
     pipeline: str
     epoch: int
+    # Resolved model artifact revision (normally a HuggingFace commit hash).  Kept last
+    # with a default for compatibility with older in-process test/fake bindings.
+    revision: str = ""
 
 
 class EmbeddingBindingChanged(RuntimeError):

@@ -47,6 +47,9 @@ class Principal:
     credential_version: int = 1
     # MCP API key scope only (web sessions leave this as "readwrite").
     key_scope: str = "readwrite"
+    # Resolved MCP key identity.  Writer transactions use this to fence an
+    # already-authenticated request against a concurrent per-key revocation.
+    api_key_id: int | None = None
 
     @property
     def can_write(self) -> bool:
@@ -354,6 +357,7 @@ def principal_from_api_key(db: Database, raw: str | None) -> Principal | None:
         via="mcp",
         credential_version=row["credential_version"],
         key_scope=scope,
+        api_key_id=int(row["id"]),
     )
 
 

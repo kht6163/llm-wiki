@@ -307,7 +307,12 @@ def create_web_app(app: AppContext) -> FastAPI:
         # handling (inline conflict re-render, flash-and-redirect) catch their own
         # WikiError before it reaches here. API routes get the structured envelope;
         # pages get the HTML error template at the error's HTTP status.
-        if request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+        if (
+            request.method not in {"GET", "HEAD", "OPTIONS", "TRACE"}
+            and not (
+                exc.code == "projection_pending" and bool(exc.extra.get("committed"))
+            )
+        ):
             principal = user(request)
             if principal is not None:
                 audit_write_rejection(

@@ -755,13 +755,9 @@ def test_read_stable_markdown_returns_text_and_exact_generation(tmp_path):
     target = vault / "note.md"
     target.write_text("invalid: \udcff", encoding="utf-8", errors="surrogatepass")
 
-    stable = fp.read_stable_markdown(vault, target)
-
-    assert stable.path == target
-    assert stable.relative_path == "note.md"
-    assert stable.signature == fp.confined_file_signature(vault, target)
-    assert stable.text.startswith("invalid:")
-    assert fp.stable_markdown_is_current(stable)
+    with pytest.raises(fp.StableFileError) as raised:
+        fp.read_stable_markdown(vault, target)
+    assert raised.value.reason == "invalid_encoding"
 
 
 def test_read_stable_markdown_rejects_parent_symlink(tmp_path):

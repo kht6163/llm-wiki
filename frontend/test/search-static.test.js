@@ -282,6 +282,67 @@ describe("search.js", () => {
 });
 
 describe("search.js saved searches", () => {
+  test("handles absent search fields and cancelled save prompts", async () => {
+    document.body.innerHTML = `
+      <section id="search-workbench">
+        <button type="button" data-save-search>save</button>
+        <ul id="saved-searches-list"></ul>
+      </section>`;
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue(null);
+    await loadStatic("search");
+    document.querySelector("[data-save-search]").click();
+    expect(prompt).not.toHaveBeenCalled();
+
+    document.querySelector("#search-workbench").insertAdjacentHTML("afterbegin", `
+      <form class="searchform"></form>`);
+    document.querySelector("[data-save-search]").click();
+    expect(prompt).toHaveBeenCalledOnce();
+
+    const sparseForm = document.querySelector("form.searchform");
+    sparseForm.innerHTML = `
+        <input name="q" value=""><input name="mode" value=""><input name="folder" value="">
+        <input name="tag" value="">`;
+    for (const name of ["q", "mode", "folder"]) {
+      Object.defineProperty(sparseForm.elements[name], "value", {
+        configurable: true,
+        get: () => null,
+      });
+    }
+    document.querySelector("[data-save-search]").click();
+    expect(prompt).toHaveBeenCalledTimes(2);
+    expect(localStorage.getItem("wiki-saved-searches")).toBeNull();
+  });
+
+  test("renders sparse and invalid saved entries without inventing filters", async () => {
+    localStorage.setItem("wiki-saved-searches", JSON.stringify([
+      null,
+      {},
+      { name: "Sparse", q: "", mode: "", folder: "", tags: [""] },
+      { name: "No tags", q: "" },
+    ]));
+    page();
+    await loadStatic("search");
+
+    const links = [...document.querySelectorAll("#saved-searches-list a")];
+    expect(links).toHaveLength(2);
+    expect(links.map((link) => link.getAttribute("href"))).toEqual(["/search", "/search"]);
+    expect(links.map((link) => link.title)).toEqual(["Sparse", "No tags"]);
+  });
+
+  test("falls back from non-array storage and ignores detached delete controls", async () => {
+    localStorage.setItem("wiki-saved-searches", JSON.stringify({ name: "not a list" }));
+    page();
+    const root = document.querySelector("#search-workbench");
+    root.insertAdjacentHTML("beforeend", `
+      <button type="button" data-delete-saved>detached</button>
+      <div data-saved-name=""><button type="button" data-delete-saved>unnamed</button></div>`);
+    await loadStatic("search");
+
+    root.querySelector(":scope > [data-delete-saved]").click();
+    root.querySelector('[data-saved-name=""] [data-delete-saved]').click();
+    expect(document.querySelector("#saved-searches-list").children).toHaveLength(0);
+  });
+
   test("saves current query mode folder and tags under a name to localStorage", async () => {
     page();
     vi.spyOn(window, "prompt").mockReturnValue("Release notes");

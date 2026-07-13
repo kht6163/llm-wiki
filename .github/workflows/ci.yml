@@ -15,6 +15,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +36,12 @@ jobs:
           key: hf-${{ runner.os }}-all-MiniLM-L6-v2
 
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
+
+      - name: Audit Python dependencies
+        # The project itself is editable and torch comes from the explicit CPU index;
+        # audit all PyPI-resolvable dependencies and let the container/SBOM scan cover the rest.
+        run: uv run pip-audit --skip-editable
 
       - name: Lint (ruff)
         run: uv run ruff check .
@@ -43,11 +49,17 @@ jobs:
       - name: Type check (mypy)
         run: uv run mypy src/llm_wiki
 
+      - name: MCP HTTP transport integration
+        run: uv run pytest -q tests/test_mcp_http_transport.py
+
       - name: Tests
-        run: uv run pytest --cov=llm_wiki --cov-report=term-missing
+        run: >-
+          uv run pytest --ignore=tests/test_mcp_http_transport.py
+          --cov=llm_wiki --cov-report=term-missing
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
@@ -64,6 +76,9 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
 
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
+
       - name: Frontend coverage
         run: npm run coverage
 
@@ -76,6 +91,7 @@ jobs:
 
   browser:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: frontend
@@ -102,7 +118,7 @@ jobs:
         working-directory: .
 
       - name: Install locked Python dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
         working-directory: .
 
       - name: Install Chromium and system dependencies
@@ -118,8 +134,20 @@ jobs:
       - name: Browser critical flows
         run: npm run e2e
 
+      - name: Upload browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-failure-${{ github.run_id }}
+          path: |
+            frontend/playwright-report
+            frontend/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
   distribution:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -130,6 +158,9 @@ jobs:
 
       - name: Install Python 3.12
         run: uv python install 3.12
+
+      - name: Verify lockfile freshness
+        run: uv lock --check
 
       - name: Build wheel and source distribution
         run: |
@@ -148,8 +179,17 @@ jobs:
             --source-package src/llm_wiki \
             --sdist dist/*.tar.gz
 
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-distributions-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
   docker:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -165,6 +205,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Scan image for fixable high-severity vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: llm-wiki:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
       - name: Start image and require liveness
         timeout-minutes: 5
         run: python3 scripts/docker_smoke.py llm-wiki:ci
@@ -174,3 +223,15 @@ jobs:
         run: |
           docker logs llm-wiki-ci-smoke 2>/dev/null || true
           docker rm --force --volumes llm-wiki-ci-smoke 2>/dev/null || true
+
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

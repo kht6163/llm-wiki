@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from ...services import audit
 from ...services.auth import Principal
+from ...services.documents import ProjectionPendingError
 from ...services.errors import ConflictError, ValidationError, WikiError
 from ...util import PathError, clamp_int, normalize_rel_path
 from ..helpers import _ACTIVITY_WINDOWS, _window_since
@@ -32,9 +33,14 @@ def register_search_graph(web: FastAPI, deps: WebDeps) -> None:
                     p: Principal = Depends(require_user)):
         try:
             result = docs.rename_tag(p, old, new)
+            partial = ""
+            if result.get("docs_skipped"):
+                partial += f" · 건너뜀 {result['docs_skipped']}개"
+            if result.get("projection_pending"):
+                partial += f" · 파일 반영 지연 {len(result['projection_pending'])}개"
             request.session["flash"] = (
                 f"태그 이름 변경: #{result['sources'][0]} → #{result['dest']} "
-                f"({result['docs_changed']}개 문서)"
+                f"({result['docs_changed']}개 문서){partial}"
             )
         except WikiError as e:
             audit_write_rejection(
@@ -50,9 +56,14 @@ def register_search_graph(web: FastAPI, deps: WebDeps) -> None:
         try:
             result = docs.merge_tags(p, sources, dest)
             src_label = ", ".join(f"#{s}" for s in result["sources"])
+            partial = ""
+            if result.get("docs_skipped"):
+                partial += f" · 건너뜀 {result['docs_skipped']}개"
+            if result.get("projection_pending"):
+                partial += f" · 파일 반영 지연 {len(result['projection_pending'])}개"
             request.session["flash"] = (
                 f"태그 병합: {src_label} → #{result['dest']} "
-                f"({result['docs_changed']}개 문서)"
+                f"({result['docs_changed']}개 문서){partial}"
             )
         except WikiError as e:
             audit_write_rejection(
@@ -131,6 +142,15 @@ def register_search_graph(web: FastAPI, deps: WebDeps) -> None:
             doc = docs.create(p, rel, "", title=None)
             request.session["flash"] = f"문서를 만들었습니다: {doc['path']}"
             return RedirectResponse("/doc/" + quote(doc["path"]) + "/edit", status_code=303)
+        except ProjectionPendingError as e:
+            committed_path = str(e.extra.get("path") or rel)
+            request.session["flash"] = (
+                "문서는 저장됐지만 파일 반영이 지연되고 있습니다. "
+                "서버가 자동 복구합니다."
+            )
+            return RedirectResponse(
+                "/doc/" + quote(committed_path) + "/edit", status_code=303
+            )
         except ConflictError:
             # Already exists (race or re-click) — open the live document instead.
             try:
@@ -160,6 +180,11 @@ def register_search_graph(web: FastAPI, deps: WebDeps) -> None:
         try:
             docs.restore(p, path)
             request.session["flash"] = f"복원했습니다: {path}"
+        except ProjectionPendingError as e:
+            restored_path = str(e.extra.get("path") or path)
+            request.session["flash"] = (
+                f"복원은 저장됐지만 파일 반영이 지연되고 있습니다: {restored_path}"
+            )
         except WikiError as e:
             audit_write_rejection(
                 request, p, e, action=write_action_for_path(request.url.path), target=path
