@@ -95,7 +95,7 @@ jobs:
         run: sha256sum dist/*.whl dist/*.tar.gz dist/*.spdx.json > dist/SHA256SUMS
 
       - name: Attest release artifacts
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             dist/*.whl
