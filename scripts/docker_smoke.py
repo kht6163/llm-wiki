@@ -17,7 +17,12 @@ CONTAINER_NAME = "llm-wiki-ci-smoke"
 def health_is_ok(url: str) -> bool:
     try:
         with urllib.request.urlopen(url, timeout=2) as response:
-            return response.status == 200 and json.load(response) == {"ok": True}
+            payload = json.load(response)
+            return (
+                response.status == 200
+                and isinstance(payload, dict)
+                and payload.get("ok") is True
+            )
     except (OSError, TimeoutError, urllib.error.URLError, json.JSONDecodeError):
         return False
 

@@ -101,6 +101,26 @@ def test_distribution_smoke_keeps_cli_in_virtual_environment():
     assert cli_path("/tmp/wheel-smoke/bin/python") == Path("/tmp/wheel-smoke/bin/llm-wiki")
 
 
+def test_docker_smoke_accepts_health_details(monkeypatch):
+    from scripts import docker_smoke
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"ok": true, "model_loaded": true}'
+
+    monkeypatch.setattr(docker_smoke.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+
+    assert docker_smoke.health_is_ok("http://127.0.0.1:8081/healthz") is True
+
+
 def test_docker_smoke_cleans_up_when_health_never_starts(monkeypatch):
     from scripts import docker_smoke
 
