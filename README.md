@@ -9,7 +9,7 @@
 - 🧠 **로컬 임베딩** — HuggingFace `sentence-transformers`(API 키 불필요, 한국어 강함)
 - 🔒 **다중 사용자 동시 편집** — 문서별 정수 버전 낙관적 잠금. 앞선 변경이 있으면 **거부**하고 현재 내용을 돌려줘서 재확인 후 재시도. 모든 변경은 작성자·시각과 함께 **전체 본문 스냅샷**으로 기록
 - 🕸 **링크 그래프** — 위키링크/마크다운 링크를 파싱해 SQLite에 저장, 백링크·미해석(broken) 링크 추적
-- 👤 **역할 기반 권한** — `admin`/`editor`/`viewer`. 웹은 ID/비밀번호 로그인, MCP는 사용자별 API 키(Bearer)
+- 👤 **역할 기반 권한** — `admin`/`editor`/`viewer`. 웹은 ID/비밀번호 로그인(+선택 OIDC/SSO), MCP는 사용자별 API 키(Bearer)
 - 🛡 **보안 기본기** — 세션 CSRF 토큰 + 동일 출처 검사, 웹 로그인·MCP 인증 레이트리밋, 보안 응답 헤더(CSP·X-Frame-Options 등), 비밀번호 최소 8자, **비밀번호 변경/계정 비활성화 시 세션·API 키 일괄 무효화**
 - 🧭 **옵시디언풍 탐색** — 모든 페이지에 상시 좌측 **파일 트리**(폴더 접기/펼치기 + 현재 문서 auto-reveal), **빈 폴더 생성**(구조 먼저, 내용 나중), 트리 우클릭 컨텍스트 메뉴(새 문서/하위 폴더/이름변경·이동/삭제), 좌측 검색·태그 탭, 사이드바 접기·폭조절(localStorage 저장)
 - ⌨️ **키보드 워크플로** — **명령 팔레트**(Ctrl/⌘+P)·**퀵 스위처**(Ctrl/⌘+O, 없으면 새 문서 생성)·사이드바 토글(Ctrl/⌘+\\), 에디터 **Ctrl/⌘+S 저장**
@@ -57,6 +57,19 @@ uv sync          # 의존성 설치 (torch는 CPU 전용 휠로 설치됨)
 | `LOG_LEVEL` | 로그 레벨(DEBUG/INFO/WARNING/ERROR/CRITICAL) | `INFO` |
 | `LOG_FILE` | (선택) 크기 로테이션 로그 파일 경로. 비우면 stderr만 | (없음) |
 | `SHUTDOWN_GRACE_S` | 종료 시 진행 중 요청을 기다리는 최대 시간(초, 1–300). 오케스트레이터 kill grace 안에서 정상 종료 | `25` |
+| `OIDC_ENABLED` | 웹 SSO(OIDC authorization-code + PKCE). `false`면 로컬 아이디/비밀번호만 | `false` |
+| `OIDC_ISSUER` | IdP issuer URL (`/.well-known/openid-configuration` 기준). `OIDC_ENABLED=true` 시 필수 | (없음) |
+| `OIDC_CLIENT_ID` | OIDC 클라이언트 ID. 활성화 시 필수 | (없음) |
+| `OIDC_CLIENT_SECRET` | (선택) confidential client 시크릿. public client는 비움 | (없음) |
+| `OIDC_REDIRECT_URI` | 콜백 URL(IdP에 등록). `https://…` 또는 개발용 `http://127.0.0.1`/`localhost`. 활성화 시 필수 | (없음) |
+| `OIDC_SCOPES` | 요청 스코프(공백 구분, `openid` 포함) | `openid profile email` |
+| `OIDC_DEFAULT_ROLE` | 자동 프로비저닝 사용자 역할(`admin`/`editor`/`viewer`). 기본은 viewer(자동 admin 없음) | `viewer` |
+| `OIDC_USERNAME_CLAIM` | 로컬 username으로 쓸 ID 토큰 클레임 | `preferred_username` |
+| `OIDC_AUTO_PROVISION` | 매칭 사용자 없을 때 SSO 전용 계정 자동 생성 | `true` |
+| `OIDC_ALLOWED_EMAIL_DOMAINS` | 허용 이메일 도메인(쉼표 구분). 비우면 제한 없음 | (없음) |
+| `OIDC_REQUIRE_EMAIL_VERIFIED` | 이메일이 있을 때 IdP `email_verified` 요구 | `true` |
+
+> **OIDC/SSO**: 기본 비활성. 켜면 로그인 화면에 **SSO로 로그인**이 추가되며 로컬 비밀번호 로그인은 그대로 동작합니다. MCP는 API 키 전용이며 OIDC를 쓰지 않습니다. 첫 SSO 시 `(issuer, sub)` → 이메일(대소문자 무시) 순으로 기존 계정에 연결하고, 없으면 `OIDC_AUTO_PROVISION`에 따라 `password_hash` 없는 SSO 전용 사용자를 만듭니다.
 
 > 임베딩 모델을 바꾸면 벡터 차원이 달라져 기동 시 거부됩니다. DB를 공유하는 실행 중인 `llm-wiki serve` 프로세스를 모두 중지한 뒤 `uv run llm-wiki reindex --reembed`로 새 모델에 맞춰 벡터 인덱스를 재구성(rebind)하고 전체 재임베딩하고, 완료 후 서버를 다시 시작하세요 — 모델 교체의 지원 경로입니다.
 
