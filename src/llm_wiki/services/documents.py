@@ -35,11 +35,9 @@ from ..embedding_contract import EmbeddingBindingChanged
 from ..markdown_utils import (
     derive_content_title,
     derive_title,
-    extract_links,
     extract_tags,
     heading_slug,
     parse_frontmatter,
-    rewrite_link_target,
 )
 from ..merge import three_way_merge
 from ..metrics import DOC_WRITES
@@ -2136,52 +2134,8 @@ class DocumentService:
             "summary": {"lines_added": added, "lines_deleted": deleted},
         }
 
-    def backlinks(self, path: str, *, with_context: bool = False) -> dict:
-        rel = normalize_rel_path(path)
-        norm = path_norm(rel)
-        with self.db.reader() as conn:
-            d = conn.execute(
-                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
-            ).fetchone()
-            if not d:
-                raise NotFoundError("No document at this path.", path=rel)
-            return {
-                "path": rel,
-                "backlinks": graph.get_backlinks(conn, d["id"], with_context=with_context),
-            }
 
-    def links(self, path: str) -> dict:
-        rel = normalize_rel_path(path)
-        norm = path_norm(rel)
-        with self.db.reader() as conn:
-            d = conn.execute(
-                "SELECT id FROM documents WHERE path_norm=? AND is_deleted=0", (norm,)
-            ).fetchone()
-            if not d:
-                raise NotFoundError("No document at this path.", path=rel)
-            return {"path": rel, "links": graph.get_outgoing(conn, d["id"])}
 
-    def graph(
-        self,
-        root=None,
-        depth=1,
-        limit=500,
-        include_unresolved=True,
-        folder=None,
-        tag=None,
-        tags=None,
-    ) -> dict:
-        with self.db.reader() as conn:
-            return graph.build_graph(
-                conn,
-                root,
-                depth,
-                limit,
-                include_unresolved,
-                folder=folder,
-                tag=tag,
-                tags=tags,
-            )
 
     def search_page(
         self,
@@ -2584,16 +2538,6 @@ class DocumentService:
                 "truncated": truncated or len(text) > limit,
             }
 
-    def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
-        """Resolve a wikilink/markdown target to an existing document path, or None."""
-        src_folder = ""
-        if from_path:
-            try:
-                src_folder = folder_of(normalize_rel_path(from_path))
-            except Exception:
-                src_folder = ""
-        with self.db.reader() as conn:
-            return graph.resolve_path(conn, target, src_folder)
 
     # ---- templates ------------------------------------------------------
     def list_templates(self) -> list[dict]:
@@ -3092,28 +3036,55 @@ class DocumentService:
         from . import doc_edit
         return doc_edit.replace_properties(self, principal, path, props, base_version)
 
+
+
+
+    # ---- links / graph (delegated to doc_links) ----
+    def backlinks(self, path: str, *, with_context: bool = False) -> dict:
+        from . import doc_links
+        return doc_links.backlinks(self, path, with_context=with_context)
+
+    def links(self, path: str) -> dict:
+        from . import doc_links
+        return doc_links.links(self, path)
+
+    def graph(
+        self,
+        root=None,
+        depth=1,
+        limit=500,
+        include_unresolved=True,
+        folder=None,
+        tag=None,
+        tags=None,
+    ) -> dict:
+        from . import doc_links
+        return doc_links.graph(
+            self,
+            root=root,
+            depth=depth,
+            limit=limit,
+            include_unresolved=include_unresolved,
+            folder=folder,
+            tag=tag,
+            tags=tags,
+        )
+
     def broken_links(self, limit: int = 200) -> dict:
-        """Vault-wide unresolved links (dangling references) for cleanup tooling."""
-        limit = clamp_int(limit, 1, 2000)
-        with self.db.reader() as conn:
-            items = graph.list_broken_links(conn, limit)
-        return {"count": len(items), "links": items}
+        from . import doc_links
+        return doc_links.broken_links(self, limit)
+
+    def resolve_link(self, target: str, from_path: str | None = None) -> str | None:
+        from . import doc_links
+        return doc_links.resolve_link(self, target, from_path)
 
     def move_preview(self, path: str, new_path: str) -> dict:
-        """Read-only preview of a move: whether the destination is already taken, and the
-        inbound links (other docs pointing at the current path) that fix_references would
-        rewrite. Lets a caller see the blast radius before committing the move."""
-        rel, new_rel = normalize_rel_path(path), normalize_rel_path(new_path)
-        if not self.exists(rel):
-            raise NotFoundError("No document at this path.", path=rel)
-        inbound = self.backlinks(rel)["backlinks"]
-        return {
-            "from": rel,
-            "to": new_rel,
-            "dest_exists": self.exists(new_rel),
-            "inbound_count": len(inbound),
-            "inbound": [b["src_path"] for b in inbound],
-        }
+        from . import doc_links
+        return doc_links.move_preview(self, path, new_path)
+
+    def rename_references(self, principal: Principal, old_path: str, new_path: str) -> dict:
+        from . import doc_links
+        return doc_links.rename_references(self, principal, old_path, new_path)
 
     def move(
         self, principal: Principal, path: str, new_path: str, fix_references: bool = False
@@ -3263,94 +3234,6 @@ class DocumentService:
         self._bump_nav()
         return result
 
-    def rename_references(self, principal: Principal, old_path: str, new_path: str) -> dict:
-        """Rewrite the link TEXT in other documents that pointed at ``old_path`` so it
-        points at ``new_path`` — the cleanup ``move`` deliberately doesn't do inline.
-        Only links that are currently broken AND keyed to the old path/name are
-        touched (path-form links and bare-name links whose stem changed); a bare name
-        that still resolves elsewhere is left alone. Each affected document gets one
-        audited revision through the CAS update path, so a single conflict skips that
-        document instead of aborting the rest.
-        Returns {from, to, docs_rewritten, links_rewritten, skipped_conflicts}."""
-        if not principal.can_write:
-            raise ForbiddenError(
-                f"Role '{principal.role}' cannot modify documents (read/search only)."
-            )
-        old_rel, new_rel = normalize_rel_path(old_path), normalize_rel_path(new_path)
-        old_norm, old_stem = path_norm(old_rel), basename_stem(old_rel).lower()
-        new_noext = new_rel[:-3] if new_rel.lower().endswith(".md") else new_rel
-        new_basename = new_noext.rsplit("/", 1)[-1]
-
-        with self.db.reader() as conn:
-            rows = conn.execute(
-                "SELECT DISTINCT d.path FROM links l JOIN documents d ON d.id=l.src_doc_id "
-                "WHERE d.is_deleted=0 AND l.is_resolved=0 AND "
-                "((l.dst_is_path=1 AND l.dst_path_norm=?) OR (l.dst_is_path=0 AND l.dst_name=?))",
-                (old_norm, old_stem),
-            ).fetchall()
-        candidates = [r["path"] for r in rows]
-
-        docs_rewritten = links_rewritten = skipped = 0
-        projection_pending: list[dict] = []
-        for src_path in candidates:
-            try:
-                doc = self.get(src_path)
-            except NotFoundError:
-                continue
-            body = doc["content"]
-            edits: list[tuple[int, int, str]] = []
-            for link in extract_links(body):
-                try:
-                    dpn, dname, is_path = graph._link_keys(link.target)
-                except PathError:
-                    continue
-                if not ((is_path and dpn == old_norm) or (not is_path and dname == old_stem)):
-                    continue
-                # Only repoint genuinely-broken refs; a bare name resolving elsewhere
-                # is a legitimately different target now and must be left intact.
-                if self.resolve_link(link.target, doc["path"]):
-                    continue
-                new_target = (
-                    (new_rel if link.target.lower().endswith(".md") else new_noext)
-                    if is_path
-                    else new_basename
-                )
-                edits.append((link.start, link.end, rewrite_link_target(link, new_target)))
-            if not edits:
-                continue
-            new_body = body
-            for start, end, new_raw in sorted(edits, key=lambda e: e[0], reverse=True):
-                new_body = new_body[:start] + new_raw + new_body[end:]
-            try:
-                self.update(principal, doc["path"], doc["version"], new_body)
-            except ProjectionPendingError as exc:
-                # The reference rewrite committed to the DB.  Keep processing the
-                # remaining candidates and report only the recoverable projection
-                # work, rather than turning a vault-wide cleanup into an apparent
-                # all-or-nothing failure.
-                docs_rewritten += 1
-                links_rewritten += len(edits)
-                projection_pending.append(
-                    {
-                        "path": doc["path"],
-                        "reason": exc.result.reason,
-                        "version": exc.extra.get("version"),
-                    }
-                )
-                continue
-            except ConflictError:
-                skipped += 1
-                continue
-            docs_rewritten += 1
-            links_rewritten += len(edits)
-        return {
-            "from": old_rel,
-            "to": new_rel,
-            "docs_rewritten": docs_rewritten,
-            "links_rewritten": links_rewritten,
-            "skipped_conflicts": skipped,
-            "projection_pending": projection_pending,
-        }
 
     def recent_changes(
         self, limit: int = 20, since: str | None = None, until: str | None = None
