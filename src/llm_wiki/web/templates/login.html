@@ -13,5 +13,11 @@
       {% if error %}aria-invalid="true" aria-describedby="login-error"{% endif %}></label>
     <button type="submit">로그인</button>
   </form>
+  {% if oidc_enabled %}
+  <div class="login-sso">
+    <div class="login-sso-divider" role="separator"><span>또는</span></div>
+    <a class="login-sso-btn" href="/auth/oidc/login">SSO로 로그인</a>
+  </div>
+  {% endif %}
 </div>
 {% endblock %}

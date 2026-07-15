@@ -491,6 +491,14 @@ select {
 .login form { display: flex; flex-direction: column; gap: 12px; }
 .login label { display: flex; flex-direction: column; gap: 4px; }
 .login input { padding: 8px 10px; }
+.login-sso { margin-top: 18px; }
+.login-sso-divider { display: flex; align-items: center; gap: 10px; color: var(--fg-muted);
+  font-size: 0.82em; margin-bottom: 12px; }
+.login-sso-divider::before, .login-sso-divider::after {
+  content: ""; flex: 1; height: 1px; background: var(--line); }
+.login-sso-btn { display: block; text-align: center; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: var(--r-sm); color: var(--fg); text-decoration: none; background: var(--field); }
+.login-sso-btn:hover { border-color: var(--accent); color: var(--accent-hover); }
 
 /* Search workbench. */
 .search-head { display: flex; align-items: flex-start; justify-content: space-between;
