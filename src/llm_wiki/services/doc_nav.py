@@ -311,7 +311,9 @@ def _resolve_template_path(svc, name: str) -> Path:
 
 def _load_template_body(svc, name: str) -> str:
     from . import documents as dm
-    path = _resolve_template_path(svc, name)
+
+    # Route through the service method so callers can monkeypatch resolution.
+    path = svc._resolve_template_path(name)
     try:
         _target, data = fp.read_confined_bytes(
             svc.vault, f"{dm.TEMPLATES_DIR}/{path.name}"

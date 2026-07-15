@@ -1788,6 +1788,10 @@ class DocumentService:
         from . import doc_nav
         return doc_nav.list_favorites(self, user_id)
 
+    def _resolve_template_path(self, name: str):
+        from . import doc_nav
+        return doc_nav._resolve_template_path(self, name)
+
     def _load_template_body(self, name: str) -> str:
         from . import doc_nav
         return doc_nav._load_template_body(self, name)

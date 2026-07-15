@@ -457,7 +457,8 @@ def merge_tags(svc, principal: Principal, sources: list[str], dest: str) -> dict
     for p in paths:
         try:
             before = svc.get(p)["version"]
-            after = patch_tags(svc, principal, p, add=[dest], remove=src)
+            # Route through the service method so tests/callers can monkeypatch it.
+            after = svc.patch_tags(principal, p, add=[dest], remove=src)
             if after["version"] != before:
                 changed += 1
         except (ConflictError, NotFoundError) as exc:
