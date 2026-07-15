@@ -132,6 +132,50 @@ def _shape_conflict(err: dict, return_content: str) -> dict:
     return {**err, "error": trimmed}
 
 
+def _merge_suggested_action(preview: dict) -> str:
+    """Pick a machine-readable next step after a non-persisting three-way preview."""
+    if preview.get("manual_only"):
+        return "manual_merge"
+    if preview.get("title_conflict") or preview.get("conflicts"):
+        return "resolve_conflicts"
+    return "apply_merged_and_update"
+
+
+def _shape_merge_preview(result: dict, return_content: str) -> dict:
+    """Optionally drop large three-way bodies while keeping decision fields.
+
+    Default for ``preview_document_merge`` is ``full`` (the preview *is* the content).
+    ``metadata`` keeps versions/flags/suggested_action and char counts so an agent can
+    decide whether an auto-merge is clean without paying for every side body.
+    """
+    if return_content == "full" or not isinstance(result, dict) or not result.get("ok"):
+        return result
+    out = dict(result)
+    out["content_omitted"] = True
+    for key in ("base", "mine", "current", "merged"):
+        if key in out:
+            body = out.pop(key)
+            out[f"{key}_chars"] = 0 if body is None else len(body)
+    conflicts = out.get("conflicts")
+    if isinstance(conflicts, list):
+        slim: list[dict] = []
+        for hunk in conflicts:
+            if not isinstance(hunk, dict):
+                slim.append(hunk)
+                continue
+            item = {
+                "start_line": hunk.get("start_line"),
+                "resolved": hunk.get("resolved"),
+                "merged_start": hunk.get("merged_start"),
+            }
+            for side in ("base", "mine", "current"):
+                text = hunk.get(side)
+                item[f"{side}_chars"] = 0 if text is None else len(text)
+            slim.append(item)
+        out["conflicts"] = slim
+    return out
+
+
 # Server-level orientation surfaced in the MCP `initialize` result (clients show it
 # to the model). It primes an agent on this vault's conventions ONCE, so the per-tool
 # descriptions can stay terse and the agent picks the right tool without trial-and-error.
@@ -147,10 +191,12 @@ over reading documents one by one; use `search_documents` for exploratory discov
 writing. `read_documents` batches up to 20 paths (per-item errors keep the rest). \
 `get_outline`/`read_chunk` read a slice without pulling the whole body.
 - WRITE (editor/admin only): pass the `base_version` you last read. If the document changed \
-since, the write is REJECTED with a `conflict` error carrying the current content — re-read \
-and retry, never force. Prefer token-cheap targeted edits (`patch_document`, `append_section`, \
-`replace_section`, `append_to_document`, `patch_tags`) over rewriting the whole body with \
-`update_document`.
+since, the write is REJECTED with a `conflict` error carrying the current content — never force. \
+For a full-body `update_document` conflict, call `preview_document_merge` with the body you \
+tried to write to get a three-way proposal (auto-merge + conflict hunks), resolve any hunks, \
+then `update_document` with `base_version=current_version`. Prefer token-cheap targeted edits \
+(`patch_document`, `append_section`, `replace_section`, `append_to_document`, `patch_tags`) \
+over rewriting the whole body when you can.
 - LINK: documents cite each other with `[[wikilinks]]`. Call `resolve_links` BEFORE writing \
 links to confirm targets exist (avoid creating broken references); `get_backlinks` shows who \
 links here and why.
@@ -688,6 +734,41 @@ def create_mcp_server(app: AppContext) -> FastMCP:
     async def compare_revisions(ctx: Context, path: str, from_version: int, to_version: int) -> dict:
         return await _call(ctx, lambda _p: {"ok": True, **docs.compare_revisions(
             path, from_version, to_version)}, "compare_revisions")
+
+    @mcp.tool(description="Non-persisting three-way merge preview (editor/admin only) — the MCP "
+                          "peer of the web conflict resolver. After an `update_document` conflict, "
+                          "pass the same `path`, the `base_version` you last read, and the full "
+                          "`mine` body you tried to write. Returns base/mine/current, an auto-merged "
+                          "`merged` proposal when possible, ordered conflict hunks "
+                          "({start_line, base, mine, current, resolved, merged_start}), title "
+                          "three-way fields, and `suggested_action`: "
+                          "`apply_merged_and_update` (clean auto-merge — then call update_document "
+                          "with base_version=current_version and content=merged), "
+                          "`resolve_conflicts` (pick sides / edit hunks first), or "
+                          "`manual_merge` (base revision pruned — rebase against current yourself). "
+                          "Never writes. Default return_content='full' keeps bodies; pass "
+                          "'metadata' for char counts only.")
+    async def preview_document_merge(
+        ctx: Context, path: str, base_version: int, mine: str,
+        mine_title: Annotated[str, Field(description="Title you intended (title three-way).")] = "",
+        return_content: Annotated[
+            Literal["full", "metadata"],
+            Field(description="'full' (default) includes base/mine/current/merged bodies; "
+                  "'metadata' omits them and reports char counts."),
+        ] = "full",
+    ) -> dict:
+        def fn(p: Principal) -> dict:
+            preview = docs.merge_preview(p, path, base_version, mine, mine_title)
+            return _shape_merge_preview(
+                {
+                    "ok": True,
+                    "path": path,
+                    **preview,
+                    "suggested_action": _merge_suggested_action(preview),
+                },
+                return_content,
+            )
+        return await _call(ctx, fn, "preview_document_merge")
 
     @mcp.tool(description="Link graph as {nodes, edges} (Cytoscape/D3). root=None for the "
                           "whole vault; otherwise BFS to 'depth' around the root document.")

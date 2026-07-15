@@ -55,6 +55,7 @@ async def test_tools_registered(ctx):
         "set_document_properties",
         "get_or_create_daily_note", "list_trash", "restore_document", "purge_document",
         "list_favorites", "set_favorite", "upload_attachment", "rename_tag", "merge_tags",
+        "preview_document_merge",
     }
     assert expected <= names, names
 
