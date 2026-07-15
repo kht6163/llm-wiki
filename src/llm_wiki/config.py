@@ -8,14 +8,11 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from pydantic import ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-_OIDC_ROLES = frozenset({"admin", "editor", "viewer"})
-
 
 class ConfigError(RuntimeError):
     """Raised when the resolved configuration is invalid (bad .env / environment)."""
@@ -95,20 +92,6 @@ class Settings(BaseSettings):
     # -> SIGKILL) so the process exits cleanly instead of being hard-killed mid-write.
     shutdown_grace_s: int = 25
 
-    # OIDC / SSO (authorization-code + PKCE). Default OFF; local username/password
-    # always remains available. MCP stays API-key only (no OIDC on the agent surface).
-    oidc_enabled: bool = False
-    oidc_issuer: str = ""
-    oidc_client_id: str = ""
-    oidc_client_secret: str = ""
-    oidc_redirect_uri: str = ""
-    oidc_scopes: str = "openid profile email"
-    oidc_default_role: str = "viewer"
-    oidc_username_claim: str = "preferred_username"
-    oidc_auto_provision: bool = True
-    # Comma-separated email domains allowed to sign in via OIDC (empty = any domain).
-    oidc_allowed_email_domains: str = ""
-    oidc_require_email_verified: bool = True
 
     @field_validator("shutdown_grace_s")
     @classmethod
@@ -179,61 +162,12 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name} must be between 0.0 and 10.0 (got {v})")
         return float(v)
 
-    @field_validator("oidc_default_role")
-    @classmethod
-    def _oidc_role(cls, v: str) -> str:
-        role = (v or "viewer").strip().lower()
-        if role not in _OIDC_ROLES:
-            raise ValueError(
-                f"oidc_default_role must be one of {sorted(_OIDC_ROLES)} (got {v!r})"
-            )
-        return role
-
-    @field_validator(
-        "oidc_issuer",
-        "oidc_client_id",
-        "oidc_client_secret",
-        "oidc_redirect_uri",
-        "oidc_scopes",
-        "oidc_username_claim",
-        "oidc_allowed_email_domains",
-    )
-    @classmethod
-    def _strip_oidc_str(cls, v: str) -> str:
-        return (v or "").strip()
-
     @model_validator(mode="after")
-    def _distinct_ports_and_oidc(self) -> Settings:
+    def _distinct_ports(self) -> Settings:
         if self.gui_port == self.mcp_port:
             raise ValueError(
                 f"GUI_PORT and MCP_PORT must differ (both are {self.gui_port})"
             )
-        if self.oidc_enabled:
-            missing = [
-                name
-                for name, value in (
-                    ("oidc_issuer", self.oidc_issuer),
-                    ("oidc_client_id", self.oidc_client_id),
-                    ("oidc_redirect_uri", self.oidc_redirect_uri),
-                )
-                if not value
-            ]
-            if missing:
-                raise ValueError(
-                    "OIDC_ENABLED requires "
-                    + ", ".join(m.upper() for m in missing)
-                )
-            if not _is_safe_oidc_redirect_uri(self.oidc_redirect_uri):
-                raise ValueError(
-                    "oidc_redirect_uri must be https://… or http://127.0.0.1|localhost "
-                    f"for local development (got {self.oidc_redirect_uri!r})"
-                )
-            if not self.oidc_scopes:
-                raise ValueError("oidc_scopes must not be empty when OIDC is enabled")
-            if not self.oidc_username_claim:
-                raise ValueError(
-                    "oidc_username_claim must not be empty when OIDC is enabled"
-                )
         return self
 
     def ensure_dirs(self) -> None:
@@ -243,18 +177,6 @@ class Settings(BaseSettings):
         except OSError as e:
             raise ConfigError(f"Cannot create data directories: {e}") from e
 
-
-def _is_safe_oidc_redirect_uri(uri: str) -> bool:
-    """Allow https anywhere, or http only to loopback hosts for local dev."""
-    parts = urlsplit(uri)
-    if not parts.scheme or not parts.netloc:
-        return False
-    host = (parts.hostname or "").lower()
-    if parts.scheme == "https":
-        return True
-    if parts.scheme == "http":
-        return host in {"127.0.0.1", "localhost", "::1"}
-    return False
 
 
 @lru_cache

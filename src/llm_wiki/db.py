@@ -425,10 +425,10 @@ MIGRATIONS: list[tuple[int, str | tuple[str, ...]]] = [
          "NOT NULL UNIQUE,doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,"
          "created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,created_at TEXT NOT NULL,"
          "expires_at TEXT NOT NULL,revoked_at TEXT,last_used_at TEXT)"),
-    # v18: OIDC/SSO identity on users. password_hash becomes nullable (SSO-only accounts);
-    # email + (oidc_issuer, oidc_sub) link external IdP subjects. The paired-oidc CHECK and
-    # partial unique indexes require a table rebuild (ADD COLUMN cannot drop NOT NULL or
-    # attach table-level CHECKs). Foreign keys are disabled for this step (see applier).
+    # v18: nullable password_hash + optional email / oidc_* columns (schema stability for
+    # upgraded DBs; app auth is local password only). Paired-oidc CHECK and partial unique
+    # indexes require a table rebuild (ADD COLUMN cannot drop NOT NULL or attach table-
+    # level CHECKs). Foreign keys are disabled for this step (see applier).
     (18, (
         "CREATE TABLE users__v18 ("
         "id INTEGER PRIMARY KEY,"
