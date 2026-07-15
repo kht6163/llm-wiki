@@ -25,7 +25,7 @@ from .embedding_contract import (
     EmbeddingBindingChanged,
 )
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 # Everything except the vector table, whose dimension is only known once the
 # embedding model is loaded (see ensure_vector_table).
@@ -38,12 +38,19 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY,
   username      TEXT NOT NULL UNIQUE,
-  password_hash TEXT NOT NULL,
+  password_hash TEXT,
   role          TEXT NOT NULL CHECK(role IN ('admin','editor','viewer')),
   is_active     INTEGER NOT NULL DEFAULT 1,
   credential_version INTEGER NOT NULL DEFAULT 1,
+  email         TEXT,
+  oidc_issuer   TEXT,
+  oidc_sub      TEXT,
   created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
+  updated_at    TEXT NOT NULL,
+  CHECK (
+    (oidc_issuer IS NULL AND oidc_sub IS NULL)
+    OR (oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL)
+  )
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (
@@ -337,6 +344,18 @@ def application_invariant_violations(conn: sqlite3.Connection) -> list[str]:
             )
     return violations
 
+# Indexes that depend on columns introduced by numbered migrations. SCHEMA_SQL runs
+# before migrations and must not reference columns an older DB does not yet have;
+# these IF-NOT-EXISTS statements run after migrations (and on fresh DBs after the
+# stamp) so both paths converge on the same indexes.
+SCHEMA_INDEXES_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email
+  ON users(email) WHERE email IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc
+  ON users(oidc_issuer, oidc_sub)
+  WHERE oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL;
+"""
+
 # Numbered forward migrations for EXISTING databases, applied in ascending order.
 # New *tables* belong in SCHEMA_SQL (IF NOT EXISTS covers fresh and existing DBs);
 # use a migration only for changes IF NOT EXISTS can't express — ALTER TABLE ADD
@@ -406,6 +425,39 @@ MIGRATIONS: list[tuple[int, str | tuple[str, ...]]] = [
          "NOT NULL UNIQUE,doc_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,"
          "created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,created_at TEXT NOT NULL,"
          "expires_at TEXT NOT NULL,revoked_at TEXT,last_used_at TEXT)"),
+    # v18: OIDC/SSO identity on users. password_hash becomes nullable (SSO-only accounts);
+    # email + (oidc_issuer, oidc_sub) link external IdP subjects. The paired-oidc CHECK and
+    # partial unique indexes require a table rebuild (ADD COLUMN cannot drop NOT NULL or
+    # attach table-level CHECKs). Foreign keys are disabled for this step (see applier).
+    (18, (
+        "CREATE TABLE users__v18 ("
+        "id INTEGER PRIMARY KEY,"
+        "username TEXT NOT NULL UNIQUE,"
+        "password_hash TEXT,"
+        "role TEXT NOT NULL CHECK(role IN ('admin','editor','viewer')),"
+        "is_active INTEGER NOT NULL DEFAULT 1,"
+        "credential_version INTEGER NOT NULL DEFAULT 1,"
+        "email TEXT,"
+        "oidc_issuer TEXT,"
+        "oidc_sub TEXT,"
+        "created_at TEXT NOT NULL,"
+        "updated_at TEXT NOT NULL,"
+        "CHECK ("
+        "(oidc_issuer IS NULL AND oidc_sub IS NULL) "
+        "OR (oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL)"
+        "))",
+        "INSERT INTO users__v18(id,username,password_hash,role,is_active,"
+        "credential_version,email,oidc_issuer,oidc_sub,created_at,updated_at) "
+        "SELECT id,username,password_hash,role,is_active,credential_version,"
+        "NULL,NULL,NULL,created_at,updated_at FROM users",
+        "DROP TABLE users",
+        "ALTER TABLE users__v18 RENAME TO users",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email "
+        "ON users(email) WHERE email IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_oidc "
+        "ON users(oidc_issuer, oidc_sub) "
+        "WHERE oidc_issuer IS NOT NULL AND oidc_sub IS NOT NULL",
+    )),
 ]
 
 
@@ -643,6 +695,10 @@ class Database:
                             )
                 conn.executescript(SCHEMA_SQL)
                 self._apply_migrations(conn)
+                # After migrations so partial unique indexes on OIDC columns exist
+                # even when SCHEMA_SQL's CREATE TABLE IF NOT EXISTS left a pre-v18
+                # users table untouched until the rebuild migration ran.
+                conn.executescript(SCHEMA_INDEXES_SQL)
             finally:
                 conn.close()
 
@@ -667,6 +723,11 @@ class Database:
             # leave the schema changed with schema_version unbumped (a half-migrated
             # DB). On failure the step rolls back and the version stays at the last
             # fully-applied migration, so a re-run resumes from there.
+            #
+            # Parent-table rebuilds (e.g. users in v18) must DROP a table that child
+            # FKs still name. SQLite only allows that with foreign_keys=OFF, and the
+            # PRAGMA is a no-op inside a transaction — so disable FKs around the step.
+            conn.execute("PRAGMA foreign_keys=OFF")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 try:
@@ -690,6 +751,8 @@ class Database:
                 except Exception:
                     pass
                 raise
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
             current = target
         if current < SCHEMA_VERSION:
             # Code is ahead of the DB but no DDL was needed up to SCHEMA_VERSION (e.g.

@@ -185,6 +185,81 @@ def test_sessions_and_share_link_indexes_exist(tmp_path):
     } <= indexes
 
 
+def test_v18_users_oidc_columns_and_constraints(tmp_path):
+    """v18 makes password_hash nullable, adds email/oidc identity, and enforces
+    the paired-oidc CHECK plus partial unique indexes on email and (issuer, sub)."""
+    db = Database(tmp_path / "oidc-users.db")
+    db.ensure_schema()
+    # Rewind outside a writer transaction so PRAGMA foreign_keys=OFF takes effect
+    # (it is a no-op inside an open transaction).
+    conn = db.connect()
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "CREATE TABLE users__old ("
+            "id INTEGER PRIMARY KEY,username TEXT NOT NULL UNIQUE,"
+            "password_hash TEXT NOT NULL,"
+            "role TEXT NOT NULL CHECK(role IN ('admin','editor','viewer')),"
+            "is_active INTEGER NOT NULL DEFAULT 1,"
+            "credential_version INTEGER NOT NULL DEFAULT 1,"
+            "created_at TEXT NOT NULL,updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO users__old(id,username,password_hash,role,is_active,"
+            "credential_version,created_at,updated_at) "
+            "SELECT id,username,password_hash,role,is_active,credential_version,"
+            "created_at,updated_at FROM users"
+        )
+        conn.execute("DROP TABLE users")
+        conn.execute("ALTER TABLE users__old RENAME TO users")
+        for name in ("idx_users_email", "idx_users_oidc"):
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
+        set_meta(conn, "schema_version", "17")
+        conn.execute("PRAGMA foreign_keys=ON")
+    finally:
+        conn.close()
+        db.close()  # drop any cached connection that saw the old layout
+
+    db.ensure_schema()
+
+    with db.writer() as conn:
+        columns = {row[1]: row for row in conn.execute("PRAGMA table_info(users)")}
+        assert "email" in columns
+        assert "oidc_issuer" in columns
+        assert "oidc_sub" in columns
+        # password_hash is nullable (notnull == 0)
+        assert columns["password_hash"][3] == 0
+        assert int(get_meta(conn, "schema_version")) == SCHEMA_VERSION
+        assert {"idx_users_email", "idx_users_oidc"} <= _indexes(conn)
+
+        # Local password user still valid; SSO-only row with NULL password_hash ok.
+        conn.execute(
+            "INSERT INTO users(username,password_hash,role,email,oidc_issuer,oidc_sub,"
+            "created_at,updated_at) VALUES('sso',NULL,'viewer','sso@ex.com',"
+            "'https://idp.example','sub-1','now','now')"
+        )
+        # CHECK: one of issuer/sub without the other is rejected.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,oidc_issuer,oidc_sub,"
+                "created_at,updated_at) VALUES('bad',NULL,'viewer',"
+                "'https://idp.example',NULL,'now','now')"
+            )
+        # Partial unique on email (when not null).
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,email,"
+                "created_at,updated_at) VALUES('dup','h','viewer','sso@ex.com','now','now')"
+            )
+        # Partial unique on (oidc_issuer, oidc_sub).
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO users(username,password_hash,role,oidc_issuer,oidc_sub,"
+                "created_at,updated_at) VALUES('dup2',NULL,'viewer',"
+                "'https://idp.example','sub-1','now','now')"
+            )
+
+
 def test_migration_failure_is_atomic_and_resumable(tmp_path, monkeypatch):
     # A failing migration must roll back its own DDL and leave schema_version at the
     # last fully-applied step — never a half-migrated DB — and a re-run must resume.
