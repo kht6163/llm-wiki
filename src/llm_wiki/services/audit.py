@@ -24,6 +24,12 @@ DOC_ACTIONS: tuple[str, ...] = (
     "doc_restore", "doc_purge", "doc_reconcile", "attachment_upload",
 )
 
+# Per-document timeline: document lifecycle plus share-link events whose target is
+# a document path (mint/revoke). Security/account events stay excluded.
+DOC_TIMELINE_ACTIONS: tuple[str, ...] = DOC_ACTIONS + (
+    "share_mint", "share_revoke",
+)
+
 _FIELD_LIMITS = {
     "actor": 128,
     "via": 32,
@@ -76,21 +82,37 @@ def record_tx(db: Database, **kw) -> None:
         record(conn, **kw)
 
 
+def _like_literal(value: str) -> str:
+    """Escape ``%``, ``_``, and ``\\`` so a path can be used as a LIKE literal."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def recent(db: Database, *, limit: int = 100, since: str | None = None,
            until: str | None = None, actor: str | None = None, via: str | None = None,
            action: str | None = None, outcome: str | None = None,
-           actions: tuple[str, ...] | list[str] | None = None) -> list[dict]:
+           actions: tuple[str, ...] | list[str] | None = None,
+           target: str | None = None, target_path: str | None = None) -> list[dict]:
     """Most-recent audit rows (newest first), narrowed by any combination of:
     an ISO-8601 ``ts`` window (since/until), exact ``actor``/``via``/``action``/
-    ``outcome``, or an ``actions`` whitelist (IN clause — e.g. DOC_ACTIONS to scope
-    the feed to document activity)."""
+    ``outcome``/``target``, an ``actions`` whitelist (IN clause — e.g. DOC_ACTIONS
+    to scope the feed to document activity), or ``target_path`` for a document
+    timeline match (exact path, or either side of a ``old -> new`` move target)."""
     clauses: list[str] = []
     params: list = []
     for col, val in (("ts >= ?", since), ("ts <= ?", until), ("actor = ?", actor),
-                     ("via = ?", via), ("action = ?", action), ("outcome = ?", outcome)):
+                     ("via = ?", via), ("action = ?", action), ("outcome = ?", outcome),
+                     ("target = ?", target)):
         if val:
             clauses.append(col)
             params.append(val)
+    if target_path:
+        # Moves store "old -> new". Match exact path, move-from, or move-to.
+        # LIKE metacharacters in the path are escaped so they stay literal.
+        lit = _like_literal(target_path)
+        clauses.append(
+            "(target = ? OR target LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\')"
+        )
+        params.extend((target_path, f"{lit} -> %", f"% -> {lit}"))
     if actions:
         ph = ",".join("?" * len(actions))
         clauses.append(f"action IN ({ph})")
