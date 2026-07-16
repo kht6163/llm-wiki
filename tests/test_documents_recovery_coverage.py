@@ -9,6 +9,7 @@ from contextlib import contextmanager
 import pytest
 
 from llm_wiki import file_projection as fp
+from llm_wiki.services import doc_projection as projection_module
 from llm_wiki.services import documents as documents_module
 from llm_wiki.services.documents import CleanupIssue
 from llm_wiki.util import now_iso, path_norm
@@ -945,7 +946,7 @@ def test_purge_tombstone_fence_detects_generation_change(ctx, principals, monkey
             ).fetchone()[0]
         )
 
-    real_unresolve = documents_module.graph.unresolve_incoming
+    real_unresolve = projection_module.graph.unresolve_incoming
 
     def change_generation(conn, current_id):
         real_unresolve(conn, current_id)
@@ -953,7 +954,7 @@ def test_purge_tombstone_fence_detects_generation_change(ctx, principals, monkey
             "UPDATE documents SET version=version+1 WHERE id=?", (current_id,)
         )
 
-    monkeypatch.setattr(documents_module.graph, "unresolve_incoming", change_generation)
+    monkeypatch.setattr(projection_module.graph, "unresolve_incoming", change_generation)
     report = docs._recover_pending_report(page_size=1)
 
     assert report.recovered == 0
