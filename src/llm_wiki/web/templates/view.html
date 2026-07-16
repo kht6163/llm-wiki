@@ -90,6 +90,7 @@
 <div class="rp-tabs" role="tablist" aria-label="문서 정보">
   <button class="rp-tab active" type="button" data-rp="outline" role="tab" id="rp-tab-outline" aria-controls="rp-panel-outline" aria-selected="true" tabindex="0">목차</button>
   <button class="rp-tab" type="button" data-rp="links" role="tab" id="rp-tab-links" aria-controls="rp-panel-links" aria-selected="false" tabindex="-1">링크</button>
+  <button class="rp-tab" type="button" data-rp="activity" role="tab" id="rp-tab-activity" aria-controls="rp-panel-activity" aria-selected="false" tabindex="-1">활동</button>
 </div>
 <div class="rp-body">
   <div class="rp-panel" data-rp-panel="outline" id="rp-panel-outline" role="tabpanel" tabindex="0" aria-labelledby="rp-tab-outline">
@@ -110,6 +111,10 @@
     </ul>
     <div id="rp-related" class="rp-related" data-path="{{ doc.path }}"></div>
   </div>
+  <div class="rp-panel" data-rp-panel="activity" id="rp-panel-activity" role="tabpanel" tabindex="0" aria-labelledby="rp-tab-activity" hidden>
+    <div id="rp-activity" class="rp-activity" data-path="{{ doc.path }}"
+         aria-live="polite" aria-busy="false"></div>
+  </div>
 </div>
 {% endblock %}
 
@@ -127,6 +132,7 @@
 <script src="{{ static('outline.js') }}"></script>
 <script src="{{ static('tasks.js') }}"></script>
 <script src="{{ static('related.js') }}"></script>
+<script src="{{ static('activity.js') }}"></script>
 {% if user.can_write %}<script src="{{ static('props.js') }}"></script>{% endif %}
 {% if user.can_write %}<script src="{{ static('share.js') }}"></script>{% endif %}
 {% endblock %}

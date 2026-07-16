@@ -9,6 +9,7 @@ from ...markdown_render import render_markdown
 from ...services import audit
 from ...services.auth import Principal
 from ...services.errors import ForbiddenError, NotFoundError, ValidationError
+from ...util import clamp_int
 from ..helpers import _ATTACH_MIME, _read_capped
 from .deps import WebDeps
 
@@ -201,3 +202,20 @@ def register_api(web: FastAPI, deps: WebDeps) -> None:
         except NotFoundError:
             related = []
         return JSONResponse({"ok": True, "related": related})
+
+    @web.get("/api/doc/{path:path}/activity")
+    def api_doc_activity(
+        path: str,
+        request: Request,
+        limit: int = 30,
+        _p: Principal = Depends(require_user),
+    ):
+        # Per-document audit timeline (lazy-loaded by activity.js). Session auth only;
+        # scoped to DOC_TIMELINE_ACTIONS and path / move-from / move-to targets.
+        events = audit.recent(
+            db,
+            limit=clamp_int(limit, 1, 100),
+            target_path=path,
+            actions=audit.DOC_TIMELINE_ACTIONS,
+        )
+        return JSONResponse({"ok": True, "path": path, "events": events})

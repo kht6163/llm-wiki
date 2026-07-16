@@ -69,6 +69,7 @@ export function useStaticIsolation() {
 export async function loadStatic(name) {
   vi.resetModules();
   const modules = {
+    activity: () => import("../../src/llm_wiki/web/static/activity.js"),
     datetime: () => import("../../src/llm_wiki/web/static/datetime.js"),
     editor: () => import("../../src/llm_wiki/web/static/editor.js"),
     graph: () => import("../../src/llm_wiki/web/static/graph.js"),
