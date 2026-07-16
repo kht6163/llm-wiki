@@ -171,7 +171,7 @@ def rename_references(svc, principal: Principal, old_path: str, new_path: str) -
         except Exception as exc:
             from .documents import ProjectionPendingError
 
-            if not isinstance(exc, ProjectionPendingError):
+            if not isinstance(exc, ProjectionPendingError):  # pragma: no cover - unexpected
                 raise
             # The reference rewrite committed to the DB.  Keep processing the
             # remaining candidates and report only the recoverable projection

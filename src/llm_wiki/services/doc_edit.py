@@ -466,7 +466,7 @@ def merge_tags(svc, principal: Principal, sources: list[str], dest: str) -> dict
         except Exception as exc:
             from .documents import ProjectionPendingError
 
-            if not isinstance(exc, ProjectionPendingError):
+            if not isinstance(exc, ProjectionPendingError):  # pragma: no cover - unexpected
                 raise
             # The DB mutation committed; surface the recoverable file projection
             # separately and continue the vault-wide operation.

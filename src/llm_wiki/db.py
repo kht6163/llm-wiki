@@ -748,7 +748,7 @@ class Database:
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
-                except Exception:
+                except Exception:  # pragma: no cover - ROLLBACK after a failed step may itself fail
                     pass
                 raise
             finally:
