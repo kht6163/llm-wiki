@@ -191,17 +191,21 @@ over reading documents one by one; use `search_documents` for exploratory discov
 writing. `read_documents` batches up to 20 paths (per-item errors keep the rest). \
 `get_outline`/`read_chunk` read a slice without pulling the whole body.
 - WRITE (editor/admin only): pass the `base_version` you last read. If the document changed \
-since, the write is REJECTED with a `conflict` error carrying the current content — never force. \
-For a full-body `update_document` conflict, call `preview_document_merge` with the body you \
-tried to write to get a three-way proposal (auto-merge + conflict hunks), resolve any hunks, \
-then `update_document` with `base_version=current_version`. Prefer token-cheap targeted edits \
-(`patch_document`, `append_section`, `replace_section`, `append_to_document`, `patch_tags`) \
-over rewriting the whole body when you can.
+since, the write is REJECTED with a `conflict` error — never force and never invent content. \
+On full-body `update_document` conflict: call `preview_document_merge(path, base_version, mine)` \
+with the body you tried to write. Branch on `suggested_action`: \
+`apply_merged_and_update` → save `merged` with `base_version=current_version`; \
+`resolve_conflicts` → pick mine/current (or edit) per hunk then save; \
+`manual_merge` → base revision pruned, re-read current and reapply carefully. \
+Prefer token-cheap targeted edits (`patch_document`, `append_section`, `replace_section`, \
+`append_to_document`, `patch_tags`) over rewriting the whole body when you can. Vault-wide \
+ops (`rename_tag`, `merge_tags`, `rename_references`) may return partial success with \
+`docs_skipped` / `projection_pending` — treat completed items as done and only retry the rest.
 - LINK: documents cite each other with `[[wikilinks]]`. Call `resolve_links` BEFORE writing \
 links to confirm targets exist (avoid creating broken references); `get_backlinks` shows who \
-links here and why.
+links here and why; `get_related_documents` finds unlinked but semantically close notes.
 - Errors are structured with a machine-readable `suggested_action` (e.g. re_read_and_retry, \
-verify_path) — branch on it instead of parsing prose."""
+preview_merge via preview_document_merge, verify_path) — branch on it instead of parsing prose."""
 
 
 def create_mcp_server(app: AppContext) -> FastMCP:
