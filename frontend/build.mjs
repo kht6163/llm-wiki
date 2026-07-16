@@ -38,7 +38,18 @@ await esbuild.build({
   outfile: path.join(outdir, "hljs.bundle.js"),
 });
 
-// 3) GitHub light/dark token colours, scoped to .rendered so they only touch the
+// 3) Offline Mermaid for the reading view — fenced ```mermaid blocks become SVG
+//    diagrams with no CDN. Exposes window.WikiMermaid.run(root).
+await esbuild.build({
+  entryPoints: [path.join(here, "src/mermaid-entry.js")],
+  bundle: true,
+  format: "iife",
+  minify: true,
+  target: ["es2020", "chrome100", "firefox100", "safari15"],
+  outfile: path.join(outdir, "mermaid.bundle.js"),
+});
+
+// 4) GitHub light/dark token colours, scoped to .rendered so they only touch the
 //    reading view (light by default, dark under [data-theme="dark"]). Backgrounds
 //    and layout are dropped — the .rendered <pre> box keeps using the app palette.
 function scopeTheme(file, scope) {
@@ -65,4 +76,4 @@ const themeCss = [
 ].join("\n") + "\n";
 fs.writeFileSync(path.join(outdir, "hljs-theme.css"), themeCss);
 
-console.log("built -> vendor/md-editor.bundle.{js,css}, hljs.bundle.js, hljs-theme.css");
+console.log("built -> vendor/md-editor.bundle.{js,css}, hljs.bundle.js, hljs-theme.css, mermaid.bundle.js");

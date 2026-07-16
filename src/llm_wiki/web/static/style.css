@@ -338,6 +338,9 @@ tr.via-mcp-row > td { background: var(--accent-soft); }
    measure and a paragraph gap that doesn't echo the tuned heading spacing. Tighten
    to a dense, even cadence; em-relative so it tracks the theme/font scale. */
 .rendered p { text-wrap: pretty; margin: 0 0 0.85em; }
+/* Offline Mermaid diagrams (```mermaid → div.mermaid SVG via mermaid.bundle.js). */
+.rendered .mermaid { margin: 12px 0; overflow-x: auto; text-align: center; }
+.rendered .mermaid svg { max-width: 100%; height: auto; }
 .rendered ul, .rendered ol { margin: 0 0 0.85em; padding-left: 1.5em; }
 .rendered li { margin: 0.15em 0; }
 .rendered li > ul, .rendered li > ol { margin: 0.15em 0 0; }

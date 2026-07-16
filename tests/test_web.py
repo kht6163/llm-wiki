@@ -1022,6 +1022,17 @@ def test_view_page_loads_code_highlighter(client):
     assert client.get("/static/vendor/hljs-theme.css").status_code == 200
 
 
+def test_view_page_loads_mermaid_bundle(client):
+    # Offline Mermaid: reading view must load the vendored IIFE and serve it
+    # (no CDN). Fenced ```mermaid blocks keep language-mermaid in the HTML.
+    login(client, "admin")
+    create_doc(client, "mm.md", "# T\n\n```mermaid\ngraph TD\n  A-->B\n```\n")
+    html = client.get("/doc/mm.md").text
+    assert "/static/vendor/mermaid.bundle.js" in html
+    assert 'class="language-mermaid"' in html
+    assert client.get("/static/vendor/mermaid.bundle.js").status_code == 200
+
+
 def test_timestamps_render_as_localizable_time_elements(client):
     # Stored timestamps are UTC ISO ("…Z"); the `dt` filter wraps them in a
     # <time> element (datetime=ISO, text=cleaned UTC fallback) that datetime.js

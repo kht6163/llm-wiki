@@ -57,4 +57,17 @@ describe("reading-page highlighting lifecycle", () => {
     expect(highlighter.highlightElement).toHaveBeenCalledTimes(2);
     expect(observers).toHaveLength(0);
   });
+
+  test("skips language-mermaid code blocks so Mermaid can use the source", async () => {
+    Object.defineProperty(document, "readyState", { configurable: true, value: "complete" });
+    document.body.innerHTML = [
+      '<main id="doc-rendered" class="rendered">',
+      '<pre><code class="language-python" id="py">x = 1</code></pre>',
+      '<pre><code class="language-mermaid" id="mm">graph TD\n  A-->B</code></pre>',
+      "</main>",
+    ].join("");
+    await import("../src/hljs-entry.js");
+    expect(highlighter.highlightElement).toHaveBeenCalledOnce();
+    expect(highlighter.highlightElement.mock.calls[0][0].id).toBe("py");
+  });
 });

@@ -4,7 +4,9 @@
 import hljs from "highlight.js/lib/common";
 
 function highlight() {
-  document.querySelectorAll(".rendered pre code:not([data-highlighted])").forEach(function (el) {
+  // Skip ```mermaid fences — highlight.js would wrap the source in token spans
+  // and break offline Mermaid rendering (WikiMermaid needs intact textContent).
+  document.querySelectorAll(".rendered pre code:not([data-highlighted]):not(.language-mermaid)").forEach(function (el) {
     try { hljs.highlightElement(el); } catch (e) { /* unknown language etc. — leave plain */ }
   });
 }

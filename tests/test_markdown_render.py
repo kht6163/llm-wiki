@@ -160,6 +160,15 @@ def test_wikilink_outside_code_still_expands_with_adjacent_code():
     assert "/go?" in html and ">대상<" in html
 
 
+def test_mermaid_fence_keeps_language_class_after_bleach():
+    # Reading view turns ```mermaid into SVG offline via mermaid.bundle.js; that
+    # needs class="language-mermaid" to survive sanitization on <code>.
+    html = render_markdown("```mermaid\ngraph TD\n  A-->B\n```\n")
+    assert 'class="language-mermaid"' in html
+    assert "graph TD" in html
+    assert "A--" in html  # arrow body (HTML may entity-encode '>')
+
+
 # ---- frontmatter property helpers -----------------------------------------
 def test_set_frontmatter_property_scalar_and_list():
     c = "---\ntitle: T\nstatus: draft\n---\n본문\n"
