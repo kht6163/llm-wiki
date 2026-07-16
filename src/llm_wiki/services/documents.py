@@ -38,6 +38,8 @@ from ..util import (
     path_norm,
 )
 from . import doc_edit as _doc_edit
+from . import doc_import as _doc_import
+from .auth import ROLE_RANK, Principal
 from .doc_projection import (  # noqa: F401 — re-exported for stable import paths
     CleanupIssue,
     ProjectionPendingError,
@@ -46,8 +48,6 @@ from .doc_projection import (  # noqa: F401 — re-exported for stable import pa
     RecoveryReport,
     ReindexTargetSnapshot,
 )
-from . import doc_import as _doc_import
-from .auth import ROLE_RANK, Principal
 from .errors import (
     ConflictError,
     ForbiddenError,
@@ -330,9 +330,10 @@ class DocumentService:
         from . import doc_projection
         return doc_projection._process_cleanup_batch(self, *args, **kwargs)
 
-    def _purge_intent_snapshot(self, *args, **kwargs):
+    def _purge_intent_snapshot(self, conn, doc_id):
+        # Does not use service state; kept as instance method for call-site parity.
         from . import doc_projection
-        return doc_projection._purge_intent_snapshot(self, *args, **kwargs)
+        return doc_projection._purge_intent_snapshot(conn, doc_id)
 
     def _process_purge_cleanup_batch(self, *args, **kwargs):
         from . import doc_projection

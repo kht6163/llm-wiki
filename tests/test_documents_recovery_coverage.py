@@ -10,7 +10,6 @@ import pytest
 
 from llm_wiki import file_projection as fp
 from llm_wiki.services import doc_projection as projection_module
-from llm_wiki.services import documents as documents_module
 from llm_wiki.services.documents import CleanupIssue
 from llm_wiki.util import now_iso, path_norm
 

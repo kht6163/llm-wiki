@@ -14,29 +14,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import hashlib
-import hmac
-import os
-from typing import cast
-
 from .. import file_projection as fp
-from .. import graph, indexing
+from .. import graph
 from ..util import (
-    PathError,
-    basename_stem,
     clamp_int,
-    folder_of,
-    normalize_rel_path,
-    now_iso,
-    path_norm,
-    safe_join,
     sha256_hex,
 )
 from . import audit
 from .errors import WikiError
 
 if TYPE_CHECKING:
-    from .documents import DocumentService
+    pass
 
 log = logging.getLogger("llm_wiki.documents")
 
