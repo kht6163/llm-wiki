@@ -89,6 +89,17 @@ describe("activity.js", () => {
       ],
       [() => Promise.resolve({ ok: false }), "활동을 불러오지 못했습니다"],
       [() => Promise.reject(new Error("offline")), "활동을 불러오지 못했습니다"],
+      [
+        () => Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: false }) }),
+        "활동을 불러오지 못했습니다",
+      ],
+      [
+        () => Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ok: true }), // no events field
+        }),
+        "이 문서의 활동이 없습니다",
+      ],
     ]) {
       const box = await loadWith(
         '<div id="rp-activity" data-path="a.md" aria-live="polite"></div>',
@@ -100,5 +111,58 @@ describe("activity.js", () => {
       expect(box.hasAttribute("aria-busy")).toBe(false);
       vi.restoreAllMocks();
     }
+  });
+
+  test("renders unknown via, missing timestamp, non-ok outcome, and bare action labels", async () => {
+    const box = await loadWith(
+      '<div id="rp-activity" data-path="x.md"></div>',
+      () => Promise.resolve({
+        ok: true,
+        json: () => Promise.resolve({
+          ok: true,
+          events: [
+            {
+              ts: null,
+              actor: "",
+              via: "batch",
+              action: "custom_op",
+              target: "x.md",
+              outcome: "error",
+              detail: "",
+            },
+            {
+              ts: "2026-07-16T10:00:00Z",
+              actor: "bob",
+              via: "cli",
+              action: "doc_create",
+              target: "x.md",
+              outcome: "ok",
+            },
+            {
+              ts: "2026-07-16T09:00:00Z",
+              actor: "carol",
+              via: null,
+              action: null,
+              target: "x.md",
+              outcome: "ok",
+              detail: null,
+            },
+          ],
+        }),
+      }),
+    );
+    await flush();
+    const items = box.querySelectorAll(".rp-activity-list > li");
+    expect(items).toHaveLength(3);
+    expect(items[0].querySelector(".via-badge").textContent).toBe("batch");
+    expect(items[0].querySelector(".via-badge").classList.contains("via-batch")).toBe(false);
+    expect(items[0].querySelector("time.dt").textContent).toBe("—");
+    expect(items[0].querySelector(".rp-activity-action").textContent).toBe("custom_op");
+    expect(items[0].querySelector(".outcome-bad").textContent).toBe("error");
+    expect(items[0].querySelector(".rp-activity-actor")).toBeNull();
+    expect(items[1].querySelector(".via-badge.via-cli").textContent).toBe("CLI");
+    // Null via/action: no badge, action falls back to em dash.
+    expect(items[2].querySelector(".via-badge")).toBeNull();
+    expect(items[2].querySelector(".rp-activity-action").textContent).toBe("—");
   });
 });

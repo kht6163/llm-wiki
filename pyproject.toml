@@ -120,6 +120,10 @@ explicit = true
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
 
+# torch pulls an older setuptools that pip-audit flags (PYSEC-2026-3447 fixed in 83+).
+[tool.uv]
+override-dependencies = ["setuptools>=83.0.0"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

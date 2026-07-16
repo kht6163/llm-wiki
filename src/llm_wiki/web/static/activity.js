@@ -32,7 +32,7 @@
     var span = document.createElement("span");
     if (via && VIA_LABELS[via]) {
       span.className = "via-badge via-" + via;
-      span.title = VIA_TITLES[via] || "";
+      span.title = VIA_TITLES[via];
       span.textContent = VIA_LABELS[via];
     } else if (via) {
       span.className = "via-badge";
@@ -144,7 +144,7 @@
           renderEmpty(box, "활동을 불러오지 못했습니다");
           return;
         }
-        renderEvents(box, data.events || []);
+        renderEvents(box, Array.isArray(data.events) ? data.events : []);
       })
       .catch(function () {
         box.removeAttribute("aria-busy");

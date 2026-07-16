@@ -91,6 +91,7 @@ describe("reading-page Mermaid lifecycle", () => {
       '<main id="doc-rendered" class="rendered">',
       '<div class="mermaid">sequenceDiagram\n  A->>B: hi</div>',
       '<div class="mermaid" data-processed="true">already done</div>',
+      '<div class="mermaid" data-mermaid-pending="1">already queued</div>',
       "</main>",
     ].join("");
     await import("../src/mermaid-entry.js");
@@ -102,5 +103,40 @@ describe("reading-page Mermaid lifecycle", () => {
     // Manual re-run should not re-process pending/processed nodes.
     await window.WikiMermaid.run(document.getElementById("doc-rendered"));
     expect(mermaidApi.run).toHaveBeenCalledOnce();
+  });
+
+  test("skips nested non-direct fences and already-done fences; empty roots are no-ops", async () => {
+    Object.defineProperty(document, "readyState", { configurable: true, value: "complete" });
+    document.body.innerHTML = [
+      '<main id="doc-rendered" class="rendered">',
+      // Not a direct child of PRE (selector is pre > code) — ignored.
+      '<pre><span><code class="language-mermaid">graph TD\n  A-->B</code></span></pre>',
+      '<pre><code class="language-mermaid" data-mermaid-done="1">graph TD\n  X-->Y</code></pre>',
+      "</main>",
+    ].join("");
+    await import("../src/mermaid-entry.js");
+    expect(mermaidApi.run).not.toHaveBeenCalled();
+    await window.WikiMermaid.run(document.getElementById("doc-rendered"));
+    expect(mermaidApi.run).not.toHaveBeenCalled();
+    await window.WikiMermaid.run(null);
+    expect(mermaidApi.run).not.toHaveBeenCalled();
+  });
+
+  test("converts empty-body PRE fences", async () => {
+    Object.defineProperty(document, "readyState", { configurable: true, value: "complete" });
+    document.body.innerHTML = '<main id="doc-rendered" class="rendered"></main>';
+    const pre = document.createElement("pre");
+    const code = document.createElement("code");
+    code.className = "language-mermaid";
+    Object.defineProperty(code, "textContent", { configurable: true, get: () => null });
+    pre.appendChild(code);
+    document.getElementById("doc-rendered").appendChild(pre);
+
+    await import("../src/mermaid-entry.js");
+    expect(mermaidApi.run).toHaveBeenCalledOnce();
+    const nodes = mermaidApi.run.mock.calls[0][0].nodes;
+    expect(nodes).toHaveLength(1);
+    expect(nodes[0].className).toBe("mermaid");
+    expect(nodes[0].textContent).toBe("");
   });
 });

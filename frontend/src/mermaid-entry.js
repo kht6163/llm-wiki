@@ -21,12 +21,11 @@ function collectNodes(root) {
   const scope = scopeOf(root);
   const nodes = [];
 
-  // Fenced ```mermaid blocks from the server renderer.
-  scope.querySelectorAll("pre code.language-mermaid").forEach(function (code) {
+  // Fenced ```mermaid blocks from the server renderer (direct child of <pre>).
+  scope.querySelectorAll("pre > code.language-mermaid").forEach(function (code) {
     if (code.getAttribute("data-mermaid-done")) return;
     code.setAttribute("data-mermaid-done", "1");
     const pre = code.parentElement;
-    if (!pre || pre.tagName !== "PRE") return;
     const div = document.createElement("div");
     div.className = "mermaid";
     div.textContent = code.textContent || "";
